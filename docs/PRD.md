@@ -397,3 +397,232 @@ minimize:
  + extrapolation_penalty
  + uncertainty_penalty
  + safety_violation_penalty
+ 제약조건:
+
+- controllable bounds
+- user constraints
+- equipment operating range
+- safety constraints
+- maximum number of changed variables
+- maximum change ratio
+- 학습 데이터 지원 범위
+
+추천 결과:
+
+- 현재 조건
+- 추천 조건
+- 절대 변경량
+- 변경 비율
+- 조정 우선순위
+- 조정 후 예상 품질
+- 조정 후 예상 anomaly score
+- 예측 불확실성
+- extrapolation 경고
+- 추천 근거
+- 실제 공정 검증 필요성
+
+확정적 표현을 사용하지 않는다.
+
+적절한 표현:
+
+> 학습 데이터가 충분히 포함하는 범위에서 압력을 약 3% 낮추고 온도를 유지할 경우,  
+> 목표 품질 범위에 진입할 가능성이 가장 높게 예측됩니다.
+
+부적절한 표현:
+
+> 압력을 3% 낮추면 반드시 불량이 해결됩니다.
+
+## 16. 추천 안전장치
+
+다음 조건에서는 강한 공정 변경 추천을 생성하지 않는다.
+
+- 표본 수가 부족함
+- target이 없음
+- 조절 가능 변수가 없음
+- 모델 성능이 기준 이하
+- 추천값이 학습 범위를 벗어남
+- 입력 제약조건이 없음
+- 데이터 누수가 의심됨
+- 불확실성이 높음
+- 관계 안정성이 낮음
+- 산업 판별 신뢰도가 낮음
+
+이 경우 다음 메시지를 사용한다.
+
+> 현재 데이터만으로는 공정조건 변경의 효과를 신뢰성 있게 추정하기 어렵습니다.  
+> 추가 데이터, 공정 제약조건 또는 현장 검증이 필요합니다.
+
+## 17. ±5% 처리 원칙
+
+±5%를 프로그램의 고정 예측 정확도로 주장하지 않는다.
+
+다음 의미로만 사용한다.
+
+- 사용자 정의 품질 허용오차
+- target specification
+- prediction interval
+- 검증 데이터에서 측정한 실제 오차
+- 공정 허용 범위
+
+예:
+
+```text
+Target = 100
+Tolerance = ±5%
+Specification range = [95, 105]
+```
+
+모델의 실제 예측 오차가 ±5% 이내인지는 별도 검증 결과로 표시한다.
+
+## 18. What-if Simulation
+
+사용자가 공정변수를 변경하면 다음을 다시 계산한다.
+
+- 예측 품질
+- 규격 진입 여부
+- anomaly score
+- 주요 feature contribution
+- 추천안 대비 차이
+- prediction interval
+- extrapolation 위험
+- 모델 confidence
+
+현재 조건, 추천 조건, 사용자 변경 조건을 표와 그래프로 비교한다.
+
+실시간 재계산이 어렵다면 캐시와 경량 추론을 사용하되, 실제 재학습이 필요한 작업과 혼동하지 않도록 구분한다.
+
+## 20. Streamlit UI
+
+MVP는 Streamlit으로 구현한다.
+
+분석 로직은 UI와 분리해 추후 FastAPI 또는 배치 프로그램에서 재사용할 수 있어야 한다.
+
+### Page 1: Data Upload
+
+- CSV, XLSX, Parquet 업로드
+- 데이터 preview
+- 파일 정보
+- 경량 프로파일
+- Data Quality Score
+
+### Page 2: Industry and Schema Mapping
+
+- 산업 자동 추정
+- confidence와 근거
+- 사용자 산업 선택
+- 열 역할 자동 분류
+- 역할 수정
+- 조절 가능 변수 지정
+
+### Page 3: Data Preparation
+
+- 정렬
+- 필터
+- 결측치 처리
+- group 설정
+- 전처리 preview
+- preprocessing log
+
+### Page 4: Analysis Setup
+
+- 분석 목적 추천
+- 사용자 최종 선택
+- target 지정
+- split 방식
+- 모델 후보
+- 분석 옵션
+
+### Page 5: Results
+
+- 모델 성능
+- 이상 샘플
+- 이상 유형
+- severity
+- 원인 변수
+- 시각화
+- 불확실성
+
+### Page 6: Recommendation
+
+- 변수별 제약조건
+- 추천 변경안
+- 예상 품질
+- 예상 anomaly score
+- extrapolation 경고
+- what-if simulation
+
+### Page 7: Report
+
+- 분석 조건
+- 데이터 품질
+- 데이터 분할
+- 모델
+- 성능
+- 이상 결과
+- 원인 진단
+- 추천
+- 한계
+- CSV 및 HTML export
+
+PDF는 안정적인 HTML 보고서가 완성된 이후 확장 기능으로 구현한다.
+
+## 21. 대시보드 핵심 지표
+
+우선 표시할 정보:
+
+- Industry
+- Industry Confidence
+- Analysis Task
+- Data Quality Score
+- Overall Process Health Score
+- Predicted Quality
+- Specification Status
+- Anomaly Type
+- Anomaly Severity
+- Top Root-Cause Features
+- Recommended Adjustment
+- Expected Improvement
+- Model Confidence
+- Extrapolation Warning
+
+Overall Process Health Score 는 다음 요소를 조합한다.
+
+- data quality
+- process anomaly
+- sensor anomaly
+- quality deviation
+- residual anomaly
+- drift
+- prediction uncertainty
+
+점수 계산식, 가중치, 누락된 요소를 UI에 공개한다.
+
+## 28. 최종 산출물
+
+다음을 제공한다.
+
+1. 실행 가능한 Python 프로젝트
+2. pyproject.toml 또는 requirements.txt
+3. Streamlit 실행 명령
+4. README
+5. 시스템 아키텍처 설명
+6. 산업별 합성 데이터 생성기
+7. sample dataset
+8. 단위 테스트
+9. 통합 테스트
+10. sample analysis report
+11. 모델 한계 설명
+12. 추천 결과 한계 설명
+13. 향후 확장 계획
+
+README에는 최소한 다음을 포함한다.
+
+```text
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+streamlit run app.py
+pytest
+```
+
+Windows 명령이 필요한 부분은 별도로 제공한다.
