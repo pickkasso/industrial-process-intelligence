@@ -397,6 +397,8 @@ minimize:
  + extrapolation_penalty
  + uncertainty_penalty
  + safety_violation_penalty
+```
+ 
  제약조건:
 
 - controllable bounds
