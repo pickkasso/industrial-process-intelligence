@@ -1,0 +1,25 @@
+# Application
+streamlit
+plotly
+
+# Data processing
+polars
+pandas
+pyarrow
+openpyxl
+numpy
+scipy
+
+# Machine learning
+scikit-learn
+joblib
+
+# Configuration and validation
+pydantic
+PyYAML
+
+# Testing and code quality
+pytest
+pytest-cov
+ruff
+mypy
