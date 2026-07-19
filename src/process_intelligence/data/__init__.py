@@ -10,6 +10,7 @@ from process_intelligence.data.profiler import (
     DatasetProfile,
     DatasetProfiler,
 )
+from process_intelligence.data.validator import DatasetValidator
 
 __all__ = [
     "ORIGINAL_ROW_ID_COLUMN",
@@ -17,5 +18,6 @@ __all__ = [
     "DatasetLoader",
     "DatasetProfile",
     "DatasetProfiler",
+    "DatasetValidator",
     "LoadedDataset",
 ]
