@@ -10,6 +10,12 @@ from process_intelligence.data.loader import (
     DatasetLoader,
     LoadedDataset,
 )
+from process_intelligence.data.preprocessor import (
+    MISSING_CATEGORY_TOKEN,
+    DatasetPreprocessor,
+    PreprocessingResult,
+    PreprocessorConfig,
+)
 from process_intelligence.data.profiler import (
     ColumnProfile,
     DatasetProfile,
@@ -33,6 +39,7 @@ __all__ = [
     "DEFAULT_SEVERITY_WEIGHTS",
     "ISSUE_TYPE_DIMENSIONS",
     "ISSUE_TYPE_MODELING_IMPACTS",
+    "MISSING_CATEGORY_TOKEN",
     "ORIGINAL_ROW_ID_COLUMN",
     "PROCESSED_ROW_INDEX_COLUMN",
     "ColumnProfile",
@@ -40,6 +47,7 @@ __all__ = [
     "DataQualityScorer",
     "DataQualityWeights",
     "DatasetLoader",
+    "DatasetPreprocessor",
     "DatasetProfile",
     "DatasetProfiler",
     "DatasetSorter",
@@ -47,6 +55,8 @@ __all__ = [
     "LineageSnapshot",
     "LineageTracker",
     "LoadedDataset",
+    "PreprocessingResult",
+    "PreprocessorConfig",
     "QualityPenalty",
     "SortResult",
 ]
