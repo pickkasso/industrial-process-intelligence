@@ -1,5 +1,10 @@
 """Data loading and preparation utilities."""
 
+from process_intelligence.data.lineage import (
+    PROCESSED_ROW_INDEX_COLUMN,
+    LineageSnapshot,
+    LineageTracker,
+)
 from process_intelligence.data.loader import (
     ORIGINAL_ROW_ID_COLUMN,
     DatasetLoader,
@@ -29,6 +34,7 @@ __all__ = [
     "ISSUE_TYPE_DIMENSIONS",
     "ISSUE_TYPE_MODELING_IMPACTS",
     "ORIGINAL_ROW_ID_COLUMN",
+    "PROCESSED_ROW_INDEX_COLUMN",
     "ColumnProfile",
     "DataQualityScore",
     "DataQualityScorer",
@@ -38,6 +44,8 @@ __all__ = [
     "DatasetProfiler",
     "DatasetSorter",
     "DatasetValidator",
+    "LineageSnapshot",
+    "LineageTracker",
     "LoadedDataset",
     "QualityPenalty",
     "SortResult",
