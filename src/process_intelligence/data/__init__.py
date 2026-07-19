@@ -20,6 +20,7 @@ from process_intelligence.data.quality_score import (
     DataQualityWeights,
     QualityPenalty,
 )
+from process_intelligence.data.sorter import DatasetSorter, SortResult
 from process_intelligence.data.validator import DatasetValidator
 
 __all__ = [
@@ -35,7 +36,9 @@ __all__ = [
     "DatasetLoader",
     "DatasetProfile",
     "DatasetProfiler",
+    "DatasetSorter",
     "DatasetValidator",
     "LoadedDataset",
     "QualityPenalty",
+    "SortResult",
 ]
