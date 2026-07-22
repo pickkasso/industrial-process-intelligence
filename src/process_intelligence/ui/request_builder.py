@@ -20,6 +20,7 @@ from process_intelligence.ui.schemas import (
     UiVariableConstraintInput,
     WorkflowUiSubmission,
 )
+from process_intelligence.workflow.enums import AnalysisExecutionMode
 from process_intelligence.workflow.schemas import (
     AnalysisWorkflowPolicy,
     AnalysisWorkflowRequest,
@@ -90,6 +91,42 @@ class WorkflowUiRequestBuilder:
             )
 
         submission_copy = submission.model_copy(deep=True)
+        metadata = dict(submission_copy.metadata)
+        metadata["ui_source"] = "streamlit_mvp"
+        metadata["builds_analysis_workflow_request"] = True
+        metadata["analysis_mode"] = submission_copy.analysis_mode.value
+
+        if submission_copy.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY:
+            return AnalysisWorkflowRequest(
+                csv_path=csv_path,
+                analysis_mode=AnalysisExecutionMode.ANOMALY_ONLY,
+                target_column=None,
+                feature_columns=list(submission_copy.feature_columns),
+                model_performance_policy=None,
+                timestamp_column=submission_copy.timestamp_column,
+                identifier_columns=list(submission_copy.identifier_columns),
+                excluded_columns=list(submission_copy.excluded_columns),
+                column_role_overrides=dict(submission_copy.column_role_overrides),
+                requested_task=None,
+                objective=None,
+                quality_direction=None,
+                quality_target=None,
+                request_constraints=[],
+                industry_constraints=[],
+                user_overrides=[],
+                user_confirmed_controllable_variables=[],
+                user_verified_variables=[],
+                max_simultaneous_changes=submission_copy.max_simultaneous_changes,
+                operating_point_selection=submission_copy.operating_point_selection,
+                explicit_operating_row_id=submission_copy.explicit_operating_row_id,
+                cohort_filter=(
+                    None
+                    if submission_copy.cohort_filter is None
+                    else submission_copy.cohort_filter.model_copy(deep=True)
+                ),
+                metadata=metadata,
+            )
+
         rules = [
             self._to_metric_rule(rule) for rule in submission_copy.performance_rules
         ]
@@ -98,12 +135,9 @@ class WorkflowUiRequestBuilder:
         ]
         performance_policy = ModelPerformanceAcceptancePolicy(rules=rules)
 
-        metadata = dict(submission_copy.metadata)
-        metadata["ui_source"] = "streamlit_mvp"
-        metadata["builds_analysis_workflow_request"] = True
-
         return AnalysisWorkflowRequest(
             csv_path=csv_path,
+            analysis_mode=AnalysisExecutionMode.SUPERVISED,
             target_column=submission_copy.target_column,
             feature_columns=list(submission_copy.feature_columns),
             model_performance_policy=performance_policy,
@@ -111,6 +145,7 @@ class WorkflowUiRequestBuilder:
             identifier_columns=list(submission_copy.identifier_columns),
             excluded_columns=list(submission_copy.excluded_columns),
             column_role_overrides=dict(submission_copy.column_role_overrides),
+            requested_task=submission_copy.requested_task,
             objective=submission_copy.objective,
             quality_direction=submission_copy.quality_direction,
             quality_target=submission_copy.quality_target,
@@ -124,6 +159,7 @@ class WorkflowUiRequestBuilder:
             max_simultaneous_changes=submission_copy.max_simultaneous_changes,
             operating_point_selection=submission_copy.operating_point_selection,
             explicit_operating_row_id=submission_copy.explicit_operating_row_id,
+            cohort_filter=None,
             metadata=metadata,
         )
 

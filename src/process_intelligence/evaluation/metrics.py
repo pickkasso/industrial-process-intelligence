@@ -26,6 +26,9 @@ from process_intelligence.core.exceptions import DataValidationError, Insufficie
 _R2_MIN_SAMPLES_WARNING = (
     "R2 requires at least 2 samples; r2 is unavailable for a single sample"
 )
+_R2_CONSTANT_TARGET_WARNING = (
+    "R² is not informative because the independent-test target is constant."
+)
 _MISSING_PRED_CLASS_WARNING = (
     "y_pred is missing one or more classes present in y_true"
 )
@@ -320,9 +323,16 @@ def evaluate_regression(y_true: Any, y_pred: Any) -> RegressionMetrics:
 
     warnings: list[str] = []
     r2: float | None
+    unique_true_count = int(np.unique(true_values).shape[0])
     if sample_count < 2:
         r2 = None
         warnings.append(_R2_MIN_SAMPLES_WARNING)
+    elif unique_true_count < 2:
+        # Constant y_true makes R² undefined / non-informative even when a
+        # metric library returns a finite 0.0 or 1.0. Do not approve it as an
+        # observed performance value.
+        r2 = None
+        warnings.append(_R2_CONSTANT_TARGET_WARNING)
     else:
         r2 = _require_finite_metric("r2", float(r2_score(true_values, pred_values)))
 

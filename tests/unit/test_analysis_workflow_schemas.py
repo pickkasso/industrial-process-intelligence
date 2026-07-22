@@ -33,6 +33,8 @@ from process_intelligence.recommendation import (
 )
 from process_intelligence.recommendation.schemas import DEFAULT_RECOMMENDATION_DISCLAIMER
 from process_intelligence.workflow import (
+    ANOMALY_CONTEXT_RADIUS,
+    AnalysisExecutionMode,
     AnalysisWorkflowOutcome,
     AnalysisWorkflowPolicy,
     AnalysisWorkflowReport,
@@ -40,8 +42,14 @@ from process_intelligence.workflow import (
     AnalysisWorkflowStage,
     AnalysisWorkflowStageRecord,
     AnalysisWorkflowStatus,
+    AnomalyContextOrderBasis,
+    AnomalyContextRow,
+    AnomalyContextValue,
+    AnomalyContextWindow,
     IndustrialProcessAnalysisWorkflow,
+    NumericCohortFilter,
     OperatingPointSelectionMode,
+    TaskSelectionSource,
 )
 
 _UTC_START = datetime(2026, 7, 21, 10, 0, tzinfo=UTC)
@@ -53,6 +61,7 @@ _CANONICAL_STAGE_NAMES = [
     "VALIDATE",
     "QUALITY_SCORE",
     "SORT",
+    "COHORT_FILTER",
     "PREPROCESS",
     "INDUSTRY_ROUTING",
     "TASK_ROUTING",
@@ -291,6 +300,20 @@ def _request(**overrides: Any) -> AnalysisWorkflowRequest:
     return AnalysisWorkflowRequest(**_request_kwargs(**overrides))
 
 
+def _anomaly_request_kwargs(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "csv_path": Path("data.csv"),
+        "analysis_mode": AnalysisExecutionMode.ANOMALY_ONLY,
+        "feature_columns": ["pressure", "temperature", "flow"],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _anomaly_request(**overrides: Any) -> AnalysisWorkflowRequest:
+    return AnalysisWorkflowRequest(**_anomaly_request_kwargs(**overrides))
+
+
 # --- stage record helpers ---
 
 
@@ -357,9 +380,17 @@ def _base_report_kwargs(**overrides: Any) -> dict[str, Any]:
         "diagnosis_factor_count": 3,
         "raw_row_count": 100,
         "processed_row_count": 100,
+        "cohort_row_count": 100,
         "train_row_count": 60,
         "validation_row_count": 20,
         "test_row_count": 20,
+        "cohort_filter_summary": {
+            "configured": False,
+            "source_row_count": 100,
+            "retained_row_count": 100,
+            "excluded_row_count": 0,
+            "null_excluded_count": 0,
+        },
         "started_at": _UTC_START,
         "completed_at": _UTC_END,
         "total_seconds": 300.0,
@@ -397,6 +428,86 @@ def _partial_early_report(**overrides: Any) -> AnalysisWorkflowReport:
     return AnalysisWorkflowReport(**payload)
 
 
+_ANOMALY_ONLY_SKIPPED_STAGES = frozenset(
+    {
+        AnalysisWorkflowStage.TASK_ROUTING,
+        AnalysisWorkflowStage.SUPERVISED_SCREENING,
+        AnalysisWorkflowStage.SUPERVISED_FINAL_EVALUATION,
+        AnalysisWorkflowStage.RESIDUAL_CALIBRATION,
+        AnalysisWorkflowStage.RESIDUAL_FINAL_EVALUATION,
+        AnalysisWorkflowStage.RECOMMENDATION,
+    }
+)
+
+
+def _anomaly_only_stage_records() -> list[AnalysisWorkflowStageRecord]:
+    records: list[AnalysisWorkflowStageRecord] = []
+    for stage in list(AnalysisWorkflowStage):
+        if stage is AnalysisWorkflowStage.DIAGNOSIS:
+            break
+        if stage in _ANOMALY_ONLY_SKIPPED_STAGES:
+            records.append(
+                _stage_record(
+                    stage,
+                    executed=False,
+                    succeeded=False,
+                    structured_refusal=False,
+                    message="Not applicable for anomaly-only analysis.",
+                )
+            )
+        else:
+            records.append(_stage_record(stage, executed=True, succeeded=True))
+    records.append(_stage_record(AnalysisWorkflowStage.DIAGNOSIS, executed=True))
+    records.append(
+        _stage_record(
+            AnalysisWorkflowStage.RECOMMENDATION,
+            executed=False,
+            succeeded=False,
+            structured_refusal=False,
+            message="Not applicable for anomaly-only analysis.",
+        )
+    )
+    return records
+
+
+def _anomaly_only_report(**overrides: Any) -> AnalysisWorkflowReport:
+    payload: dict[str, Any] = {
+        "status": AnalysisWorkflowStatus.PARTIAL,
+        "terminal_stage": AnalysisWorkflowStage.DIAGNOSIS,
+        "stage_records": _anomaly_only_stage_records(),
+        "analysis_mode": AnalysisExecutionMode.ANOMALY_ONLY,
+        "model_performance_assessment": None,
+        "final_recommendation": None,
+        "selected_industry": "battery",
+        "selected_task": None,
+        "selected_supervised_model_key": None,
+        "selected_anomaly_model_key": "isolation_forest",
+        "selected_operating_row_id": 5,
+        "anomaly_event_count": 2,
+        "diagnosis_factor_count": 2,
+        "raw_row_count": 100,
+        "processed_row_count": 100,
+        "cohort_row_count": 100,
+        "train_row_count": 60,
+        "validation_row_count": 20,
+        "test_row_count": 20,
+        "cohort_filter_summary": {
+            "configured": False,
+            "source_row_count": 100,
+            "retained_row_count": 100,
+            "excluded_row_count": 0,
+            "null_excluded_count": 0,
+        },
+        "started_at": _UTC_START,
+        "completed_at": _UTC_END,
+        "total_seconds": 12.0,
+        "warnings": [],
+        "metadata": {"analysis_mode": "ANOMALY_ONLY"},
+    }
+    payload.update(overrides)
+    return AnalysisWorkflowReport(**payload)
+
+
 def _refused_report(**overrides: Any) -> AnalysisWorkflowReport:
     payload = _base_report_kwargs(
         status=AnalysisWorkflowStatus.REFUSED,
@@ -430,7 +541,7 @@ def test_stage_enum_values_and_canonical_order() -> None:
     assert list(AnalysisWorkflowStage) == [
         AnalysisWorkflowStage(name) for name in _CANONICAL_STAGE_NAMES
     ]
-    assert len(AnalysisWorkflowStage) == 20
+    assert len(AnalysisWorkflowStage) == 21
     assert AnalysisWorkflowStage.__doc__
 
 
@@ -455,16 +566,38 @@ def test_operating_point_selection_mode_values() -> None:
     assert OperatingPointSelectionMode.__doc__
 
 
+def test_task_selection_source_values() -> None:
+    assert {member.name: member.value for member in TaskSelectionSource} == {
+        "ROUTER": "ROUTER",
+        "USER_OVERRIDE": "USER_OVERRIDE",
+    }
+    assert TaskSelectionSource.__doc__
+
+
+def test_analysis_execution_mode_values() -> None:
+    assert {member.name: member.value for member in AnalysisExecutionMode} == {
+        "SUPERVISED": "SUPERVISED",
+        "ANOMALY_ONLY": "ANOMALY_ONLY",
+    }
+    assert AnalysisExecutionMode.__doc__
+
+
 def test_enums_have_no_extra_members() -> None:
-    assert len(AnalysisWorkflowStage) == 20
+    assert len(AnalysisWorkflowStage) == 21
     assert len(AnalysisWorkflowStatus) == 3
     assert len(OperatingPointSelectionMode) == 4
+    assert len(TaskSelectionSource) == 2
+    assert len(AnalysisExecutionMode) == 2
     with pytest.raises(ValueError):
         AnalysisWorkflowStage("NOT_A_STAGE")
     with pytest.raises(ValueError):
         AnalysisWorkflowStatus("NOT_A_STATUS")
     with pytest.raises(ValueError):
         OperatingPointSelectionMode("NOT_A_MODE")
+    with pytest.raises(ValueError):
+        TaskSelectionSource("NOT_A_SOURCE")
+    with pytest.raises(ValueError):
+        AnalysisExecutionMode("NOT_A_MODE")
 
 
 # --- 5-11: policy ---
@@ -533,6 +666,7 @@ def test_request_valid() -> None:
     assert request.csv_path == Path("data.csv")
     assert request.target_column == "quality"
     assert request.feature_columns == ["pressure", "temperature", "flow"]
+    assert request.requested_task is None
     assert request.objective is RecommendationObjective.IMPROVE_PREDICTED_QUALITY
     assert request.quality_direction is QualityOptimizationDirection.MAXIMIZE
     assert (
@@ -543,6 +677,149 @@ def test_request_valid() -> None:
         request.model_performance_policy, ModelPerformanceAcceptancePolicy
     )
     assert len(request.model_performance_policy.rules) >= 1
+
+
+# --- analysis_mode / ANOMALY_ONLY ---
+
+
+def test_request_analysis_mode_defaults_to_supervised() -> None:
+    request = _request()
+    assert request.analysis_mode is AnalysisExecutionMode.SUPERVISED
+
+
+def test_request_analysis_mode_explicit_supervised() -> None:
+    request = _request(analysis_mode=AnalysisExecutionMode.SUPERVISED)
+    assert request.analysis_mode is AnalysisExecutionMode.SUPERVISED
+    assert request.target_column == "quality"
+    assert request.model_performance_policy is not None
+    assert request.objective is RecommendationObjective.IMPROVE_PREDICTED_QUALITY
+
+
+def test_request_anomaly_only_valid() -> None:
+    request = _anomaly_request()
+    assert request.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
+    assert request.target_column is None
+    assert request.model_performance_policy is None
+    assert request.objective is None
+    assert request.requested_task is None
+    assert request.quality_direction is None
+    assert request.quality_target is None
+    assert request.feature_columns == ["pressure", "temperature", "flow"]
+
+
+def test_request_anomaly_only_target_conflict_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_request(target_column="quality")
+
+
+def test_request_anomaly_only_requested_task_conflict_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_request(requested_task=AnalysisTask.REGRESSION)
+
+
+def test_request_anomaly_only_performance_policy_conflict_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_request(model_performance_policy=_performance_policy())
+
+
+def test_request_anomaly_only_objective_conflict_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_request(objective=RecommendationObjective.REDUCE_ANOMALY_SCORE)
+
+
+def test_request_anomaly_only_quality_direction_conflict_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_request(quality_direction=QualityOptimizationDirection.MAXIMIZE)
+
+
+def test_request_anomaly_only_quality_target_conflict_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_request(quality_target=5.0)
+
+
+def test_request_supervised_missing_target_rejected() -> None:
+    payload = _anomaly_request_kwargs()
+    payload["analysis_mode"] = AnalysisExecutionMode.SUPERVISED
+    payload["model_performance_policy"] = _performance_policy()
+    payload["objective"] = RecommendationObjective.REDUCE_ANOMALY_SCORE
+    with pytest.raises(ValidationError):
+        AnalysisWorkflowRequest(**payload)
+
+
+def test_request_supervised_missing_performance_policy_rejected() -> None:
+    payload = _anomaly_request_kwargs()
+    payload["analysis_mode"] = AnalysisExecutionMode.SUPERVISED
+    payload["target_column"] = "quality"
+    payload["objective"] = RecommendationObjective.REDUCE_ANOMALY_SCORE
+    with pytest.raises(ValidationError):
+        AnalysisWorkflowRequest(**payload)
+
+
+def test_request_supervised_missing_objective_rejected() -> None:
+    payload = _anomaly_request_kwargs()
+    payload["analysis_mode"] = AnalysisExecutionMode.SUPERVISED
+    payload["target_column"] = "quality"
+    payload["model_performance_policy"] = _performance_policy()
+    with pytest.raises(ValidationError):
+        AnalysisWorkflowRequest(**payload)
+
+
+def test_request_anomaly_only_round_trip() -> None:
+    request = _anomaly_request(metadata={"seed": 3})
+    restored = AnalysisWorkflowRequest.model_validate(request.model_dump())
+    assert restored.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
+    assert restored.target_column is None
+    assert restored.model_performance_policy is None
+    assert restored.objective is None
+    assert restored == request
+
+
+def test_request_analysis_mode_default_state_independence() -> None:
+    supervised = _request()
+    anomaly = _anomaly_request()
+    assert supervised.analysis_mode is AnalysisExecutionMode.SUPERVISED
+    assert anomaly.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
+    # Constructing the anomaly-only request must not mutate the supervised one.
+    assert supervised.analysis_mode is AnalysisExecutionMode.SUPERVISED
+    assert supervised.target_column == "quality"
+
+
+def test_request_requested_task_none_is_auto() -> None:
+    request = _request(requested_task=None)
+    assert request.requested_task is None
+
+
+def test_request_requested_task_explicit_regression() -> None:
+    request = _request(requested_task=AnalysisTask.REGRESSION)
+    assert request.requested_task is AnalysisTask.REGRESSION
+    restored = AnalysisWorkflowRequest.model_validate(request.model_dump())
+    assert restored.requested_task is AnalysisTask.REGRESSION
+
+
+def test_request_requested_task_explicit_classification() -> None:
+    request = _request(requested_task=AnalysisTask.CLASSIFICATION)
+    assert request.requested_task is AnalysisTask.CLASSIFICATION
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        AnalysisTask.UNSUPERVISED_ANOMALY,
+        "NOT_A_TASK",
+        1,
+        True,
+    ],
+)
+def test_request_requested_task_invalid_rejected(bad_value: object) -> None:
+    with pytest.raises(ValidationError):
+        _request(requested_task=bad_value)  # type: ignore[arg-type]
+
+
+def test_request_requested_task_no_mutable_state() -> None:
+    request = _request(requested_task=AnalysisTask.REGRESSION)
+    dumped = request.model_dump()
+    dumped["requested_task"] = AnalysisTask.CLASSIFICATION.value
+    assert request.requested_task is AnalysisTask.REGRESSION
 
 
 def test_request_requires_model_performance_policy() -> None:
@@ -836,7 +1113,7 @@ def test_report_completed_valid() -> None:
     assert report.terminal_stage is AnalysisWorkflowStage.RECOMMENDATION
     assert report.final_recommendation is not None
     assert report.final_recommendation.status is RecommendationStatus.GENERATED
-    assert len(report.stage_records) == 20
+    assert len(report.stage_records) == 21
 
 
 def test_report_partial_valid() -> None:
@@ -889,7 +1166,11 @@ def test_report_out_of_order_stages_rejected() -> None:
         )
 
 
-def test_report_executed_prefix_violation_rejected() -> None:
+def test_report_skipped_stage_between_executed_stages_allowed() -> None:
+    # Under the "all canonical stages present" rule (not a strict contiguous
+    # executed-only prefix), an explicitly skipped (executed=False) record may
+    # sit between two executed records, as long as every canonical stage from
+    # LOAD through the last executed stage is present in stage_records.
     records = [
         _stage_record(AnalysisWorkflowStage.LOAD, executed=True),
         _stage_record(
@@ -900,11 +1181,35 @@ def test_report_executed_prefix_violation_rejected() -> None:
         ),
         _stage_record(AnalysisWorkflowStage.VALIDATE, executed=True),
     ]
+    report = _completed_report(
+        status=AnalysisWorkflowStatus.PARTIAL,
+        terminal_stage=AnalysisWorkflowStage.VALIDATE,
+        stage_records=records,
+        model_performance_assessment=None,
+        final_recommendation=None,
+    )
+    assert report.terminal_stage is AnalysisWorkflowStage.VALIDATE
+    assert [record.stage for record in report.stage_records] == [
+        AnalysisWorkflowStage.LOAD,
+        AnalysisWorkflowStage.PROFILE,
+        AnalysisWorkflowStage.VALIDATE,
+    ]
+    assert report.stage_records[1].executed is False
+
+
+def test_report_missing_canonical_stage_before_last_executed_rejected() -> None:
+    # Omitting a canonical stage entirely (not even as a skipped record)
+    # between LOAD and the last executed stage must still be rejected.
+    records = [
+        _stage_record(AnalysisWorkflowStage.LOAD, executed=True),
+        _stage_record(AnalysisWorkflowStage.VALIDATE, executed=True),
+    ]
     with pytest.raises(ValidationError):
         _completed_report(
             status=AnalysisWorkflowStatus.PARTIAL,
             terminal_stage=AnalysisWorkflowStage.VALIDATE,
             stage_records=records,
+            model_performance_assessment=None,
             final_recommendation=None,
         )
 
@@ -990,6 +1295,43 @@ def test_report_round_trip() -> None:
     )
 
 
+# --- analysis_mode on AnalysisWorkflowReport ---
+
+
+def test_report_analysis_mode_defaults_to_supervised() -> None:
+    report = _completed_report()
+    assert report.analysis_mode is AnalysisExecutionMode.SUPERVISED
+
+
+def test_report_analysis_mode_anomaly_only_with_skipped_stages() -> None:
+    report = _anomaly_only_report()
+    assert report.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
+    assert report.status is AnalysisWorkflowStatus.PARTIAL
+    assert report.terminal_stage is AnalysisWorkflowStage.DIAGNOSIS
+    assert report.selected_task is None
+    assert report.model_performance_assessment is None
+    assert report.final_recommendation is None
+    stage_by_name = {record.stage: record for record in report.stage_records}
+    for stage in _ANOMALY_ONLY_SKIPPED_STAGES:
+        assert stage_by_name[stage].executed is False
+    assert stage_by_name[AnalysisWorkflowStage.DIAGNOSIS].executed is True
+    # All canonical stages through DIAGNOSIS (inclusive) must be present.
+    present_stages = {record.stage for record in report.stage_records}
+    diagnosis_index = list(AnalysisWorkflowStage).index(AnalysisWorkflowStage.DIAGNOSIS)
+    for stage in list(AnalysisWorkflowStage)[: diagnosis_index + 1]:
+        assert stage in present_stages
+    # RECOMMENDATION appears as an explicitly skipped record too.
+    assert AnalysisWorkflowStage.RECOMMENDATION in present_stages
+    assert stage_by_name[AnalysisWorkflowStage.RECOMMENDATION].executed is False
+
+
+def test_report_anomaly_only_round_trip_preserves_analysis_mode() -> None:
+    report = _anomaly_only_report()
+    restored = AnalysisWorkflowReport.model_validate(report.model_dump())
+    assert restored.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
+    assert restored == report
+
+
 # --- 56-57: outcome ---
 
 
@@ -1017,6 +1359,7 @@ def test_public_package_exports() -> None:
     assert workflow.AnalysisWorkflowStage is AnalysisWorkflowStage
     assert workflow.AnalysisWorkflowStatus is AnalysisWorkflowStatus
     assert workflow.OperatingPointSelectionMode is OperatingPointSelectionMode
+    assert workflow.TaskSelectionSource is TaskSelectionSource
     assert workflow.AnalysisWorkflowPolicy is AnalysisWorkflowPolicy
     assert workflow.AnalysisWorkflowRequest is AnalysisWorkflowRequest
     assert workflow.AnalysisWorkflowStageRecord is AnalysisWorkflowStageRecord
@@ -1025,7 +1368,11 @@ def test_public_package_exports() -> None:
     assert workflow.IndustrialProcessAnalysisWorkflow is (
         IndustrialProcessAnalysisWorkflow
     )
+    assert workflow.AnalysisExecutionMode is AnalysisExecutionMode
     assert set(workflow.__all__) == {
+        "ANOMALY_CONTEXT_MAX_FEATURES",
+        "ANOMALY_CONTEXT_RADIUS",
+        "AnalysisExecutionMode",
         "AnalysisWorkflowOutcome",
         "AnalysisWorkflowPolicy",
         "AnalysisWorkflowReport",
@@ -1033,6 +1380,231 @@ def test_public_package_exports() -> None:
         "AnalysisWorkflowStage",
         "AnalysisWorkflowStageRecord",
         "AnalysisWorkflowStatus",
+        "AnomalyContextIdentifierValue",
+        "AnomalyContextOrderBasis",
+        "AnomalyContextRow",
+        "AnomalyContextValue",
+        "AnomalyContextWindow",
+        "CohortFilterSummary",
         "IndustrialProcessAnalysisWorkflow",
+        "NumericCohortFilter",
+        "NumericCohortFilterOutcome",
         "OperatingPointSelectionMode",
+        "TaskSelectionSource",
+        "apply_numeric_cohort_filter",
+        "list_numeric_cohort_filter_candidates",
+        "observed_numeric_range",
+        "preview_numeric_cohort_filter_row_count",
     }
+
+
+# ---------------------------------------------------------------------------
+# Anomaly context window schemas (Step 11B.9)
+# ---------------------------------------------------------------------------
+
+
+def _context_value(**overrides: Any) -> AnomalyContextValue:
+    payload: dict[str, Any] = {"feature_name": "RSOCmin", "value": 42.5}
+    payload.update(overrides)
+    return AnomalyContextValue(**payload)
+
+
+def _context_row(**overrides: Any) -> AnomalyContextRow:
+    payload: dict[str, Any] = {
+        "analysis_position": 10,
+        "original_row_id": 13,
+        "relative_offset": 0,
+        "is_center_event": True,
+        "is_selected_anomaly_event": True,
+        "identifier_values": [],
+        "timestamp_value": None,
+        "feature_values": [_context_value()],
+    }
+    payload.update(overrides)
+    return AnomalyContextRow(**payload)
+
+
+def _context_window(**overrides: Any) -> AnomalyContextWindow:
+    payload: dict[str, Any] = {
+        "event_rank": 1,
+        "center_original_row_id": 13,
+        "center_anomaly_score": -0.2,
+        "radius": ANOMALY_CONTEXT_RADIUS,
+        "order_basis": AnomalyContextOrderBasis.LOADED_ROW_ORDER,
+        "feature_names": ["RSOCmin"],
+        "rows": [_context_row()],
+    }
+    payload.update(overrides)
+    return AnomalyContextWindow(**payload)
+
+
+def test_context_value_valid_numeric_string_null() -> None:
+    assert _context_value(value=1.5).value == pytest.approx(1.5)
+    assert _context_value(value="abc").value == "abc"
+    assert _context_value(value=None).value is None
+
+
+def test_context_value_rejects_arbitrary_object() -> None:
+    with pytest.raises(ValidationError):
+        _context_value(value={"nested": True})  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        _context_value(value=float("nan"))
+
+
+def test_context_row_strict_bool_and_offsets() -> None:
+    assert _context_row(relative_offset=-3, is_center_event=False).relative_offset == -3
+    assert _context_row(relative_offset=2, is_center_event=False).relative_offset == 2
+    with pytest.raises(ValidationError):
+        _context_row(is_center_event=1)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        _context_row(relative_offset=0, is_center_event=False)
+    with pytest.raises(ValidationError):
+        _context_row(relative_offset=1, is_center_event=True)
+
+
+def test_context_window_radius_and_immutability_round_trip() -> None:
+    window = _context_window()
+    assert window.radius == 3
+    assert window.radius == ANOMALY_CONTEXT_RADIUS
+    with pytest.raises(ValidationError):
+        _context_window(radius=4)
+    dumped = window.model_dump(mode="json")
+    restored = AnomalyContextWindow.model_validate(dumped)
+    assert restored == window
+    mutated = list(window.feature_names)
+    mutated.append("extra")
+    assert window.feature_names == ["RSOCmin"]
+
+
+def test_report_accepts_empty_and_populated_context_windows() -> None:
+    empty = _anomaly_only_report(anomaly_context_windows=[])
+    assert empty.anomaly_context_windows == []
+    populated = _anomaly_only_report(anomaly_context_windows=[_context_window()])
+    assert len(populated.anomaly_context_windows) == 1
+    assert populated.anomaly_context_windows[0].center_original_row_id == 13
+
+
+# --- NumericCohortFilter / cohort_filter request contracts (Step 11B.10) ---
+
+
+def test_numeric_cohort_filter_valid() -> None:
+    cohort = NumericCohortFilter(
+        column_name="RSOCavg",
+        lower_bound=80.0,
+        upper_bound=100.0,
+    )
+    assert cohort.column_name == "RSOCavg"
+    assert cohort.lower_bound == pytest.approx(80.0)
+    assert cohort.upper_bound == pytest.approx(100.0)
+    assert cohort.include_lower is True
+    assert cohort.include_upper is True
+    assert cohort.exclude_filter_column_from_features is True
+
+
+def test_numeric_cohort_filter_inclusive_and_exclusive_bounds() -> None:
+    inclusive = NumericCohortFilter(
+        column_name="RSOCavg",
+        lower_bound=80.0,
+        upper_bound=100.0,
+        include_lower=True,
+        include_upper=True,
+    )
+    exclusive = NumericCohortFilter(
+        column_name="RSOCavg",
+        lower_bound=80.0,
+        upper_bound=100.0,
+        include_lower=False,
+        include_upper=False,
+    )
+    assert inclusive.include_lower is True
+    assert exclusive.include_upper is False
+
+
+def test_numeric_cohort_filter_allows_equal_bounds() -> None:
+    cohort = NumericCohortFilter(
+        column_name="RSOCavg",
+        lower_bound=90.0,
+        upper_bound=90.0,
+    )
+    assert cohort.lower_bound == cohort.upper_bound
+
+
+def test_numeric_cohort_filter_rejects_lower_greater_than_upper() -> None:
+    with pytest.raises(ValidationError):
+        NumericCohortFilter(
+            column_name="RSOCavg",
+            lower_bound=100.0,
+            upper_bound=80.0,
+        )
+
+
+def test_numeric_cohort_filter_rejects_nan_and_infinity() -> None:
+    with pytest.raises(ValidationError):
+        NumericCohortFilter(
+            column_name="RSOCavg",
+            lower_bound=float("nan"),
+            upper_bound=100.0,
+        )
+    with pytest.raises(ValidationError):
+        NumericCohortFilter(
+            column_name="RSOCavg",
+            lower_bound=80.0,
+            upper_bound=float("inf"),
+        )
+
+
+def test_numeric_cohort_filter_rejects_blank_column() -> None:
+    with pytest.raises(ValidationError):
+        NumericCohortFilter(column_name="  ", lower_bound=0.0, upper_bound=1.0)
+
+
+def test_numeric_cohort_filter_strict_bool() -> None:
+    with pytest.raises(ValidationError):
+        NumericCohortFilter(
+            column_name="RSOCavg",
+            lower_bound=80.0,
+            upper_bound=100.0,
+            include_lower=1,  # type: ignore[arg-type]
+        )
+
+
+def test_request_anomaly_only_allows_cohort_filter() -> None:
+    request = _anomaly_request(
+        cohort_filter=NumericCohortFilter(
+            column_name="pressure",
+            lower_bound=10.0,
+            upper_bound=50.0,
+        )
+    )
+    assert request.cohort_filter is not None
+    assert request.cohort_filter.column_name == "pressure"
+
+
+def test_request_supervised_rejects_cohort_filter() -> None:
+    with pytest.raises(ValidationError):
+        _request(
+            cohort_filter=NumericCohortFilter(
+                column_name="pressure",
+                lower_bound=10.0,
+                upper_bound=50.0,
+            )
+        )
+
+
+def test_request_cohort_filter_defaults_to_none() -> None:
+    assert _request().cohort_filter is None
+    assert _anomaly_request().cohort_filter is None
+
+
+def test_numeric_cohort_filter_immutable_round_trip() -> None:
+    cohort = NumericCohortFilter(
+        column_name="RSOCavg",
+        lower_bound=80.0,
+        upper_bound=100.0,
+        include_lower=False,
+        include_upper=True,
+        exclude_filter_column_from_features=False,
+    )
+    restored = NumericCohortFilter.model_validate(cohort.model_dump(mode="json"))
+    assert restored == cohort
+    assert dataclasses.is_dataclass(cohort) is False

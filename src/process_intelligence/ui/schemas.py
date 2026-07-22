@@ -12,7 +12,7 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from process_intelligence.core.enums import ColumnRole
+from process_intelligence.core.enums import AnalysisTask, ColumnRole
 from process_intelligence.evaluation.performance_acceptance import (
     MetricAcceptanceDirection,
 )
@@ -20,7 +20,11 @@ from process_intelligence.recommendation import (
     QualityOptimizationDirection,
     RecommendationObjective,
 )
-from process_intelligence.workflow.enums import OperatingPointSelectionMode
+from process_intelligence.workflow.enums import (
+    AnalysisExecutionMode,
+    OperatingPointSelectionMode,
+)
+from process_intelligence.workflow.schemas import NumericCohortFilter
 
 ScalarMetadataValue = str | int | float | bool | None
 """Allowed scalar types for UI submission metadata dictionaries."""
@@ -236,16 +240,18 @@ class WorkflowUiSubmission(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    target_column: str
+    analysis_mode: AnalysisExecutionMode = AnalysisExecutionMode.SUPERVISED
+    target_column: str | None = None
     feature_columns: list[str]
     timestamp_column: str | None = None
     identifier_columns: list[str] = Field(default_factory=list)
     excluded_columns: list[str] = Field(default_factory=list)
     column_role_overrides: dict[str, ColumnRole] = Field(default_factory=dict)
-    objective: RecommendationObjective
+    requested_task: AnalysisTask | None = None
+    objective: RecommendationObjective | None = None
     quality_direction: QualityOptimizationDirection | None = None
     quality_target: float | None = None
-    performance_rules: list[UiMetricRuleInput]
+    performance_rules: list[UiMetricRuleInput] = Field(default_factory=list)
     constraints: list[UiVariableConstraintInput] = Field(default_factory=list)
     user_confirmed_controllable_variables: list[str] = Field(default_factory=list)
     user_verified_variables: list[str] = Field(default_factory=list)
@@ -254,11 +260,29 @@ class WorkflowUiSubmission(BaseModel):
         OperatingPointSelectionMode.TOP_RESIDUAL_ANOMALY
     )
     explicit_operating_row_id: int | str | None = None
+    cohort_filter: NumericCohortFilter | None = None
     metadata: dict[str, ScalarMetadataValue] = Field(default_factory=dict)
+
+    @field_validator("analysis_mode", mode="before")
+    @classmethod
+    def _validate_analysis_mode(cls, value: object) -> AnalysisExecutionMode:
+        if isinstance(value, AnalysisExecutionMode):
+            return value
+        if isinstance(value, str):
+            try:
+                return AnalysisExecutionMode(value)
+            except ValueError as exc:
+                raise ValueError(f"invalid AnalysisExecutionMode: {value!r}") from exc
+        raise ValueError(
+            "analysis_mode must be AnalysisExecutionMode, "
+            f"got {type(value).__name__}"
+        )
 
     @field_validator("target_column", mode="before")
     @classmethod
-    def _validate_target_column(cls, value: object) -> str:
+    def _validate_target_column(cls, value: object) -> str | None:
+        if value is None:
+            return None
         return _validate_column_name(value, field_name="target_column")
 
     @field_validator("feature_columns", mode="before")
@@ -346,9 +370,38 @@ class WorkflowUiSubmission(BaseModel):
             cleaned[name] = role
         return cleaned
 
+    @field_validator("requested_task", mode="before")
+    @classmethod
+    def _validate_requested_task(cls, value: object) -> AnalysisTask | None:
+        if value is None:
+            return None
+        if isinstance(value, AnalysisTask):
+            task = value
+        elif isinstance(value, str):
+            try:
+                task = AnalysisTask(value)
+            except ValueError as exc:
+                raise ValueError(f"invalid AnalysisTask: {value!r}") from exc
+        else:
+            raise ValueError(
+                "requested_task must be AnalysisTask or None, "
+                f"got {type(value).__name__}"
+            )
+        if task not in {
+            AnalysisTask.REGRESSION,
+            AnalysisTask.CLASSIFICATION,
+        }:
+            raise ValueError(
+                "requested_task must be REGRESSION, CLASSIFICATION, or None, "
+                f"got {task!r}"
+            )
+        return task
+
     @field_validator("objective", mode="before")
     @classmethod
-    def _validate_objective(cls, value: object) -> RecommendationObjective:
+    def _validate_objective(cls, value: object) -> RecommendationObjective | None:
+        if value is None:
+            return None
         if isinstance(value, RecommendationObjective):
             return value
         if isinstance(value, str):
@@ -359,7 +412,8 @@ class WorkflowUiSubmission(BaseModel):
                     f"invalid RecommendationObjective: {value!r}"
                 ) from exc
         raise ValueError(
-            f"objective must be RecommendationObjective, got {type(value).__name__}"
+            "objective must be RecommendationObjective or None, "
+            f"got {type(value).__name__}"
         )
 
     @field_validator("quality_direction", mode="before")
@@ -408,8 +462,6 @@ class WorkflowUiSubmission(BaseModel):
         cls,
         value: list[UiMetricRuleInput],
     ) -> list[UiMetricRuleInput]:
-        if not value:
-            raise ValueError("performance_rules must contain at least one rule")
         seen: set[str] = set()
         copied: list[UiMetricRuleInput] = []
         for item in value:
@@ -541,23 +593,87 @@ class WorkflowUiSubmission(BaseModel):
             return {}
         return _validate_scalar_metadata(value)
 
+    @field_validator("cohort_filter", mode="before")
+    @classmethod
+    def _validate_cohort_filter(cls, value: object) -> NumericCohortFilter | None:
+        if value is None:
+            return None
+        if isinstance(value, NumericCohortFilter):
+            return value.model_copy(deep=True)
+        if isinstance(value, dict):
+            return NumericCohortFilter.model_validate(value)
+        raise ValueError(
+            "cohort_filter must be NumericCohortFilter or None, "
+            f"got {type(value).__name__}"
+        )
+
     @model_validator(mode="after")
     def _validate_cross_fields(self) -> Self:
         feature_set = set(self.feature_columns)
-        if self.target_column in feature_set:
+        identifier_set = set(self.identifier_columns)
+        excluded_set = set(self.excluded_columns)
+
+        if self.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY:
+            if self.target_column is not None:
+                raise ValueError(
+                    "target_column must be None when analysis_mode is ANOMALY_ONLY"
+                )
+            if self.requested_task is not None:
+                raise ValueError(
+                    "requested_task must be None when analysis_mode is ANOMALY_ONLY"
+                )
+            if self.performance_rules:
+                raise ValueError(
+                    "performance_rules must be empty when analysis_mode "
+                    "is ANOMALY_ONLY"
+                )
+            if self.objective is not None:
+                raise ValueError(
+                    "objective must be None when analysis_mode is ANOMALY_ONLY"
+                )
+            if self.quality_direction is not None:
+                raise ValueError(
+                    "quality_direction must be None when analysis_mode "
+                    "is ANOMALY_ONLY"
+                )
+            if self.quality_target is not None:
+                raise ValueError(
+                    "quality_target must be None when analysis_mode is ANOMALY_ONLY"
+                )
+        else:
+            if self.cohort_filter is not None:
+                raise ValueError(
+                    "cohort_filter is only supported when analysis_mode is "
+                    "ANOMALY_ONLY"
+                )
+            if self.target_column is None:
+                raise ValueError(
+                    "target_column is required when analysis_mode is SUPERVISED"
+                )
+            if self.objective is None:
+                raise ValueError(
+                    "objective is required when analysis_mode is SUPERVISED"
+                )
+            if not self.performance_rules:
+                raise ValueError(
+                    "performance_rules must contain at least one rule when "
+                    "analysis_mode is SUPERVISED"
+                )
+
+        if self.target_column is not None and self.target_column in feature_set:
             raise ValueError(
                 "feature_columns must not include target_column "
                 f"({self.target_column!r})"
             )
 
-        identifier_set = set(self.identifier_columns)
-        excluded_set = set(self.excluded_columns)
         if identifier_set & excluded_set:
             raise ValueError(
                 "identifier_columns and excluded_columns must be disjoint: "
                 f"{sorted(identifier_set & excluded_set)}"
             )
-        if self.target_column in identifier_set or self.target_column in excluded_set:
+        if self.target_column is not None and (
+            self.target_column in identifier_set or self.target_column in excluded_set
+        ):
             raise ValueError(
                 "target_column must not appear in identifier_columns or "
                 "excluded_columns"
@@ -570,7 +686,10 @@ class WorkflowUiSubmission(BaseModel):
             )
 
         if self.timestamp_column is not None:
-            if self.timestamp_column == self.target_column:
+            if (
+                self.target_column is not None
+                and self.timestamp_column == self.target_column
+            ):
                 raise ValueError("timestamp_column must not equal target_column")
             if self.timestamp_column in feature_set:
                 raise ValueError("timestamp_column must not appear in feature_columns")
@@ -582,20 +701,25 @@ class WorkflowUiSubmission(BaseModel):
                 raise ValueError("timestamp_column must not appear in excluded_columns")
 
         for name, role in self.column_role_overrides.items():
-            if name == self.target_column and role is not ColumnRole.TARGET_QUALITY:
+            if (
+                self.target_column is not None
+                and name == self.target_column
+                and role is not ColumnRole.TARGET_QUALITY
+            ):
                 raise ValueError(
                     "target_column override must use ColumnRole.TARGET_QUALITY"
                 )
 
-        needs_quality = self.objective in {
-            RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
-            RecommendationObjective.BALANCE_QUALITY_AND_ANOMALY,
-        }
-        if needs_quality and self.quality_direction is None:
-            raise ValueError(
-                "quality_direction is required for IMPROVE_PREDICTED_QUALITY "
-                "and BALANCE_QUALITY_AND_ANOMALY objectives"
-            )
+        if self.objective is not None:
+            needs_quality = self.objective in {
+                RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
+                RecommendationObjective.BALANCE_QUALITY_AND_ANOMALY,
+            }
+            if needs_quality and self.quality_direction is None:
+                raise ValueError(
+                    "quality_direction is required for IMPROVE_PREDICTED_QUALITY "
+                    "and BALANCE_QUALITY_AND_ANOMALY objectives"
+                )
 
         if self.quality_direction is QualityOptimizationDirection.TARGET:
             if self.quality_target is None:

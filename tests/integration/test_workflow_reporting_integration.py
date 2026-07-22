@@ -413,11 +413,11 @@ def test_stage_order_matches_workflow(
 ) -> None:
     source = quality_outcome.report
     presentation = AnalysisWorkflowReportBuilder().build(source).report
-    assert len(presentation.stages) == 20
+    assert len(presentation.stages) == 21
     assert [stage.stage for stage in presentation.stages] == [
         record.stage for record in source.stage_records
     ]
-    assert [stage.sequence for stage in presentation.stages] == list(range(1, 21))
+    assert [stage.sequence for stage in presentation.stages] == list(range(1, 22))
 
 
 def test_recommendation_mapping_for_generated_or_ready(
@@ -558,6 +558,7 @@ def test_datetime_and_counts_preserved(
     assert presentation.overview.total_seconds == pytest.approx(source.total_seconds)
     assert presentation.data_summary.raw_row_count == source.raw_row_count
     assert presentation.data_summary.processed_row_count == source.processed_row_count
+    assert presentation.data_summary.cohort_row_count == source.cohort_row_count
     assert presentation.data_summary.train_row_count == source.train_row_count
     assert presentation.data_summary.validation_row_count == source.validation_row_count
     assert presentation.data_summary.test_row_count == source.test_row_count
@@ -566,7 +567,7 @@ def test_datetime_and_counts_preserved(
         + presentation.data_summary.validation_row_count
         + presentation.data_summary.test_row_count
     )
-    assert split_total == presentation.data_summary.processed_row_count
+    assert split_total == presentation.data_summary.cohort_row_count
 
 
 def test_builder_does_not_rewrite_backend_status(

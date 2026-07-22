@@ -7,23 +7,44 @@ and recommendation packages. It does not reimplement any modeling, diagnosis, or
 recommendation algorithm.
 """
 
+from process_intelligence.workflow.cohort_filter import (
+    NumericCohortFilterOutcome,
+    apply_numeric_cohort_filter,
+    list_numeric_cohort_filter_candidates,
+    observed_numeric_range,
+    preview_numeric_cohort_filter_row_count,
+)
 from process_intelligence.workflow.enums import (
+    AnalysisExecutionMode,
     AnalysisWorkflowStage,
     AnalysisWorkflowStatus,
+    AnomalyContextOrderBasis,
     OperatingPointSelectionMode,
+    TaskSelectionSource,
 )
 from process_intelligence.workflow.pipeline import (
     IndustrialProcessAnalysisWorkflow,
 )
 from process_intelligence.workflow.schemas import (
+    ANOMALY_CONTEXT_MAX_FEATURES,
+    ANOMALY_CONTEXT_RADIUS,
     AnalysisWorkflowOutcome,
     AnalysisWorkflowPolicy,
     AnalysisWorkflowReport,
     AnalysisWorkflowRequest,
     AnalysisWorkflowStageRecord,
+    AnomalyContextIdentifierValue,
+    AnomalyContextRow,
+    AnomalyContextValue,
+    AnomalyContextWindow,
+    CohortFilterSummary,
+    NumericCohortFilter,
 )
 
 __all__ = [
+    "ANOMALY_CONTEXT_MAX_FEATURES",
+    "ANOMALY_CONTEXT_RADIUS",
+    "AnalysisExecutionMode",
     "AnalysisWorkflowOutcome",
     "AnalysisWorkflowPolicy",
     "AnalysisWorkflowReport",
@@ -31,6 +52,19 @@ __all__ = [
     "AnalysisWorkflowStage",
     "AnalysisWorkflowStageRecord",
     "AnalysisWorkflowStatus",
+    "AnomalyContextIdentifierValue",
+    "AnomalyContextOrderBasis",
+    "AnomalyContextRow",
+    "AnomalyContextValue",
+    "AnomalyContextWindow",
+    "CohortFilterSummary",
     "IndustrialProcessAnalysisWorkflow",
+    "NumericCohortFilter",
+    "NumericCohortFilterOutcome",
     "OperatingPointSelectionMode",
+    "TaskSelectionSource",
+    "apply_numeric_cohort_filter",
+    "list_numeric_cohort_filter_candidates",
+    "observed_numeric_range",
+    "preview_numeric_cohort_filter_row_count",
 ]

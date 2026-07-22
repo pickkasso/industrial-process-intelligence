@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from process_intelligence.core.enums import ColumnRole
+from process_intelligence.core.enums import AnalysisTask, ColumnRole
 from process_intelligence.evaluation import MetricAcceptanceDirection
 from process_intelligence.recommendation import (
     QualityOptimizationDirection,
@@ -20,7 +20,7 @@ from process_intelligence.ui import (
     UiVariableConstraintInput,
     WorkflowUiSubmission,
 )
-from process_intelligence.workflow import OperatingPointSelectionMode
+from process_intelligence.workflow import AnalysisExecutionMode, OperatingPointSelectionMode
 
 
 def _rule(**overrides: Any) -> UiMetricRuleInput:
@@ -98,7 +98,40 @@ def test_constraint_rejects_minimum_ge_maximum() -> None:
 def test_valid_submission() -> None:
     submission = _submission()
     assert submission.target_column == "quality"
+    assert submission.requested_task is None
     assert len(submission.performance_rules) == 1
+
+
+def test_submission_requested_task_auto() -> None:
+    submission = _submission(requested_task=None)
+    assert submission.requested_task is None
+
+
+def test_submission_requested_task_regression() -> None:
+    submission = _submission(requested_task=AnalysisTask.REGRESSION)
+    assert submission.requested_task is AnalysisTask.REGRESSION
+
+
+def test_submission_requested_task_classification() -> None:
+    submission = _submission(requested_task=AnalysisTask.CLASSIFICATION)
+    assert submission.requested_task is AnalysisTask.CLASSIFICATION
+
+
+def test_submission_requested_task_rejects_unsupported() -> None:
+    with pytest.raises(ValidationError):
+        _submission(requested_task=AnalysisTask.UNSUPERVISED_ANOMALY)
+    with pytest.raises(ValidationError):
+        _submission(requested_task="NOT_A_TASK")
+
+
+def test_submission_soh_name_does_not_force_regression() -> None:
+    submission = _submission(
+        target_column="SOH",
+        feature_columns=["pressure"],
+        max_simultaneous_changes=1,
+    )
+    assert submission.target_column == "SOH"
+    assert submission.requested_task is None
 
 
 def test_metric_duplicate_rejected() -> None:
@@ -234,3 +267,146 @@ def test_round_trip() -> None:
     restored = WorkflowUiSubmission.model_validate(dumped)
     assert restored == submission
     assert not math.isnan(restored.performance_rules[0].threshold)
+
+
+# ---------------------------------------------------------------------------
+# ANOMALY_ONLY analysis mode (Step 11B.5)
+# ---------------------------------------------------------------------------
+
+
+def _anomaly_submission(**overrides: Any) -> WorkflowUiSubmission:
+    payload: dict[str, Any] = {
+        "analysis_mode": AnalysisExecutionMode.ANOMALY_ONLY,
+        "feature_columns": ["pressure", "temperature"],
+        "identifier_columns": [],
+        "excluded_columns": [],
+        "max_simultaneous_changes": 2,
+        "operating_point_selection": (
+            OperatingPointSelectionMode.TOP_UNSUPERVISED_ANOMALY
+        ),
+    }
+    payload.update(overrides)
+    return WorkflowUiSubmission(**payload)
+
+
+def test_analysis_mode_defaults_to_supervised() -> None:
+    submission = _submission()
+    assert submission.analysis_mode is AnalysisExecutionMode.SUPERVISED
+
+
+def test_analysis_mode_explicit_supervised() -> None:
+    submission = _submission(analysis_mode=AnalysisExecutionMode.SUPERVISED)
+    assert submission.analysis_mode is AnalysisExecutionMode.SUPERVISED
+
+
+def test_anomaly_only_valid_submission() -> None:
+    submission = _anomaly_submission()
+    assert submission.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
+    assert submission.target_column is None
+    assert submission.objective is None
+    assert submission.performance_rules == []
+    assert submission.feature_columns == ["pressure", "temperature"]
+
+
+def test_anomaly_only_target_column_conflict_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_submission(target_column="quality")
+
+
+def test_anomaly_only_requested_task_conflict_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_submission(requested_task=AnalysisTask.REGRESSION)
+
+
+def test_anomaly_only_performance_rules_conflict_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_submission(performance_rules=[_rule()])
+
+
+def test_anomaly_only_objective_conflict_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_submission(objective=RecommendationObjective.REDUCE_ANOMALY_SCORE)
+
+
+def test_anomaly_only_quality_direction_conflict_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_submission(quality_direction=QualityOptimizationDirection.MAXIMIZE)
+
+
+def test_anomaly_only_quality_target_conflict_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_submission(
+            quality_direction=QualityOptimizationDirection.TARGET,
+            quality_target=90.0,
+        )
+
+
+def test_supervised_missing_target_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _submission(analysis_mode=AnalysisExecutionMode.SUPERVISED, target_column=None)
+
+
+def test_supervised_missing_objective_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _submission(
+            analysis_mode=AnalysisExecutionMode.SUPERVISED,
+            objective=None,
+            quality_direction=None,
+        )
+
+
+def test_supervised_missing_performance_rules_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _submission(
+            analysis_mode=AnalysisExecutionMode.SUPERVISED,
+            performance_rules=[],
+        )
+
+
+def test_anomaly_only_round_trip() -> None:
+    submission = _anomaly_submission()
+    dumped = submission.model_dump(mode="json")
+    restored = WorkflowUiSubmission.model_validate(dumped)
+    assert restored == submission
+    assert restored.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
+
+
+def test_supervised_regression_still_valid() -> None:
+    # Guards against ANOMALY_ONLY additions breaking the default SUPERVISED
+    # submission path exercised throughout the rest of this module.
+    submission = _submission()
+    assert submission.analysis_mode is AnalysisExecutionMode.SUPERVISED
+    assert submission.target_column == "quality"
+    assert len(submission.performance_rules) == 1
+
+
+def test_anomaly_only_allows_cohort_filter() -> None:
+    from process_intelligence.workflow import NumericCohortFilter
+
+    submission = _anomaly_submission(
+        cohort_filter=NumericCohortFilter(
+            column_name="pressure",
+            lower_bound=10.0,
+            upper_bound=50.0,
+        )
+    )
+    assert submission.cohort_filter is not None
+    assert submission.cohort_filter.column_name == "pressure"
+
+
+def test_supervised_rejects_cohort_filter() -> None:
+    from process_intelligence.workflow import NumericCohortFilter
+
+    with pytest.raises(ValidationError):
+        _submission(
+            cohort_filter=NumericCohortFilter(
+                column_name="pressure",
+                lower_bound=10.0,
+                upper_bound=50.0,
+            )
+        )
+
+
+def test_cohort_filter_defaults_to_none() -> None:
+    assert _submission().cohort_filter is None
+    assert _anomaly_submission().cohort_filter is None

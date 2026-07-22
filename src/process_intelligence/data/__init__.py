@@ -32,6 +32,11 @@ from process_intelligence.data.quality_score import (
     QualityPenalty,
 )
 from process_intelligence.data.sorter import DatasetSorter, SortResult
+from process_intelligence.data.target_suitability import (
+    TargetSuitabilityAssessment,
+    TargetSuitabilityRefusalCode,
+    evaluate_target_suitability,
+)
 from process_intelligence.data.validator import DatasetValidator
 
 __all__ = [
@@ -59,4 +64,7 @@ __all__ = [
     "PreprocessorConfig",
     "QualityPenalty",
     "SortResult",
+    "TargetSuitabilityAssessment",
+    "TargetSuitabilityRefusalCode",
+    "evaluate_target_suitability",
 ]

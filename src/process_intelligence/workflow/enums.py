@@ -3,6 +3,18 @@
 from enum import StrEnum
 
 
+class AnalysisExecutionMode(StrEnum):
+    """How the analysis workflow executes modeling and diagnosis stages.
+
+    SUPERVISED runs the target-based regression path with residual diagnosis and
+    recommendation. ANOMALY_ONLY runs label-free anomaly detection and robust
+    group comparison without a target or recommendation generation.
+    """
+
+    SUPERVISED = "SUPERVISED"
+    ANOMALY_ONLY = "ANOMALY_ONLY"
+
+
 class AnalysisWorkflowStage(StrEnum):
     """Canonical orchestration stages for the industrial analysis workflow.
 
@@ -16,6 +28,7 @@ class AnalysisWorkflowStage(StrEnum):
     VALIDATE = "VALIDATE"
     QUALITY_SCORE = "QUALITY_SCORE"
     SORT = "SORT"
+    COHORT_FILTER = "COHORT_FILTER"
     PREPROCESS = "PREPROCESS"
     INDUSTRY_ROUTING = "INDUSTRY_ROUTING"
     TASK_ROUTING = "TASK_ROUTING"
@@ -60,3 +73,28 @@ class OperatingPointSelectionMode(StrEnum):
     TOP_RESIDUAL_ANOMALY = "TOP_RESIDUAL_ANOMALY"
     TOP_UNSUPERVISED_ANOMALY = "TOP_UNSUPERVISED_ANOMALY"
     LATEST_ROW = "LATEST_ROW"
+
+
+class TaskSelectionSource(StrEnum):
+    """How the final analysis task was chosen for a workflow run.
+
+    ROUTER means the task router inference was used unchanged (AUTO).
+    USER_OVERRIDE means the caller explicitly selected REGRESSION or
+    CLASSIFICATION and that selection was applied over router inference.
+    """
+
+    ROUTER = "ROUTER"
+    USER_OVERRIDE = "USER_OVERRIDE"
+
+
+class AnomalyContextOrderBasis(StrEnum):
+    """Row adjacency basis used for anomaly context windows.
+
+    LOADED_ROW_ORDER means neighboring rows follow the CSV load order when no
+    timestamp sort was applied. SORTED_ANALYSIS_ORDER means neighboring rows
+    follow the workflow chronological sort used for analysis. Original row IDs
+    remain identity only and are not used as arithmetic neighbors.
+    """
+
+    LOADED_ROW_ORDER = "LOADED_ROW_ORDER"
+    SORTED_ANALYSIS_ORDER = "SORTED_ANALYSIS_ORDER"

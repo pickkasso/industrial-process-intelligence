@@ -31,6 +31,7 @@ from process_intelligence.diagnosis import (
     RobustFeatureStatistic,
     RobustGroupComparisonConfig,
     RobustGroupComparisonDiagnoser,
+    RobustScaleStatus,
 )
 
 _ROBUST_SCALE_CONSTANT = 1.4826
@@ -116,14 +117,19 @@ def _valid_statistic(**overrides: Any) -> RobustFeatureStatistic:
         "anomaly_median": 40.0,
         "signed_location_difference": 30.0,
         "median_absolute_deviation": 0.0,
-        "effective_scale": 1e-12,
-        "robust_z_score": 3.0e13,
+        "robust_scale": 0.0,
+        "robust_scale_status": RobustScaleStatus.ZERO_VARIANCE,
+        "effective_scale": None,
+        "robust_z_score": None,
         "deviation_prevalence": 1.0,
-        "raw_association_score": 3.0e13,
+        "raw_association_score": 0.8,
         "normalized_association_score": 1.0,
         "direction": "POSITIVE",
         "confidence": 0.8,
-        "warnings": ["reference dispersion was near zero"],
+        "warnings": [
+            "Robust standardized score is unavailable because the reference "
+            "group has zero robust variance."
+        ],
     }
     payload.update(overrides)
     return RobustFeatureStatistic(**payload)
@@ -199,6 +205,7 @@ def test_statistic_valid_and_round_trip() -> None:
         {"anomaly_row_count": True},
         {"reference_median": math.nan},
         {"median_absolute_deviation": -0.1},
+        {"robust_scale": -0.1},
         {"effective_scale": 0.0},
         {"robust_z_score": -1.0},
         {"deviation_prevalence": -0.1},
@@ -207,6 +214,7 @@ def test_statistic_valid_and_round_trip() -> None:
         {"confidence": -0.01},
         {"warnings": [""]},
         {"warnings": ["a", "a"]},
+        {"robust_scale_status": "NOT_A_STATUS"},
     ],
 )
 def test_statistic_rejects_invalid(overrides: dict[str, object]) -> None:
@@ -524,35 +532,52 @@ def test_reference_and_anomaly_minimums() -> None:
 
 def test_robust_statistics_and_scores() -> None:
     diagnoser = RobustGroupComparisonDiagnoser()
-    frame = _base_frame()
-    request = _request(method=DiagnosisMethod.ROBUST_Z_SCORE)
+    frame = pl.DataFrame(
+        {
+            "_original_row_id": ["0", "1", "2", "3", "4", "5"],
+            "pressure": [8.0, 9.0, 10.0, 11.0, 12.0, 40.0],
+            "temperature": [20.0, 21.0, 19.0, 20.5, 20.0, 35.0],
+            "stable": [5.0, 5.1, 4.9, 5.0, 5.05, 5.0],
+            "is_anomaly": [0, 0, 0, 0, 0, 1],
+            "anomaly_score": [0.1, 0.1, 0.1, 0.1, 0.1, 0.95],
+        }
+    )
+    request = _request(
+        method=DiagnosisMethod.ROBUST_Z_SCORE,
+        feature_columns=["pressure", "temperature", "stable"],
+        minimum_reference_rows=3,
+    )
     result = diagnoser.diagnose(frame, request=request)
     assert isinstance(result, DiagnosisResult)
 
-    reference = np.array([10.0, 10.0, 10.0, 10.0, 10.0])
+    reference = np.array([8.0, 9.0, 10.0, 11.0, 12.0])
     anomaly = np.array([40.0])
     reference_median = float(np.median(reference))
     anomaly_median = float(np.median(anomaly))
     signed = anomaly_median - reference_median
     mad = float(np.median(np.abs(reference - reference_median)))
     robust_scale = _ROBUST_SCALE_CONSTANT * mad
-    effective = max(robust_scale, 1e-12)
-    robust_z = abs(signed) / effective
+    assert robust_scale > 1e-12
+    robust_z = abs(signed) / robust_scale
 
     pressure = next(f for f in result.factors if f.variable == "pressure")
     assert pressure.direction == "POSITIVE"
     assert pressure.deviation == pytest.approx(signed)
     assert "robust_z_score=" in pressure.evidence
-    assert robust_z == pytest.approx(abs(signed) / effective)
+    assert "robust_z_score=None" not in pressure.evidence
+    assert f"{robust_z:.6g}" in pressure.evidence or "robust_z_score=" in pressure.evidence
     assert math.isfinite(robust_z)
-    assert "near-zero reference dispersion" in " ".join(result.caveats).lower() or any(
-        "near-zero" in caveat.lower() for caveat in result.caveats
-    )
+    assert "AVAILABLE" in pressure.evidence
+    assert "zero robust variance" not in " ".join(result.caveats).lower()
 
     # ENSEMBLE raw uses prevalence term; pressure prevalence is 1.0 for single high event
     ensemble = diagnoser.diagnose(
         frame,
-        request=_request(method=DiagnosisMethod.ENSEMBLE),
+        request=_request(
+            method=DiagnosisMethod.ENSEMBLE,
+            feature_columns=["pressure", "temperature", "stable"],
+            minimum_reference_rows=3,
+        ),
     )
     assert isinstance(ensemble, DiagnosisResult)
     ens_pressure = next(f for f in ensemble.factors if f.variable == "pressure")
@@ -563,7 +588,9 @@ def test_robust_statistics_and_scores() -> None:
         request=_request(
             method=DiagnosisMethod.GROUP_COMPARISON,
             scope=DiagnosisScope.ANOMALY_GROUP,
-            events=[_event("5"), _event("6"), _event("7")],
+            events=[_event("5")],
+            feature_columns=["pressure", "temperature", "stable"],
+            minimum_reference_rows=3,
         ),
     )
     assert isinstance(group, DiagnosisResult)
@@ -937,4 +964,308 @@ def test_public_exports_include_step8b_objects() -> None:
     assert diagnosis.RobustGroupComparisonConfig is RobustGroupComparisonConfig
     assert diagnosis.RobustFeatureStatistic is RobustFeatureStatistic
     assert diagnosis.RobustGroupComparisonDiagnoser is RobustGroupComparisonDiagnoser
+    assert diagnosis.RobustScaleStatus is RobustScaleStatus
     assert "DiagnosisRequest" in diagnosis.__all__
+    assert "RobustScaleStatus" in diagnosis.__all__
+
+
+def _parse_evidence_float(evidence: str, key: str) -> float | None:
+    marker = f"{key}="
+    if marker not in evidence:
+        return None
+    fragment = evidence.split(marker, 1)[1]
+    token = fragment.split(";", 1)[0].strip()
+    if token == "None":
+        return None
+    return float(token)
+
+
+def _parse_evidence_status(evidence: str) -> str | None:
+    marker = "robust_scale_status="
+    if marker not in evidence:
+        return None
+    return evidence.split(marker, 1)[1].split(";", 1)[0].strip()
+
+
+def test_zero_variance_equal_medians_excluded_by_default() -> None:
+    frame = pl.DataFrame(
+        {
+            "_original_row_id": ["0", "1", "2", "3", "4", "5"],
+            "stable": [5.0, 5.0, 5.0, 5.0, 5.0, 5.0],
+            "is_anomaly": [0, 0, 0, 0, 0, 1],
+            "anomaly_score": [0.1, 0.1, 0.1, 0.1, 0.1, 0.9],
+        }
+    )
+    before = frame.to_dicts()
+    result = RobustGroupComparisonDiagnoser().diagnose(
+        frame,
+        request=_request(feature_columns=["stable"], minimum_reference_rows=3),
+    )
+    assert isinstance(result, DiagnosisResult)
+    assert result.factors == []
+    assert frame.to_dicts() == before
+
+
+def test_zero_variance_positive_difference_no_pseudo_z() -> None:
+    frame = pl.DataFrame(
+        {
+            "_original_row_id": ["0", "1", "2", "3", "4", "5"],
+            "current": [0.0, 0.0, 0.0, 0.0, 0.0, 106.0],
+            "is_anomaly": [0, 0, 0, 0, 0, 1],
+            "anomaly_score": [0.1, 0.1, 0.1, 0.1, 0.1, 0.95],
+        }
+    )
+    before = frame.to_dicts()
+    result = RobustGroupComparisonDiagnoser().diagnose(
+        frame,
+        request=_request(feature_columns=["current"], minimum_reference_rows=3),
+    )
+    assert isinstance(result, DiagnosisResult)
+    assert len(result.factors) == 1
+    factor = result.factors[0]
+    assert factor.variable == "current"
+    assert factor.direction == "POSITIVE"
+    assert factor.deviation == pytest.approx(106.0)
+    assert math.isfinite(factor.confidence)
+    assert 0.0 <= factor.confidence <= 1.0
+    assert _parse_evidence_status(factor.evidence) == RobustScaleStatus.ZERO_VARIANCE.value
+    assert _parse_evidence_float(factor.evidence, "robust_z_score") is None
+    assert "robust_z_score=None" in factor.evidence
+    raw_score = _parse_evidence_float(factor.evidence, "raw_association_score")
+    assert raw_score is not None
+    assert math.isfinite(raw_score)
+    assert raw_score < 1e6
+    assert "1e+14" not in factor.evidence.lower()
+    assert "100000000000000" not in factor.evidence
+    assert "zero robust variance" in factor.evidence.lower()
+    assert any("zero robust variance" in caveat.lower() for caveat in result.caveats)
+    assert not any(math.isinf(factor.confidence) for factor in result.factors)
+    assert not any(math.isnan(factor.confidence) for factor in result.factors)
+    assert frame.to_dicts() == before
+
+
+def test_zero_variance_negative_difference_preserves_direction() -> None:
+    frame = pl.DataFrame(
+        {
+            "_original_row_id": ["0", "1", "2", "3", "4", "5"],
+            "current": [10.0, 10.0, 10.0, 10.0, 10.0, 0.0],
+            "is_anomaly": [0, 0, 0, 0, 0, 1],
+            "anomaly_score": [0.1, 0.1, 0.1, 0.1, 0.1, 0.95],
+        }
+    )
+    result = RobustGroupComparisonDiagnoser().diagnose(
+        frame,
+        request=_request(feature_columns=["current"], minimum_reference_rows=3),
+    )
+    assert isinstance(result, DiagnosisResult)
+    factor = result.factors[0]
+    assert factor.direction == "NEGATIVE"
+    assert factor.deviation == pytest.approx(-10.0)
+    assert _parse_evidence_float(factor.evidence, "robust_z_score") is None
+    assert _parse_evidence_status(factor.evidence) == "ZERO_VARIANCE"
+    assert math.isfinite(factor.confidence)
+
+
+def test_zero_variance_ranking_deterministic_not_by_raw_units() -> None:
+    frame = pl.DataFrame(
+        {
+            "_original_row_id": ["0", "1", "2", "3", "4", "5"],
+            "current": [0.0, 0.0, 0.0, 0.0, 0.0, 106.0],
+            "usocmax": [6.0, 6.0, 6.0, 6.0, 6.0, 97.0],
+            "power": [0.0, 0.0, 0.0, 0.0, 0.0, 73.61],
+            "is_anomaly": [0, 0, 0, 0, 0, 1],
+            "anomaly_score": [0.1, 0.1, 0.1, 0.1, 0.1, 0.99],
+        }
+    )
+    request = _request(
+        feature_columns=["current", "usocmax", "power"],
+        minimum_reference_rows=3,
+    )
+    first = RobustGroupComparisonDiagnoser().diagnose(frame, request=request)
+    second = RobustGroupComparisonDiagnoser().diagnose(frame, request=request)
+    assert isinstance(first, DiagnosisResult)
+    assert isinstance(second, DiagnosisResult)
+    names_first = [factor.variable for factor in first.factors]
+    names_second = [factor.variable for factor in second.factors]
+    assert names_first == names_second
+    assert set(names_first) == {"current", "usocmax", "power"}
+    for factor in first.factors:
+        assert _parse_evidence_float(factor.evidence, "robust_z_score") is None
+        raw_score = _parse_evidence_float(factor.evidence, "raw_association_score")
+        assert raw_score is not None
+        assert raw_score == pytest.approx(factor.confidence)
+        assert raw_score < 1e6
+        assert math.isfinite(factor.confidence)
+    # Tie-break uses feature order when confidence-based scores match.
+    assert names_first == ["current", "usocmax", "power"]
+
+
+def test_available_scale_regression_finite_robust_z() -> None:
+    frame = pl.DataFrame(
+        {
+            "_original_row_id": ["0", "1", "2", "3", "4", "5"],
+            "pressure": [8.0, 9.0, 10.0, 11.0, 12.0, 40.0],
+            "is_anomaly": [0, 0, 0, 0, 0, 1],
+            "anomaly_score": [0.1, 0.1, 0.1, 0.1, 0.1, 0.95],
+        }
+    )
+    result = RobustGroupComparisonDiagnoser().diagnose(
+        frame,
+        request=_request(feature_columns=["pressure"], minimum_reference_rows=3),
+    )
+    assert isinstance(result, DiagnosisResult)
+    factor = result.factors[0]
+    robust_z = _parse_evidence_float(factor.evidence, "robust_z_score")
+    assert robust_z is not None
+    assert math.isfinite(robust_z)
+    assert robust_z < 1e6
+    assert _parse_evidence_status(factor.evidence) == "AVAILABLE"
+    assert factor.direction == "POSITIVE"
+    ranking_score = _parse_evidence_float(factor.evidence, "raw_association_score")
+    assert ranking_score is not None
+    assert math.isfinite(ranking_score)
+    assert 0.0 <= ranking_score <= 1.0
+    assert ranking_score == pytest.approx(factor.confidence)
+    robust_scale = _parse_evidence_float(factor.evidence, "robust_scale")
+    assert robust_scale is not None and robust_scale > 0.0
+
+
+def test_mixed_available_and_zero_variance_ranking() -> None:
+    frame = pl.DataFrame(
+        {
+            "_original_row_id": ["0", "1", "2", "3", "4", "5"],
+            "varying": [8.0, 9.0, 10.0, 11.0, 12.0, 40.0],
+            "constant_shift": [0.0, 0.0, 0.0, 0.0, 0.0, 100.0],
+            "is_anomaly": [0, 0, 0, 0, 0, 1],
+            "anomaly_score": [0.1, 0.1, 0.1, 0.1, 0.1, 0.95],
+        }
+    )
+    before = frame.to_dicts()
+    result = RobustGroupComparisonDiagnoser().diagnose(
+        frame,
+        request=_request(
+            feature_columns=["varying", "constant_shift"],
+            minimum_reference_rows=3,
+        ),
+    )
+    assert isinstance(result, DiagnosisResult)
+    by_name = {factor.variable: factor for factor in result.factors}
+    assert "varying" in by_name
+    assert "constant_shift" in by_name
+    varying_z = _parse_evidence_float(by_name["varying"].evidence, "robust_z_score")
+    constant_z = _parse_evidence_float(
+        by_name["constant_shift"].evidence,
+        "robust_z_score",
+    )
+    assert varying_z is not None and math.isfinite(varying_z)
+    assert constant_z is None
+    assert _parse_evidence_status(by_name["varying"].evidence) == "AVAILABLE"
+    assert _parse_evidence_status(by_name["constant_shift"].evidence) == "ZERO_VARIANCE"
+    for factor in result.factors:
+        raw_score = _parse_evidence_float(factor.evidence, "raw_association_score")
+        assert raw_score is not None
+        assert math.isfinite(raw_score)
+        assert 0.0 <= raw_score <= 1.0
+        assert raw_score == pytest.approx(factor.confidence)
+    # Unified confidence ranking: ZERO_VARIANCE is not auto-demoted by status,
+    # and AVAILABLE is not auto-promoted merely because a robust z exists.
+    assert by_name["constant_shift"].confidence >= by_name["varying"].confidence
+    assert result.factors[0].variable == "constant_shift"
+    assert frame.to_dicts() == before
+
+
+def test_battery_style_mixed_scale_ranking_fixture() -> None:
+    """AVAILABLE large-z and strong ZERO_VARIANCE share one bounded ranking scale."""
+    frame = pl.DataFrame(
+        {
+            "_original_row_id": ["0", "1", "2", "3", "4", "5", "6", "7"],
+            # Reference variance available; anomaly produces a large robust z.
+            "chg_pmax": [1.0, 1.1, 0.9, 1.05, 0.95, 1.0, 1.02, 50.0],
+            # Reference variance zero; strong group separation.
+            "current": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 106.0],
+            "is_anomaly": [0, 0, 0, 0, 0, 0, 0, 1],
+            "anomaly_score": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.99],
+        }
+    )
+    before = frame.to_dicts()
+    first = RobustGroupComparisonDiagnoser().diagnose(
+        frame,
+        request=_request(
+            events=[_event("7", score=0.99)],
+            feature_columns=["chg_pmax", "current"],
+            minimum_reference_rows=3,
+            anomaly_indicator_column="is_anomaly",
+        ),
+    )
+    second = RobustGroupComparisonDiagnoser().diagnose(
+        frame,
+        request=_request(
+            events=[_event("7", score=0.99)],
+            feature_columns=["chg_pmax", "current"],
+            minimum_reference_rows=3,
+            anomaly_indicator_column="is_anomaly",
+        ),
+    )
+    assert isinstance(first, DiagnosisResult)
+    assert isinstance(second, DiagnosisResult)
+    assert [factor.variable for factor in first.factors] == [
+        factor.variable for factor in second.factors
+    ]
+    by_name = {factor.variable: factor for factor in first.factors}
+    assert "chg_pmax" in by_name
+    assert "current" in by_name
+    available = by_name["chg_pmax"]
+    zero_var = by_name["current"]
+    available_z = _parse_evidence_float(available.evidence, "robust_z_score")
+    zero_z = _parse_evidence_float(zero_var.evidence, "robust_z_score")
+    assert available_z is not None and math.isfinite(available_z)
+    assert available_z > 1.0
+    assert zero_z is None
+    assert _parse_evidence_status(available.evidence) == "AVAILABLE"
+    assert _parse_evidence_status(zero_var.evidence) == "ZERO_VARIANCE"
+    available_scale = _parse_evidence_float(available.evidence, "robust_scale")
+    zero_scale = _parse_evidence_float(zero_var.evidence, "robust_scale")
+    assert available_scale is not None and available_scale > 0.0
+    assert zero_scale is not None and zero_scale == pytest.approx(0.0)
+    for factor in first.factors:
+        ranking_score = _parse_evidence_float(factor.evidence, "raw_association_score")
+        assert ranking_score is not None
+        assert math.isfinite(ranking_score)
+        assert 0.0 <= ranking_score <= 1.0
+        assert ranking_score == pytest.approx(factor.confidence)
+        assert not math.isnan(factor.confidence)
+        assert not math.isinf(factor.confidence)
+    # z availability alone must not force AVAILABLE above ZERO_VARIANCE.
+    assert zero_var.confidence >= available.confidence
+    assert first.factors[0].variable == "current"
+    assert frame.to_dicts() == before
+
+
+def test_feature_unit_rescaling_does_not_change_ranking_score_meaning() -> None:
+    base = pl.DataFrame(
+        {
+            "_original_row_id": ["0", "1", "2", "3", "4", "5"],
+            "feature": [0.0, 0.0, 0.0, 0.0, 0.0, 10.0],
+            "is_anomaly": [0, 0, 0, 0, 0, 1],
+            "anomaly_score": [0.1, 0.1, 0.1, 0.1, 0.1, 0.9],
+        }
+    )
+    scaled = base.with_columns((pl.col("feature") * 1000.0).alias("feature"))
+    request = _request(feature_columns=["feature"], minimum_reference_rows=3)
+    base_result = RobustGroupComparisonDiagnoser().diagnose(base, request=request)
+    scaled_result = RobustGroupComparisonDiagnoser().diagnose(scaled, request=request)
+    assert isinstance(base_result, DiagnosisResult)
+    assert isinstance(scaled_result, DiagnosisResult)
+    assert len(base_result.factors) == 1
+    assert len(scaled_result.factors) == 1
+    assert base_result.factors[0].confidence == pytest.approx(
+        scaled_result.factors[0].confidence
+    )
+    base_rank = _parse_evidence_float(
+        base_result.factors[0].evidence, "raw_association_score"
+    )
+    scaled_rank = _parse_evidence_float(
+        scaled_result.factors[0].evidence, "raw_association_score"
+    )
+    assert base_rank == pytest.approx(scaled_rank)
+    assert base_rank is not None and 0.0 <= base_rank <= 1.0

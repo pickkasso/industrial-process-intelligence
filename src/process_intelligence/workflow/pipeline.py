@@ -30,9 +30,16 @@ from typing import NoReturn, TypeVar
 import polars as pl
 
 from process_intelligence.core.enums import AnalysisTask, AnomalyType
-from process_intelligence.core.exceptions import DataValidationError
+from process_intelligence.core.exceptions import (
+    DataValidationError,
+    InsufficientDataError,
+)
 from process_intelligence.core.protocols import BaseIndustryProfile
-from process_intelligence.core.schemas import AnomalyEvent, VariableConstraint
+from process_intelligence.core.schemas import (
+    AnomalyEvent,
+    RootCauseFactor,
+    VariableConstraint,
+)
 from process_intelligence.data import (
     ORIGINAL_ROW_ID_COLUMN,
     DataQualityScorer,
@@ -42,6 +49,8 @@ from process_intelligence.data import (
     DatasetSorter,
     DatasetValidator,
     PreprocessorConfig,
+    TargetSuitabilityAssessment,
+    evaluate_target_suitability,
 )
 from process_intelligence.diagnosis import (
     DiagnosisEnsembleConfig,
@@ -50,6 +59,7 @@ from process_intelligence.diagnosis import (
     DiagnosisRequest,
     DiagnosisResult,
     DiagnosisScope,
+    RobustGroupComparisonDiagnoser,
 )
 from process_intelligence.evaluation import (
     DatasetSplit,
@@ -101,10 +111,15 @@ from process_intelligence.routing import (
     create_default_industry_router,
     create_default_task_router,
 )
+from process_intelligence.workflow.anomaly_context import build_anomaly_context_windows
+from process_intelligence.workflow.cohort_filter import apply_numeric_cohort_filter
 from process_intelligence.workflow.enums import (
+    AnalysisExecutionMode,
     AnalysisWorkflowStage,
     AnalysisWorkflowStatus,
+    AnomalyContextOrderBasis,
     OperatingPointSelectionMode,
+    TaskSelectionSource,
 )
 from process_intelligence.workflow.schemas import (
     AnalysisWorkflowOutcome,
@@ -112,6 +127,8 @@ from process_intelligence.workflow.schemas import (
     AnalysisWorkflowReport,
     AnalysisWorkflowRequest,
     AnalysisWorkflowStageRecord,
+    AnomalyContextWindow,
+    CohortFilterSummary,
     ScalarMetadataValue,
 )
 
@@ -121,6 +138,14 @@ _ANOMALY_INDICATOR_COLUMN = "_is_anomaly"
 _ANOMALY_SCORE_COLUMN = "_anomaly_score"
 
 _SEMICONDUCTOR_INDUSTRY = "semiconductor"
+
+_SKIPPED_NOT_APPLICABLE = "Not applicable for anomaly-only analysis."
+_ANOMALY_ONLY_OVERVIEW = (
+    "Anomaly-only analysis completed. Recommendation generation is not "
+    "enabled for this analysis mode."
+)
+_SELECTION_SOURCE_UNSUPERVISED = "UNSUPERVISED_ANOMALY_SCORE"
+_DIAGNOSIS_SOURCE_ROBUST = "ROBUST_GROUP_COMPARISON"
 
 _WARNING_OMISSION = (
     "Additional workflow warnings were omitted due to the configured limit."
@@ -151,16 +176,25 @@ class _RunState:
     status: AnalysisWorkflowStatus = AnalysisWorkflowStatus.REFUSED
     raw_row_count: int = 0
     processed_row_count: int = 0
+    cohort_row_count: int = 0
     train_row_count: int = 0
     validation_row_count: int = 0
     test_row_count: int = 0
+    cohort_filter_summary: CohortFilterSummary | None = None
     selected_industry: str | None = None
     selected_task: AnalysisTask | None = None
+    inferred_task: AnalysisTask | None = None
+    task_selection_source: TaskSelectionSource | None = None
+    task_override_applied: bool = False
     selected_supervised_model_key: str | None = None
     selected_anomaly_model_key: str | None = None
     selected_operating_row_id: int | str | None = None
     anomaly_event_count: int = 0
     diagnosis_factor_count: int = 0
+    anomaly_events: list[AnomalyEvent] = field(default_factory=list)
+    diagnosis_factors: list[RootCauseFactor] = field(default_factory=list)
+    anomaly_context_windows: list[AnomalyContextWindow] = field(default_factory=list)
+    context_warnings: list[str] = field(default_factory=list)
     raw_csv_loaded: bool = False
     supervised_model_available: bool = False
     anomaly_model_available: bool = False
@@ -172,6 +206,16 @@ class _RunState:
     row_identity_preserved: bool = False
     model_performance_assessment: ModelPerformanceAcceptanceReport | None = None
     final_recommendation: RecommendationResult | None = None
+    analysis_mode: AnalysisExecutionMode = AnalysisExecutionMode.SUPERVISED
+    recommendation_applicable: bool = True
+    diagnosis_source: str | None = None
+    anomaly_event_selection_source: str | None = None
+    target_column: str | None = None
+    feature_count: int | None = None
+    target_suitable: bool | None = None
+    target_unique_non_null_count: int | None = None
+    target_refusal_code: str | None = None
+    target_suitability_message: str | None = None
 
 
 def _row_id_set(frame: pl.DataFrame) -> set[int]:
@@ -417,6 +461,16 @@ class IndustrialProcessAnalysisWorkflow:
         state: _RunState,
     ) -> None:
         feature_columns = list(request.feature_columns)
+        state.analysis_mode = request.analysis_mode
+        state.target_column = request.target_column
+        state.feature_count = len(feature_columns)
+        anomaly_only = request.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
+        if anomaly_only:
+            state.recommendation_applicable = False
+            state.target_suitable = None
+            state.target_suitability_message = "NOT_APPLICABLE"
+        else:
+            state.recommendation_applicable = True
 
         # --- LOAD ---
         csv_path = request.csv_path
@@ -437,6 +491,7 @@ class IndustrialProcessAnalysisWorkflow:
             )
         state.raw_row_count = loaded_frame.height
         state.processed_row_count = loaded_frame.height
+        state.cohort_row_count = loaded_frame.height
         state.raw_csv_loaded = True
         self._ok(
             state,
@@ -460,26 +515,119 @@ class IndustrialProcessAnalysisWorkflow:
         # --- VALIDATE ---
         issues = self._validator.validate(loaded_frame)
         blockers = [issue for issue in issues if issue.severity == "ERROR"]
-        if blockers and policy.stop_on_validation_blocker:
-            self._refuse(
-                state,
-                AnalysisWorkflowStage.VALIDATE,
-                "Validation found blocking (ERROR) data quality issues; "
-                "the workflow stopped before analysis.",
-                metadata={"blocker_count": len(blockers)},
-            )
         validation_warnings = [
-            f"Validation issue ({issue.issue_type}, {issue.severity})"
+            _format_validation_warning(issue)
             for issue in issues
             if issue.severity != "ERROR"
         ]
-        self._ok(
-            state,
-            AnalysisWorkflowStage.VALIDATE,
-            "Validated the loaded dataset for structural quality issues.",
-            warnings=validation_warnings,
-            metadata={"issue_count": len(issues), "blocker_count": len(blockers)},
-        )
+        if anomaly_only:
+            if blockers and policy.stop_on_validation_blocker:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.VALIDATE,
+                    "Validation found blocking (ERROR) data quality issues; "
+                    "the workflow stopped before analysis.",
+                    warnings=validation_warnings,
+                    metadata={"blocker_count": len(blockers)},
+                )
+            self._ok(
+                state,
+                AnalysisWorkflowStage.VALIDATE,
+                "Validated the loaded dataset for structural quality issues. "
+                "Target suitability is not applicable for anomaly-only analysis.",
+                warnings=validation_warnings,
+                metadata={
+                    "issue_count": len(issues),
+                    "blocker_count": len(blockers),
+                    "target_suitable": None,
+                    "target_suitability": "NOT_APPLICABLE",
+                    "analysis_mode": request.analysis_mode.value,
+                },
+            )
+        else:
+            if request.target_column is None:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.VALIDATE,
+                    "Target column is required for supervised analysis.",
+                )
+            if request.target_column not in loaded_frame.columns:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.VALIDATE,
+                    f"Target column '{request.target_column}' was not found in the "
+                    "loaded dataset. Supervised analysis cannot continue.",
+                    warnings=validation_warnings,
+                    metadata={
+                        "issue_count": len(issues),
+                        "blocker_count": len(blockers),
+                        "target_column": request.target_column,
+                        "target_suitable": False,
+                    },
+                )
+            target_assessment = evaluate_target_suitability(
+                loaded_frame,
+                request.target_column,
+                requested_task=None,
+            )
+            self._store_target_suitability(state, target_assessment)
+            if not target_assessment.suitable:
+                refusal_metadata: dict[str, ScalarMetadataValue] = {
+                    "issue_count": len(issues),
+                    "blocker_count": len(blockers),
+                    "target_column": target_assessment.target_column,
+                    "target_suitable": False,
+                    "target_unique_non_null_count": (
+                        target_assessment.unique_non_null_count
+                    ),
+                    "target_refusal_code": (
+                        None
+                        if target_assessment.refusal_code is None
+                        else target_assessment.refusal_code.value
+                    ),
+                    "row_count": target_assessment.row_count,
+                    "non_null_count": target_assessment.non_null_count,
+                    "null_count": target_assessment.null_count,
+                    "is_all_null": target_assessment.is_all_null,
+                    "is_constant": target_assessment.is_constant,
+                    "is_numeric": target_assessment.is_numeric,
+                }
+                if target_assessment.constant_value is not None:
+                    refusal_metadata["constant_value"] = (
+                        target_assessment.constant_value
+                    )
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.VALIDATE,
+                    target_assessment.message,
+                    warnings=validation_warnings,
+                    metadata=refusal_metadata,
+                )
+            if blockers and policy.stop_on_validation_blocker:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.VALIDATE,
+                    "Validation found blocking (ERROR) data quality issues; "
+                    "the workflow stopped before analysis.",
+                    warnings=validation_warnings,
+                    metadata={"blocker_count": len(blockers)},
+                )
+            self._ok(
+                state,
+                AnalysisWorkflowStage.VALIDATE,
+                "Validated the loaded dataset for structural quality issues and "
+                "target suitability.",
+                warnings=validation_warnings,
+                metadata={
+                    "issue_count": len(issues),
+                    "blocker_count": len(blockers),
+                    "target_column": target_assessment.target_column,
+                    "target_suitable": True,
+                    "target_unique_non_null_count": (
+                        target_assessment.unique_non_null_count
+                    ),
+                },
+            )
 
         # --- QUALITY_SCORE ---
         quality = self._quality_scorer.score(issues)
@@ -497,11 +645,13 @@ class IndustrialProcessAnalysisWorkflow:
                 by=request.timestamp_column,
             )
             sorted_frame = sort_result.frame
+            context_order_basis = AnomalyContextOrderBasis.SORTED_ANALYSIS_ORDER
             sort_message = (
                 "Applied a stable chronological sort using the timestamp column."
             )
         else:
             sorted_frame = loaded_frame
+            context_order_basis = AnomalyContextOrderBasis.LOADED_ROW_ORDER
             sort_message = (
                 "No timestamp column provided; preserved the loaded row order "
                 "without sorting."
@@ -515,6 +665,126 @@ class IndustrialProcessAnalysisWorkflow:
             sort_message,
             row_count=sorted_frame.height,
         )
+
+        # --- COHORT_FILTER ---
+        analysis_frame = sorted_frame
+        if request.cohort_filter is None:
+            state.cohort_row_count = analysis_frame.height
+            state.cohort_filter_summary = CohortFilterSummary(
+                configured=False,
+                column_name=None,
+                lower_bound=None,
+                upper_bound=None,
+                include_lower=None,
+                include_upper=None,
+                exclude_filter_column_from_features=None,
+                source_row_count=analysis_frame.height,
+                retained_row_count=analysis_frame.height,
+                excluded_row_count=0,
+                null_excluded_count=0,
+            )
+            self._skip(
+                state,
+                AnalysisWorkflowStage.COHORT_FILTER,
+                "No operating cohort filter was configured.",
+            )
+        else:
+            try:
+                cohort_outcome = apply_numeric_cohort_filter(
+                    analysis_frame,
+                    request.cohort_filter,
+                )
+            except DataValidationError as exc:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.COHORT_FILTER,
+                    str(exc),
+                    metadata={
+                        "cohort_filter_column": request.cohort_filter.column_name,
+                        "cohort_filter_lower_bound": (
+                            request.cohort_filter.lower_bound
+                        ),
+                        "cohort_filter_upper_bound": (
+                            request.cohort_filter.upper_bound
+                        ),
+                    },
+                )
+            analysis_frame = cohort_outcome.frame
+            state.cohort_row_count = cohort_outcome.retained_row_count
+            state.cohort_filter_summary = CohortFilterSummary(
+                configured=True,
+                column_name=cohort_outcome.filter.column_name,
+                lower_bound=cohort_outcome.filter.lower_bound,
+                upper_bound=cohort_outcome.filter.upper_bound,
+                include_lower=cohort_outcome.filter.include_lower,
+                include_upper=cohort_outcome.filter.include_upper,
+                exclude_filter_column_from_features=(
+                    cohort_outcome.filter.exclude_filter_column_from_features
+                ),
+                source_row_count=cohort_outcome.source_row_count,
+                retained_row_count=cohort_outcome.retained_row_count,
+                excluded_row_count=cohort_outcome.excluded_row_count,
+                null_excluded_count=cohort_outcome.null_excluded_count,
+            )
+            if request.cohort_filter.exclude_filter_column_from_features:
+                filter_column = request.cohort_filter.column_name
+                if filter_column in feature_columns:
+                    feature_columns = [
+                        name for name in feature_columns if name != filter_column
+                    ]
+                    state.feature_count = len(feature_columns)
+                if not feature_columns:
+                    self._refuse(
+                        state,
+                        AnalysisWorkflowStage.COHORT_FILTER,
+                        "Excluding the cohort filter column left no modeling "
+                        "features for anomaly analysis.",
+                        metadata=cohort_outcome.metadata(),
+                    )
+
+            # Validate the filtered cohort against the same splitter contract
+            # used later for train/validation/test partitioning.
+            if request.timestamp_column is not None:
+                probe_split_config = SplitConfig(
+                    strategy=SplitStrategy.TIME,
+                    time_column=request.timestamp_column,
+                    test_size=0.20,
+                    validation_size=0.20,
+                    random_state=42,
+                )
+            else:
+                probe_split_config = SplitConfig(
+                    strategy=SplitStrategy.RANDOM,
+                    allow_random_split=True,
+                    test_size=0.20,
+                    validation_size=0.20,
+                    random_state=42,
+                )
+            try:
+                self._splitter.split(analysis_frame, probe_split_config)
+            except InsufficientDataError:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.COHORT_FILTER,
+                    "The configured cohort filter retained too few rows for the "
+                    "required train/validation/test split.",
+                    metadata=cohort_outcome.metadata(),
+                )
+
+            self._ok(
+                state,
+                AnalysisWorkflowStage.COHORT_FILTER,
+                (
+                    "Applied the user-confirmed numeric operating cohort filter "
+                    f"on '{request.cohort_filter.column_name}'."
+                ),
+                row_count=cohort_outcome.retained_row_count,
+                metadata=cohort_outcome.metadata(),
+            )
+
+        # Keep the historical local name for the analysis-order frame used by
+        # split, diagnosis context, and later stages.
+        sorted_frame = analysis_frame
 
         # --- PREPROCESS (deferred fit until after SPLIT) ---
         preprocessor_config = PreprocessorConfig(
@@ -574,36 +844,114 @@ class IndustrialProcessAnalysisWorkflow:
         )
 
         # --- TASK_ROUTING ---
-        task_result = self._task_router.route(
-            sorted_profile,
-            role_mapping,
-            confirmed_target=request.target_column,
-            confirmed_time_column=request.timestamp_column,
-        )
-        selected_task = task_result.selected_task
-        state.selected_task = selected_task
-        if (
-            policy.require_regression_task
-            and selected_task is not AnalysisTask.REGRESSION
-        ):
-            self._refuse(
+        if anomaly_only:
+            self._skip(
                 state,
                 AnalysisWorkflowStage.TASK_ROUTING,
-                "Policy requires a regression task, but routing selected "
-                f"'{selected_task.value}'. Classification is not supported by "
-                "this workflow.",
-                metadata={"selected_task": selected_task.value},
+                _SKIPPED_NOT_APPLICABLE,
+                metadata={"analysis_mode": request.analysis_mode.value},
             )
-        self._ok(
-            state,
-            AnalysisWorkflowStage.TASK_ROUTING,
-            f"Routed the analysis to the '{selected_task.value}' task.",
-            warnings=list(task_result.warnings),
-            metadata={
+        else:
+            if request.target_column is None:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.TASK_ROUTING,
+                    "Target column is required for supervised task routing.",
+                )
+            task_result = self._task_router.route(
+                sorted_profile,
+                role_mapping,
+                confirmed_target=request.target_column,
+                confirmed_time_column=request.timestamp_column,
+            )
+            inferred_task = task_result.selected_task
+            state.inferred_task = inferred_task
+            routing_warnings = list(task_result.warnings)
+
+            if request.requested_task is None:
+                selected_task = inferred_task
+                task_selection_source = TaskSelectionSource.ROUTER
+                task_override_applied = False
+            else:
+                selected_task = request.requested_task
+                task_selection_source = TaskSelectionSource.USER_OVERRIDE
+                task_override_applied = True
+                if selected_task is not inferred_task:
+                    routing_warnings.append(
+                        "The task router inferred "
+                        f"{inferred_task.value}, while the user explicitly selected "
+                        f"{selected_task.value}. The explicit selection was used."
+                    )
+
+            state.selected_task = selected_task
+            state.task_selection_source = task_selection_source
+            state.task_override_applied = task_override_applied
+
+            task_routing_metadata: dict[str, ScalarMetadataValue] = {
+                "inferred_task": inferred_task.value,
                 "selected_task": selected_task.value,
+                "task_selection_source": task_selection_source.value,
+                "task_override_applied": task_override_applied,
                 "selected_target": task_result.selected_target,
-            },
-        )
+            }
+
+            if selected_task is AnalysisTask.REGRESSION and (
+                request.target_column in sorted_frame.columns
+            ):
+                regression_assessment = evaluate_target_suitability(
+                    sorted_frame,
+                    request.target_column,
+                    requested_task=AnalysisTask.REGRESSION,
+                )
+                self._store_target_suitability(state, regression_assessment)
+                if not regression_assessment.suitable:
+                    task_routing_metadata["target_suitable"] = False
+                    task_routing_metadata["target_unique_non_null_count"] = (
+                        regression_assessment.unique_non_null_count
+                    )
+                    task_routing_metadata["target_refusal_code"] = (
+                        None
+                        if regression_assessment.refusal_code is None
+                        else regression_assessment.refusal_code.value
+                    )
+                    self._refuse(
+                        state,
+                        AnalysisWorkflowStage.TASK_ROUTING,
+                        regression_assessment.message,
+                        warnings=routing_warnings,
+                        metadata=task_routing_metadata,
+                    )
+
+            if selected_task is AnalysisTask.CLASSIFICATION:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.TASK_ROUTING,
+                    "Classification modeling is not yet supported by this workflow. "
+                    "The analysis was refused because CLASSIFICATION was selected.",
+                    warnings=routing_warnings,
+                    metadata=task_routing_metadata,
+                )
+
+            if (
+                policy.require_regression_task
+                and selected_task is not AnalysisTask.REGRESSION
+            ):
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.TASK_ROUTING,
+                    "Policy requires a regression task, but routing selected "
+                    f"'{selected_task.value}'. Classification is not supported by "
+                    "this workflow.",
+                    warnings=routing_warnings,
+                    metadata=task_routing_metadata,
+                )
+            self._ok(
+                state,
+                AnalysisWorkflowStage.TASK_ROUTING,
+                f"Routed the analysis to the '{selected_task.value}' task.",
+                warnings=routing_warnings,
+                metadata=task_routing_metadata,
+            )
 
         # --- ROLE_MAPPING ---
         self._ok(
@@ -713,77 +1061,103 @@ class IndustrialProcessAnalysisWorkflow:
             },
         )
 
-        # --- SUPERVISED_SCREENING ---
-        supervised_screening = SupervisedModelScreener(
-            self._supervised_registry
-        ).screen(
-            split,
-            task=AnalysisTask.REGRESSION,
-            target_column=request.target_column,
-            feature_columns=feature_columns,
-            leakage_report=leakage_report,
-            industry_profile=industry_profile,
-        )
-        state.selected_supervised_model_key = (
-            supervised_screening.summary.selected_estimator_key
-        )
-        self._ok(
-            state,
-            AnalysisWorkflowStage.SUPERVISED_SCREENING,
-            "Screened supervised regression candidates on train/validation.",
-            metadata={
-                "selected_model_name": (
-                    supervised_screening.summary.selected_model_name
-                ),
-                "selected_estimator_key": (
-                    supervised_screening.summary.selected_estimator_key
-                ),
-            },
-        )
+        supervised_final: FinalEvaluationOutcome | None = None
+        residual_final: ResidualAnomalyFinalEvaluationOutcome | None = None
 
-        # --- SUPERVISED_FINAL_EVALUATION ---
-        supervised_final = FinalModelEvaluator(self._supervised_registry).evaluate(
-            split,
-            supervised_screening,
-            task=AnalysisTask.REGRESSION,
-            target_column=request.target_column,
-            feature_columns=feature_columns,
-            leakage_report=leakage_report,
-        )
-        state.supervised_model_available = True
-        state.independent_test_evaluation_performed = True
-        performance_outcome = ModelPerformanceAssessor(
-            policy=request.model_performance_policy,
-        ).assess(supervised_final)
-        assessment = performance_outcome.report
-        state.model_performance_assessment = assessment
-        assessment_warnings = list(assessment.warnings)
-        self._ok(
-            state,
-            AnalysisWorkflowStage.SUPERVISED_FINAL_EVALUATION,
-            "Refit the selected regression model on train+validation and "
-            "evaluated once on the independent test partition.",
-            warnings=assessment_warnings,
-            metadata={
-                "refit_on_train_validation": bool(
-                    supervised_final.report.refit_on_train_validation
-                ),
-                "performance_degraded": bool(
-                    supervised_final.report.performance_degraded
-                ),
-                "model_performance_status": assessment.status.value,
-                "model_performance_rule_count": len(assessment.metric_results),
-                "model_performance_required_rule_count": (
-                    assessment.required_rule_count
-                ),
-                "model_performance_failed_rule_count": (
-                    assessment.failed_required_rule_count
-                ),
-                "model_performance_unavailable_rule_count": (
-                    assessment.unavailable_required_rule_count
-                ),
-            },
-        )
+        # --- SUPERVISED_SCREENING / SUPERVISED_FINAL_EVALUATION ---
+        if anomaly_only:
+            self._skip(
+                state,
+                AnalysisWorkflowStage.SUPERVISED_SCREENING,
+                _SKIPPED_NOT_APPLICABLE,
+            )
+            self._skip(
+                state,
+                AnalysisWorkflowStage.SUPERVISED_FINAL_EVALUATION,
+                _SKIPPED_NOT_APPLICABLE,
+            )
+        else:
+            if request.target_column is None:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.SUPERVISED_SCREENING,
+                    "Target column is required for supervised screening.",
+                )
+            if request.model_performance_policy is None:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.SUPERVISED_FINAL_EVALUATION,
+                    "Model performance policy is required for supervised analysis.",
+                )
+            supervised_screening = SupervisedModelScreener(
+                self._supervised_registry
+            ).screen(
+                split,
+                task=AnalysisTask.REGRESSION,
+                target_column=request.target_column,
+                feature_columns=feature_columns,
+                leakage_report=leakage_report,
+                industry_profile=industry_profile,
+            )
+            state.selected_supervised_model_key = (
+                supervised_screening.summary.selected_estimator_key
+            )
+            self._ok(
+                state,
+                AnalysisWorkflowStage.SUPERVISED_SCREENING,
+                "Screened supervised regression candidates on train/validation.",
+                metadata={
+                    "selected_model_name": (
+                        supervised_screening.summary.selected_model_name
+                    ),
+                    "selected_estimator_key": (
+                        supervised_screening.summary.selected_estimator_key
+                    ),
+                },
+            )
+
+            supervised_final = FinalModelEvaluator(self._supervised_registry).evaluate(
+                split,
+                supervised_screening,
+                task=AnalysisTask.REGRESSION,
+                target_column=request.target_column,
+                feature_columns=feature_columns,
+                leakage_report=leakage_report,
+            )
+            state.supervised_model_available = True
+            state.independent_test_evaluation_performed = True
+            performance_outcome = ModelPerformanceAssessor(
+                policy=request.model_performance_policy,
+            ).assess(supervised_final)
+            assessment = performance_outcome.report
+            state.model_performance_assessment = assessment
+            assessment_warnings = list(assessment.warnings)
+            self._ok(
+                state,
+                AnalysisWorkflowStage.SUPERVISED_FINAL_EVALUATION,
+                "Refit the selected regression model on train+validation and "
+                "evaluated once on the independent test partition.",
+                warnings=assessment_warnings,
+                metadata={
+                    "refit_on_train_validation": bool(
+                        supervised_final.report.refit_on_train_validation
+                    ),
+                    "performance_degraded": bool(
+                        supervised_final.report.performance_degraded
+                    ),
+                    "model_performance_status": assessment.status.value,
+                    "model_performance_rule_count": len(assessment.metric_results),
+                    "model_performance_required_rule_count": (
+                        assessment.required_rule_count
+                    ),
+                    "model_performance_failed_rule_count": (
+                        assessment.failed_required_rule_count
+                    ),
+                    "model_performance_unavailable_rule_count": (
+                        assessment.unavailable_required_rule_count
+                    ),
+                },
+            )
 
         # --- ANOMALY_SCREENING ---
         anomaly_screening = UnsupervisedAnomalyModelScreener(
@@ -819,6 +1193,8 @@ class IndustrialProcessAnalysisWorkflow:
             leakage_report=leakage_report,
         )
         state.anomaly_model_available = True
+        if anomaly_only:
+            state.independent_test_evaluation_performed = True
         self._ok(
             state,
             AnalysisWorkflowStage.ANOMALY_FINAL_EVALUATION,
@@ -827,47 +1203,96 @@ class IndustrialProcessAnalysisWorkflow:
             row_count=anomaly_final.test_scored.height,
         )
 
-        # --- RESIDUAL_CALIBRATION ---
-        residual_pipeline_outcome = self._residual_pipeline.run(
-            split,
-            supervised_screening,
-            target_column=request.target_column,
-            feature_columns=feature_columns,
-            leakage_report=leakage_report,
-        )
-        state.residual_calibration_performed = True
-        self._ok(
-            state,
-            AnalysisWorkflowStage.RESIDUAL_CALIBRATION,
-            "Calibrated the residual anomaly detector using the screening "
-            "regression model.",
-        )
+        # --- RESIDUAL_CALIBRATION / RESIDUAL_FINAL_EVALUATION ---
+        if anomaly_only:
+            self._skip(
+                state,
+                AnalysisWorkflowStage.RESIDUAL_CALIBRATION,
+                _SKIPPED_NOT_APPLICABLE,
+            )
+            self._skip(
+                state,
+                AnalysisWorkflowStage.RESIDUAL_FINAL_EVALUATION,
+                _SKIPPED_NOT_APPLICABLE,
+            )
+        else:
+            if request.target_column is None or supervised_final is None:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.RESIDUAL_CALIBRATION,
+                    "Supervised outputs are required for residual calibration.",
+                )
+            residual_pipeline_outcome = self._residual_pipeline.run(
+                split,
+                supervised_screening,
+                target_column=request.target_column,
+                feature_columns=feature_columns,
+                leakage_report=leakage_report,
+            )
+            state.residual_calibration_performed = True
+            self._ok(
+                state,
+                AnalysisWorkflowStage.RESIDUAL_CALIBRATION,
+                "Calibrated the residual anomaly detector using the screening "
+                "regression model.",
+            )
 
-        # --- RESIDUAL_FINAL_EVALUATION ---
-        residual_final = self._residual_final_evaluator.evaluate(
-            split,
-            residual_pipeline_outcome,
-            target_column=request.target_column,
-            feature_columns=feature_columns,
-            leakage_report=leakage_report,
-        )
-        self._ok(
-            state,
-            AnalysisWorkflowStage.RESIDUAL_FINAL_EVALUATION,
-            "Evaluated the calibrated residual anomaly detector on the "
-            "independent test partition.",
-            row_count=residual_final.test_scored.height,
-        )
+            residual_final = self._residual_final_evaluator.evaluate(
+                split,
+                residual_pipeline_outcome,
+                target_column=request.target_column,
+                feature_columns=feature_columns,
+                leakage_report=leakage_report,
+            )
+            self._ok(
+                state,
+                AnalysisWorkflowStage.RESIDUAL_FINAL_EVALUATION,
+                "Evaluated the calibrated residual anomaly detector on the "
+                "independent test partition.",
+                row_count=residual_final.test_scored.height,
+            )
 
         # --- ANOMALY_EVENT_SELECTION ---
-        anomaly_events, event_warnings = _select_anomaly_events(
-            residual_test=residual_final.test_scored,
-            anomaly_test=anomaly_final.test_scored,
-            feature_columns=feature_columns,
-            maximum_events=policy.maximum_anomaly_events,
-            minimum_events=policy.minimum_anomaly_events,
-        )
+        if anomaly_only:
+            anomaly_events, event_warnings = _select_unsupervised_anomaly_events(
+                anomaly_test=anomaly_final.test_scored,
+                feature_columns=feature_columns,
+                maximum_events=policy.maximum_anomaly_events,
+                minimum_events=policy.minimum_anomaly_events,
+            )
+            state.anomaly_event_selection_source = _SELECTION_SOURCE_UNSUPERVISED
+            event_message = (
+                "Selected anomaly events for diagnosis using unsupervised "
+                "anomaly scores."
+            )
+            event_metadata: dict[str, ScalarMetadataValue] = {
+                "anomaly_event_count": len(anomaly_events),
+                "selection_source": _SELECTION_SOURCE_UNSUPERVISED,
+            }
+        else:
+            assert residual_final is not None
+            anomaly_events, event_warnings = _select_anomaly_events(
+                residual_test=residual_final.test_scored,
+                anomaly_test=anomaly_final.test_scored,
+                feature_columns=feature_columns,
+                maximum_events=policy.maximum_anomaly_events,
+                minimum_events=policy.minimum_anomaly_events,
+            )
+            event_message = (
+                "Selected anomaly events for diagnosis using residual and "
+                "unsupervised indicators."
+            )
+            event_metadata = {
+                "anomaly_event_count": len(anomaly_events),
+            }
         state.anomaly_event_count = len(anomaly_events)
+        state.anomaly_events = [
+            event.model_copy(
+                update={"contributing_variables": []},
+                deep=True,
+            )
+            for event in anomaly_events
+        ]
         if len(anomaly_events) < policy.minimum_anomaly_events:
             self._refuse(
                 state,
@@ -882,85 +1307,198 @@ class IndustrialProcessAnalysisWorkflow:
         self._ok(
             state,
             AnalysisWorkflowStage.ANOMALY_EVENT_SELECTION,
-            "Selected anomaly events for diagnosis using residual and "
-            "unsupervised indicators.",
+            event_message,
             warnings=event_warnings,
-            metadata={
-                "anomaly_event_count": len(anomaly_events),
-            },
+            metadata=event_metadata,
         )
 
         # --- DIAGNOSIS ---
-        diagnosis_frame, diagnosis_warnings = _build_diagnosis_frame(
-            residual_final.test_scored
-        )
-        ensemble = self._resolve_diagnoser(policy)
-        diagnosis_request = DiagnosisRequest(
-            task=AnalysisTask.RESIDUAL_ANOMALY,
-            method=DiagnosisMethod.ENSEMBLE,
-            scope=DiagnosisScope.ANOMALY_GROUP,
-            feature_columns=list(feature_columns),
-            anomaly_events=[],
-            anomaly_indicator_column=_RESIDUAL_INDICATOR_COLUMN,
-            anomaly_score_column=_RESIDUAL_SCORE_COLUMN,
-            row_id_column=ORIGINAL_ROW_ID_COLUMN,
-            minimum_reference_rows=5,
-            metadata={"stage": AnalysisWorkflowStage.DIAGNOSIS.value},
-        )
-        diagnosis_result = ensemble.diagnose(diagnosis_frame, request=diagnosis_request)
-        if not isinstance(diagnosis_result, DiagnosisResult):
-            self._refuse(
+        if anomaly_only:
+            diagnosis_frame, diagnosis_warnings = _build_unsupervised_diagnosis_frame(
+                anomaly_final.test_scored
+            )
+            diagnoser = RobustGroupComparisonDiagnoser()
+            diagnosis_request = DiagnosisRequest(
+                task=AnalysisTask.UNSUPERVISED_ANOMALY,
+                method=DiagnosisMethod.GROUP_COMPARISON,
+                scope=DiagnosisScope.ANOMALY_GROUP,
+                feature_columns=list(feature_columns),
+                anomaly_events=[],
+                anomaly_indicator_column=_ANOMALY_INDICATOR_COLUMN,
+                anomaly_score_column=_ANOMALY_SCORE_COLUMN,
+                row_id_column=ORIGINAL_ROW_ID_COLUMN,
+                minimum_reference_rows=5,
+                metadata={
+                    "stage": AnalysisWorkflowStage.DIAGNOSIS.value,
+                    "diagnosis_source": _DIAGNOSIS_SOURCE_ROBUST,
+                    "association_not_causation": True,
+                    "target_based_diagnosis": False,
+                },
+            )
+            diagnosis_result = diagnoser.diagnose(
+                diagnosis_frame,
+                request=diagnosis_request,
+            )
+            if not isinstance(diagnosis_result, DiagnosisResult):
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.DIAGNOSIS,
+                    "Diagnosis returned an unexpected batch result for a single "
+                    "anomaly group.",
+                )
+            state.diagnosis_source = _DIAGNOSIS_SOURCE_ROBUST
+            state.diagnosis_performed = True
+            state.diagnosis_factor_count = len(diagnosis_result.factors)
+            state.diagnosis_factors = [
+                factor.model_copy(deep=True) for factor in diagnosis_result.factors
+            ]
+            diagnosis_warnings = list(diagnosis_warnings)
+            diagnosis_warnings.append(
+                "Diagnosis compares anomaly and normal group distributions "
+                "(association, not causation; not target-based)."
+            )
+            self._ok(
                 state,
                 AnalysisWorkflowStage.DIAGNOSIS,
-                "Diagnosis returned an unexpected batch result for a single "
-                "anomaly group.",
+                "Diagnosed likely associated factors using robust "
+                "normal-vs-anomaly group comparison (association, not causation).",
+                warnings=_dedupe(diagnosis_warnings),
+                metadata={
+                    "diagnosis_factor_count": len(diagnosis_result.factors),
+                    "diagnosis_source": _DIAGNOSIS_SOURCE_ROBUST,
+                    "target_based_diagnosis": False,
+                    "association_not_causation": True,
+                },
             )
-        residual_succeeded = diagnosis_result.metadata.get(
-            "residual_method_succeeded"
-        )
-        partial_ensemble = bool(diagnosis_result.metadata.get("partial_ensemble"))
-        if policy.require_residual_diagnosis and residual_succeeded is not True:
-            self._refuse(
+        else:
+            assert residual_final is not None
+            diagnosis_frame, diagnosis_warnings = _build_diagnosis_frame(
+                residual_final.test_scored
+            )
+            ensemble = self._resolve_diagnoser(policy)
+            diagnosis_request = DiagnosisRequest(
+                task=AnalysisTask.RESIDUAL_ANOMALY,
+                method=DiagnosisMethod.ENSEMBLE,
+                scope=DiagnosisScope.ANOMALY_GROUP,
+                feature_columns=list(feature_columns),
+                anomaly_events=[],
+                anomaly_indicator_column=_RESIDUAL_INDICATOR_COLUMN,
+                anomaly_score_column=_RESIDUAL_SCORE_COLUMN,
+                row_id_column=ORIGINAL_ROW_ID_COLUMN,
+                minimum_reference_rows=5,
+                metadata={"stage": AnalysisWorkflowStage.DIAGNOSIS.value},
+            )
+            diagnosis_result = ensemble.diagnose(
+                diagnosis_frame,
+                request=diagnosis_request,
+            )
+            if not isinstance(diagnosis_result, DiagnosisResult):
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.DIAGNOSIS,
+                    "Diagnosis returned an unexpected batch result for a single "
+                    "anomaly group.",
+                )
+            residual_succeeded = diagnosis_result.metadata.get(
+                "residual_method_succeeded"
+            )
+            partial_ensemble = bool(diagnosis_result.metadata.get("partial_ensemble"))
+            if policy.require_residual_diagnosis and residual_succeeded is not True:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.DIAGNOSIS,
+                    "Residual diagnosis was required but the residual method did not "
+                    "succeed.",
+                )
+            if partial_ensemble and not policy.allow_partial_diagnosis_ensemble:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.DIAGNOSIS,
+                    "The diagnosis ensemble produced only partial method support and "
+                    "partial ensembles are not permitted by policy.",
+                )
+            state.diagnosis_source = "RESIDUAL_ROBUST_ENSEMBLE"
+            state.diagnosis_performed = True
+            state.diagnosis_factor_count = len(diagnosis_result.factors)
+            state.diagnosis_factors = [
+                factor.model_copy(deep=True) for factor in diagnosis_result.factors
+            ]
+            self._ok(
                 state,
                 AnalysisWorkflowStage.DIAGNOSIS,
-                "Residual diagnosis was required but the residual method did not "
-                "succeed.",
+                "Diagnosed likely associated factors using the residual/robust "
+                "ensemble (association, not causation).",
+                warnings=diagnosis_warnings,
+                metadata={
+                    "diagnosis_factor_count": len(diagnosis_result.factors),
+                    "residual_method_succeeded": bool(residual_succeeded),
+                    "partial_ensemble": partial_ensemble,
+                },
             )
-        if partial_ensemble and not policy.allow_partial_diagnosis_ensemble:
-            self._refuse(
-                state,
-                AnalysisWorkflowStage.DIAGNOSIS,
-                "The diagnosis ensemble produced only partial method support and "
-                "partial ensembles are not permitted by policy.",
-            )
-        state.diagnosis_performed = True
-        state.diagnosis_factor_count = len(diagnosis_result.factors)
-        self._ok(
-            state,
-            AnalysisWorkflowStage.DIAGNOSIS,
-            "Diagnosed likely associated factors using the residual/robust "
-            "ensemble (association, not causation).",
-            warnings=diagnosis_warnings,
-            metadata={
-                "diagnosis_factor_count": len(diagnosis_result.factors),
-                "residual_method_succeeded": bool(residual_succeeded),
-                "partial_ensemble": partial_ensemble,
-            },
+
+        # --- ANOMALY CONTEXT WINDOWS (interpretation only) ---
+        context_windows, context_warnings = build_anomaly_context_windows(
+            analysis_frame=sorted_frame,
+            anomaly_events=state.anomaly_events,
+            diagnosis_factors=state.diagnosis_factors,
+            order_basis=context_order_basis,
+            timestamp_column=request.timestamp_column,
+            identifier_columns=list(request.identifier_columns),
         )
+        state.anomaly_context_windows = [
+            window.model_copy(deep=True) for window in context_windows
+        ]
+        state.context_warnings = list(context_warnings)
 
         # --- RECOMMENDATION ---
-        self._run_recommendation(
-            request,
-            policy=policy,
-            state=state,
-            feature_columns=feature_columns,
-            industry_profile=industry_profile,
-            leakage_report=leakage_report,
-            supervised_final=supervised_final,
-            anomaly_final=anomaly_final,
-            residual_final=residual_final,
-            diagnosis_result=diagnosis_result,
-        )
+        if anomaly_only:
+            operating_request = request
+            if (
+                request.operating_point_selection
+                is OperatingPointSelectionMode.TOP_RESIDUAL_ANOMALY
+            ):
+                operating_request = request.model_copy(
+                    update={
+                        "operating_point_selection": (
+                            OperatingPointSelectionMode.TOP_UNSUPERVISED_ANOMALY
+                        )
+                    }
+                )
+            selected_row_id, _baseline, operating_warnings = _select_operating_point(
+                request=operating_request,
+                residual_test=anomaly_final.test_scored,
+                anomaly_test=anomaly_final.test_scored,
+                test_frame=anomaly_final.test_scored,
+                feature_columns=feature_columns,
+            )
+            state.selected_operating_row_id = selected_row_id
+            self._skip(
+                state,
+                AnalysisWorkflowStage.RECOMMENDATION,
+                _SKIPPED_NOT_APPLICABLE,
+                warnings=operating_warnings,
+                metadata={
+                    "recommendation_applicable": False,
+                    "operating_row_id": _scalar_row_id(selected_row_id),
+                    "overview_message": _ANOMALY_ONLY_OVERVIEW,
+                },
+            )
+            state.status = AnalysisWorkflowStatus.PARTIAL
+        else:
+            assert supervised_final is not None
+            assert residual_final is not None
+            self._run_recommendation(
+                request,
+                policy=policy,
+                state=state,
+                feature_columns=feature_columns,
+                industry_profile=industry_profile,
+                leakage_report=leakage_report,
+                supervised_final=supervised_final,
+                anomaly_final=anomaly_final,
+                residual_final=residual_final,
+                diagnosis_result=diagnosis_result,
+            )
 
     def _run_recommendation(
         self,
@@ -977,6 +1515,12 @@ class IndustrialProcessAnalysisWorkflow:
         diagnosis_result: DiagnosisResult,
     ) -> None:
         objective = request.objective
+        if objective is None:
+            self._refuse(
+                state,
+                AnalysisWorkflowStage.RECOMMENDATION,
+                "Recommendation objective is required for supervised analysis.",
+            )
         if objective is RecommendationObjective.REDUCE_ANOMALY_SCORE:
             recommendation_task = AnalysisTask.UNSUPERVISED_ANOMALY
             target_column: str | None = None
@@ -1214,6 +1758,21 @@ class IndustrialProcessAnalysisWorkflow:
     # Stage record helpers
     # ------------------------------------------------------------------
 
+    def _store_target_suitability(
+        self,
+        state: _RunState,
+        assessment: TargetSuitabilityAssessment,
+    ) -> None:
+        state.target_column = assessment.target_column
+        state.target_suitable = assessment.suitable
+        state.target_unique_non_null_count = assessment.unique_non_null_count
+        state.target_refusal_code = (
+            None
+            if assessment.refusal_code is None
+            else assessment.refusal_code.value
+        )
+        state.target_suitability_message = assessment.message
+
     def _record(
         self,
         state: _RunState,
@@ -1233,6 +1792,29 @@ class IndustrialProcessAnalysisWorkflow:
                 succeeded=succeeded,
                 structured_refusal=structured_refusal,
                 row_count=row_count,
+                message=message,
+                warnings=_dedupe(warnings or []),
+                metadata=metadata or {},
+            )
+        )
+
+    def _skip(
+        self,
+        state: _RunState,
+        stage: AnalysisWorkflowStage,
+        message: str,
+        *,
+        warnings: list[str] | None = None,
+        metadata: dict[str, ScalarMetadataValue] | None = None,
+    ) -> None:
+        """Record a stage as explicitly skipped / not applicable."""
+        state.records.append(
+            AnalysisWorkflowStageRecord(
+                stage=stage,
+                executed=False,
+                succeeded=False,
+                structured_refusal=False,
+                row_count=None,
                 message=message,
                 warnings=_dedupe(warnings or []),
                 metadata=metadata or {},
@@ -1294,28 +1876,59 @@ class IndustrialProcessAnalysisWorkflow:
         total_seconds: float,
     ) -> AnalysisWorkflowReport:
         records = state.records
-        terminal_stage = records[-1].stage
-        warnings = self._aggregate_warnings(policy=policy, records=records)
+        executed = [record for record in records if record.executed]
+        terminal_stage = executed[-1].stage if executed else records[-1].stage
+        warnings = self._aggregate_warnings(
+            policy=policy,
+            records=records,
+            extra_warnings=state.context_warnings,
+        )
         report_metadata = _build_report_metadata(state)
 
         return AnalysisWorkflowReport(
             status=state.status,
             terminal_stage=terminal_stage,
             stage_records=records,
+            analysis_mode=state.analysis_mode,
             model_performance_assessment=state.model_performance_assessment,
             final_recommendation=state.final_recommendation,
             selected_industry=state.selected_industry,
             selected_task=state.selected_task,
+            inferred_task=state.inferred_task,
+            task_selection_source=state.task_selection_source,
+            task_override_applied=state.task_override_applied,
             selected_supervised_model_key=state.selected_supervised_model_key,
             selected_anomaly_model_key=state.selected_anomaly_model_key,
             selected_operating_row_id=state.selected_operating_row_id,
             anomaly_event_count=state.anomaly_event_count,
             diagnosis_factor_count=state.diagnosis_factor_count,
+            anomaly_events=[
+                event.model_copy(deep=True) for event in state.anomaly_events
+            ],
+            diagnosis_factors=[
+                factor.model_copy(deep=True) for factor in state.diagnosis_factors
+            ],
+            anomaly_context_windows=[
+                window.model_copy(deep=True)
+                for window in state.anomaly_context_windows
+            ],
             raw_row_count=state.raw_row_count,
             processed_row_count=state.processed_row_count,
+            cohort_row_count=state.cohort_row_count,
             train_row_count=state.train_row_count,
             validation_row_count=state.validation_row_count,
             test_row_count=state.test_row_count,
+            cohort_filter_summary=(
+                state.cohort_filter_summary.model_copy(deep=True)
+                if state.cohort_filter_summary is not None
+                else CohortFilterSummary(
+                    configured=False,
+                    source_row_count=state.processed_row_count,
+                    retained_row_count=state.cohort_row_count,
+                    excluded_row_count=0,
+                    null_excluded_count=0,
+                )
+            ),
             started_at=started_at,
             completed_at=completed_at,
             total_seconds=total_seconds,
@@ -1328,6 +1941,7 @@ class IndustrialProcessAnalysisWorkflow:
         *,
         policy: AnalysisWorkflowPolicy,
         records: list[AnalysisWorkflowStageRecord],
+        extra_warnings: list[str] | None = None,
     ) -> list[str]:
         if not policy.include_stage_warnings:
             if not records:
@@ -1341,12 +1955,22 @@ class IndustrialProcessAnalysisWorkflow:
                     kept.append(message)
             if terminal.structured_refusal and terminal.message not in seen_terminal:
                 kept.append(terminal.message)
+            if extra_warnings:
+                for message in extra_warnings:
+                    if message not in seen_terminal:
+                        seen_terminal.add(message)
+                        kept.append(message)
             return kept
 
         collected: list[str] = []
         seen_all: set[str] = set()
         for record in records:
             for message in record.warnings:
+                if message not in seen_all:
+                    seen_all.add(message)
+                    collected.append(message)
+        if extra_warnings:
+            for message in extra_warnings:
                 if message not in seen_all:
                     seen_all.add(message)
                     collected.append(message)
@@ -1402,11 +2026,137 @@ def _dedupe(messages: list[str]) -> list[str]:
     return result
 
 
+def _format_validation_warning(issue: object) -> str:
+    """Return a concrete validation warning from an existing issue payload."""
+    message = getattr(issue, "message", None)
+    if isinstance(message, str) and message.strip() != "":
+        return message
+    issue_type = getattr(issue, "issue_type", None)
+    if isinstance(issue_type, str) and issue_type.strip() != "":
+        return f"Validation issue ({issue_type})"
+    return "Validation issue"
+
+
 def _scalar_row_id(row_id: int | str | None) -> ScalarMetadataValue:
     """Return a scalar-safe representation of an operating row identifier."""
     if row_id is None or isinstance(row_id, (int, str)):
         return row_id
     return str(row_id)
+
+
+def _select_unsupervised_anomaly_events(
+    *,
+    anomaly_test: pl.DataFrame,
+    feature_columns: list[str],
+    maximum_events: int,
+    minimum_events: int,
+) -> tuple[list[AnomalyEvent], list[str]]:
+    """Select anomaly events from unsupervised scores only (anomaly-only mode).
+
+    Uses unsupervised indicator-positive rows first, then high unsupervised
+    scores when below the configured minimum. Does not treat missing residual
+    indicators as a fallback condition.
+    """
+    warnings: list[str] = []
+    candidates: list[tuple[bool, float, int, str, str]] = []
+    seen_ids: set[int] = set()
+
+    unsupervised_hits = anomaly_test.filter(pl.col(_ANOMALY_INDICATOR_COLUMN)).sort(
+        [_ANOMALY_SCORE_COLUMN, ORIGINAL_ROW_ID_COLUMN],
+        descending=[True, False],
+    )
+    for row in unsupervised_hits.iter_rows(named=True):
+        row_id = int(row[ORIGINAL_ROW_ID_COLUMN])
+        if row_id in seen_ids:
+            continue
+        seen_ids.add(row_id)
+        candidates.append(
+            (
+                True,
+                _finite_float(row[_ANOMALY_SCORE_COLUMN]),
+                row_id,
+                "unsupervised_anomaly_model",
+                (
+                    "Unsupervised anomaly indicator was True for this row "
+                    f"(selection_source={_SELECTION_SOURCE_UNSUPERVISED})."
+                ),
+            )
+        )
+
+    if len(candidates) < minimum_events:
+        ordered_scores = anomaly_test.sort(
+            [_ANOMALY_SCORE_COLUMN, ORIGINAL_ROW_ID_COLUMN],
+            descending=[True, False],
+        )
+        for row in ordered_scores.iter_rows(named=True):
+            if len(candidates) >= maximum_events:
+                break
+            row_id = int(row[ORIGINAL_ROW_ID_COLUMN])
+            if row_id in seen_ids:
+                continue
+            seen_ids.add(row_id)
+            candidates.append(
+                (
+                    False,
+                    _finite_float(row[_ANOMALY_SCORE_COLUMN]),
+                    row_id,
+                    "top_anomaly_score_candidate",
+                    (
+                        "Selected as a high unsupervised anomaly-score diagnostic "
+                        "candidate; not asserted as a confirmed anomaly."
+                    ),
+                )
+            )
+            warnings.append(
+                "Anomaly event selected as a high unsupervised anomaly-score "
+                "diagnostic candidate; not asserted as a confirmed anomaly."
+            )
+
+    candidates.sort(key=lambda item: (not item[0], -item[1], item[2]))
+    selected = candidates[:maximum_events]
+
+    events: list[AnomalyEvent] = []
+    for _is_flagged, score, row_id, detector, rationale in selected:
+        events.append(
+            AnomalyEvent(
+                anomaly_id=str(row_id),
+                anomaly_type=AnomalyType.PROCESS_INPUT,
+                anomaly_score=score,
+                severity="high" if score >= 0.0 else "moderate",
+                sample_id=row_id,
+                model_confidence=0.75,
+                detector=detector,
+                rationale=rationale,
+                contributing_variables=list(feature_columns),
+            )
+        )
+    return events, _dedupe(warnings)
+
+
+def _build_unsupervised_diagnosis_frame(
+    anomaly_test: pl.DataFrame,
+) -> tuple[pl.DataFrame, list[str]]:
+    """Return a diagnosis frame with at least one unsupervised anomaly-group row."""
+    warnings: list[str] = []
+    positive = int(anomaly_test.get_column(_ANOMALY_INDICATOR_COLUMN).sum())
+    if positive > 0:
+        return anomaly_test, warnings
+
+    top_id = anomaly_test.sort(_ANOMALY_SCORE_COLUMN, descending=True)[
+        ORIGINAL_ROW_ID_COLUMN
+    ][0]
+    frame = anomaly_test.with_columns(
+        pl.when(pl.col(ORIGINAL_ROW_ID_COLUMN) == top_id)
+        .then(True)
+        .otherwise(False)
+        .alias(_ANOMALY_INDICATOR_COLUMN)
+    )
+    warnings.append(
+        "No unsupervised anomaly indicators were present on the test partition; "
+        "the highest unsupervised anomaly-score row was marked as the diagnostic "
+        "anomaly group."
+    )
+    return frame, warnings
 
 
 def _select_anomaly_events(
@@ -1718,13 +2468,24 @@ def _build_report_metadata(state: _RunState) -> dict[str, ScalarMetadataValue]:
         "raw_csv_loaded": state.raw_csv_loaded,
         "raw_row_count": state.raw_row_count,
         "processed_row_count": state.processed_row_count,
+        "cohort_row_count": state.cohort_row_count,
         "train_row_count": state.train_row_count,
         "validation_row_count": state.validation_row_count,
         "test_row_count": state.test_row_count,
+        "analysis_mode": state.analysis_mode.value,
         "selected_industry": state.selected_industry,
         "selected_task": (
             state.selected_task.value if state.selected_task is not None else None
         ),
+        "inferred_task": (
+            state.inferred_task.value if state.inferred_task is not None else None
+        ),
+        "task_selection_source": (
+            state.task_selection_source.value
+            if state.task_selection_source is not None
+            else None
+        ),
+        "task_override_applied": state.task_override_applied,
         "selected_supervised_model_available": state.supervised_model_available,
         "selected_anomaly_model_available": state.anomaly_model_available,
         "residual_calibration_performed": state.residual_calibration_performed,
@@ -1732,24 +2493,39 @@ def _build_report_metadata(state: _RunState) -> dict[str, ScalarMetadataValue]:
             state.independent_test_evaluation_performed
         ),
         "anomaly_event_count": state.anomaly_event_count,
+        "anomaly_event_selection_source": state.anomaly_event_selection_source,
         "diagnosis_performed": state.diagnosis_performed,
+        "diagnosis_source": state.diagnosis_source,
         "recommendation_pipeline_executed": state.recommendation_pipeline_executed,
         "recommendation_generated": state.recommendation_generated,
+        "recommendation_applicable": state.recommendation_applicable,
         "row_identity_preserved": state.row_identity_preserved,
         "test_used_for_model_selection": False,
         "test_used_for_threshold_calibration": False,
         "anomaly_score_direction": "higher_is_more_anomalous",
         "model_fit_performed": True,
-        "model_refit_performed": True,
+        "model_refit_performed": (
+            state.analysis_mode is AnalysisExecutionMode.SUPERVISED
+        ),
         "residual_model_refit_after_calibration": False,
         "extrapolation_computed": False,
         "uncertainty_computed": False,
         "workflow_orchestration_only": True,
         "model_performance_gate_bypassed": False,
+        "target_column": state.target_column,
+        "feature_count": state.feature_count,
+        "target_suitable": state.target_suitable,
+        "target_unique_non_null_count": state.target_unique_non_null_count,
+        "target_refusal_code": state.target_refusal_code,
+        "target_suitability_message": state.target_suitability_message,
     }
     if assessment is None:
         metadata["model_performance_assessed"] = False
-        metadata["model_performance_status"] = None
+        metadata["model_performance_status"] = (
+            "NOT_APPLICABLE"
+            if state.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
+            else None
+        )
         metadata["model_performance_rule_count"] = None
         metadata["model_performance_required_rule_count"] = None
         metadata["model_performance_failed_rule_count"] = None

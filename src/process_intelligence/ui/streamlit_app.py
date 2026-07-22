@@ -8,22 +8,25 @@ Does not implement modeling, scoring, ranking, or recommendation algorithms.
 
 from __future__ import annotations
 
+import csv
 import math
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
 
+import pandas as pd  # type: ignore[import-untyped]
 import polars as pl
 import streamlit as st
 from pydantic import ValidationError
 
-from process_intelligence.core.enums import ColumnRole
+from process_intelligence.core.enums import AnalysisTask, ColumnRole
 from process_intelligence.core.exceptions import (
     DataValidationError,
     ProcessIntelligenceError,
 )
+from process_intelligence.data import evaluate_target_suitability
 from process_intelligence.evaluation.performance_acceptance import (
     MetricAcceptanceDirection,
     ModelPerformanceAcceptanceStatus,
@@ -34,7 +37,12 @@ from process_intelligence.recommendation import (
     RecommendationStatus,
 )
 from process_intelligence.reporting import AnalysisWorkflowReportBuilder
-from process_intelligence.reporting.schemas import WorkflowPresentationReport
+from process_intelligence.reporting.schemas import (
+    AnomalyContextWindowView,
+    AnomalyEventView,
+    DiagnosisFactorView,
+    WorkflowPresentationReport,
+)
 from process_intelligence.ui.column_configuration import (
     AutomaticColumnConfigurator,
     UiColumnConfigurationReport,
@@ -49,28 +57,297 @@ from process_intelligence.ui.schemas import (
 )
 from process_intelligence.ui.workflow_factory import create_default_analysis_workflow
 from process_intelligence.workflow import (
+    ANOMALY_CONTEXT_RADIUS,
+    AnalysisExecutionMode,
+    AnalysisWorkflowOutcome,
     AnalysisWorkflowStatus,
     IndustrialProcessAnalysisWorkflow,
+    NumericCohortFilter,
     OperatingPointSelectionMode,
+    list_numeric_cohort_filter_candidates,
+    observed_numeric_range,
+    preview_numeric_cohort_filter_row_count,
 )
-from process_intelligence.workflow.schemas import AnalysisWorkflowOutcome
 
 _ORIGINAL_ROW_ID = "_original_row_id"
 _SESSION_REPORT_KEY = "last_presentation_report_json"
 _SESSION_COLUMNS_KEY = "ui_column_schema_fingerprint"
+_SESSION_ANALYSIS_MODE_KEY = "ui_analysis_mode"
 _SESSION_TARGET_KEY = "ui_target_column"
 _SESSION_TIMESTAMP_KEY = "ui_timestamp_column"
 _SESSION_IDENTIFIERS_KEY = "ui_identifier_columns"
 _SESSION_EXCLUDED_KEY = "ui_excluded_columns"
 _NOT_AVAILABLE = "Not available"
+_NOT_APPLICABLE = "Not applicable"
 _ROLE_NONE = "(no override)"
 _TARGET_PLACEHOLDER = "(select target)"
 _TIMESTAMP_NONE = "(none)"
 _OBJECTIVE_PLACEHOLDER = "(select objective)"
 _DIRECTION_PLACEHOLDER = "(select direction)"
+_TASK_AUTO = "AUTO"
+_TASK_HELP = (
+    "AUTO uses the task router. "
+    "REGRESSION predicts a continuous numeric target. "
+    "CLASSIFICATION predicts discrete classes. "
+    "Classification modeling is not yet supported by this workflow."
+)
 _QUALITY_DIRECTION_PLACEHOLDER = "(select quality direction)"
+_ANOMALY_ONLY_RECOMMENDATION_NOTE = (
+    "Recommendation generation is not enabled for anomaly-only analysis."
+)
+_ANOMALY_ONLY_PERFORMANCE_NOTE = "Not applicable for anomaly-only analysis."
+_COHORT_COLUMN_PLACEHOLDER = "(select cohort column)"
+_COHORT_FILTER_INTERPRETATION_NOTE = (
+    "Anomaly scores are relative to the selected operating cohort and should "
+    "not be compared directly with scores from a different cohort run."
+)
+_ANOMALY_EVENTS_CAPTION = (
+    "Rows with the highest unsupervised anomaly scores in the independent test "
+    "partition. These are statistical outliers and are not automatically defects. "
+    "Original row ID is the workflow-preserved CSV row identity (0-based from the "
+    "loaded file) and may differ from a user-provided identifier column."
+)
+_ANOMALY_CONTEXT_CAPTION = (
+    "Context rows show the selected event and its neighboring records in the "
+    "workflow analysis order. Values are original preprocessed-input values and "
+    "are provided for interpretation only."
+)
+_ANOMALY_CONTEXT_ORDER_CAPTION = (
+    "Original row ID is the workflow-preserved 0-based CSV row identity. "
+    "Neighboring rows are based on the workflow analysis order, not arithmetic "
+    "differences between original row IDs. When timestamp sorting was used, "
+    "original row ID values may not be contiguous."
+)
+_ANOMALY_CONTEXT_FILTERED_CAPTION = (
+    "When an operating cohort filter is configured, neighboring rows are "
+    "adjacent only within the filtered analysis-order cohort. Rows outside "
+    "the selected operating range are not re-inserted into the context window."
+)
+_DIAGNOSIS_FACTORS_CAPTION = (
+    "Features that differ most strongly between the selected anomaly group and "
+    "the normal comparison group. These are associations, not proven causes. "
+    "Factors are ranked using a common bounded association score. Robust "
+    "z-scores are shown only as supporting statistics when the comparison-group "
+    "scale is available."
+)
 
 WorkflowFactory = Callable[[], IndustrialProcessAnalysisWorkflow]
+
+
+def _csv_bytes_from_rows(rows: list[dict[str, Any]]) -> bytes:
+    """Serialize presentation rows to UTF-8 CSV bytes without temp files."""
+    buffer = StringIO()
+    if not rows:
+        return b""
+    fieldnames = list(rows[0].keys())
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buffer.getvalue().encode("utf-8")
+
+
+def _anomaly_event_table_rows(
+    events: Sequence[AnomalyEventView],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "Rank": event.rank,
+            "Original row ID": event.original_row_id,
+            "Anomaly score": event.anomaly_score,
+            "Operating row": "Yes" if event.is_operating_row else "No",
+        }
+        for event in events
+    ]
+
+
+def _anomaly_event_download_rows(
+    events: Sequence[AnomalyEventView],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "rank": event.rank,
+            "original_row_id": event.original_row_id,
+            "anomaly_score": event.anomaly_score,
+            "is_operating_row": event.is_operating_row,
+            "selection_source": event.selection_source,
+            "score_direction": event.score_direction,
+            "is_anomaly_flagged": event.is_anomaly_flagged,
+        }
+        for event in events
+    ]
+
+
+def _diagnosis_factor_table_rows(
+    factors: Sequence[DiagnosisFactorView],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for factor in factors:
+        difference = factor.raw_group_difference
+        if difference is None:
+            difference = factor.effect_size
+        robust_z_display: float | str
+        if factor.robust_z_score is None:
+            robust_z_display = _NOT_AVAILABLE
+        else:
+            robust_z_display = factor.robust_z_score
+        rows.append(
+            {
+                "Rank": factor.rank,
+                "Feature": factor.feature_name,
+                "Ranking score": factor.diagnostic_score,
+                "Direction": factor.direction,
+                "Anomaly group": factor.anomaly_group_value,
+                "Normal group": factor.normal_group_value,
+                "Difference": difference,
+                "Robust scale": factor.robust_scale,
+                "Robust z-score": robust_z_display,
+                "Scale status": factor.robust_scale_status,
+                "Confidence": factor.confidence,
+                "Source": factor.source,
+            }
+        )
+    return rows
+
+
+def _diagnosis_factor_download_rows(
+    factors: Sequence[DiagnosisFactorView],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for factor in factors:
+        difference = factor.raw_group_difference
+        if difference is None:
+            difference = factor.effect_size
+        rows.append(
+            {
+                "rank": factor.rank,
+                "feature_name": factor.feature_name,
+                "ranking_score": factor.diagnostic_score,
+                "direction": factor.direction,
+                "anomaly_group_value": factor.anomaly_group_value,
+                "normal_group_value": factor.normal_group_value,
+                "raw_group_difference": difference,
+                "robust_scale": factor.robust_scale,
+                "robust_z_score": factor.robust_z_score,
+                "robust_scale_status": factor.robust_scale_status,
+                "confidence": factor.confidence,
+                "source": factor.source,
+            }
+        )
+    return rows
+
+
+def _context_event_option_label(
+    window: AnomalyContextWindowView,
+    *,
+    is_operating: bool,
+) -> str:
+    suffix = " (operating row)" if is_operating else ""
+    return (
+        f"Rank {window.event_rank} — Original row ID "
+        f"{window.center_original_row_id}{suffix}"
+    )
+
+
+def _default_context_window_index(
+    windows: Sequence[AnomalyContextWindowView],
+    events: Sequence[AnomalyEventView],
+) -> int:
+    operating_ids = {
+        event.original_row_id for event in events if event.is_operating_row
+    }
+    for index, window in enumerate(windows):
+        if window.center_original_row_id in operating_ids:
+            return index
+    return 0
+
+
+def _context_table_rows(window: AnomalyContextWindowView) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in window.rows:
+        item: dict[str, Any] = {
+            "Relative offset": row.relative_offset,
+            "Analysis position": row.analysis_position,
+            "Original row ID": row.original_row_id,
+            "Center event": "Yes" if row.is_center_event else "No",
+            "Selected anomaly event": (
+                "Yes" if row.is_selected_anomaly_event else "No"
+            ),
+        }
+        if row.timestamp_value is not None or any(
+            other.timestamp_value is not None for other in window.rows
+        ):
+            item["Timestamp"] = row.timestamp_value
+        for identifier in row.identifier_values:
+            item[identifier.column_name] = identifier.value
+        feature_lookup = {value.feature_name: value.value for value in row.feature_values}
+        for feature_name in window.feature_names:
+            item[feature_name] = feature_lookup.get(feature_name)
+        rows.append(item)
+    return rows
+
+
+def _context_download_rows(window: AnomalyContextWindowView) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in window.rows:
+        item: dict[str, Any] = {
+            "event_rank": window.event_rank,
+            "center_original_row_id": window.center_original_row_id,
+            "center_anomaly_score": window.center_anomaly_score,
+            "order_basis": window.order_basis.value,
+            "radius": window.radius,
+            "analysis_position": row.analysis_position,
+            "original_row_id": row.original_row_id,
+            "relative_offset": row.relative_offset,
+            "is_center_event": row.is_center_event,
+            "is_selected_anomaly_event": row.is_selected_anomaly_event,
+            "timestamp_value": row.timestamp_value,
+        }
+        for identifier in row.identifier_values:
+            item[f"identifier_{identifier.column_name}"] = identifier.value
+        feature_lookup = {value.feature_name: value.value for value in row.feature_values}
+        for feature_name in window.feature_names:
+            item[feature_name] = feature_lookup.get(feature_name)
+        rows.append(item)
+    return rows
+
+
+def _feature_values_are_numeric(window: AnomalyContextWindowView, feature_name: str) -> bool:
+    saw_value = False
+    for row in window.rows:
+        for item in row.feature_values:
+            if item.feature_name != feature_name:
+                continue
+            if item.value is None:
+                continue
+            saw_value = True
+            if isinstance(item.value, bool) or not isinstance(item.value, (int, float)):
+                return False
+    return saw_value
+
+
+def _context_chart_rows(
+    window: AnomalyContextWindowView,
+    feature_name: str,
+) -> list[dict[str, Any]]:
+    chart_rows: list[dict[str, Any]] = []
+    for row in window.rows:
+        value = next(
+            (
+                item.value
+                for item in row.feature_values
+                if item.feature_name == feature_name
+            ),
+            None,
+        )
+        if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        chart_rows.append(
+            {
+                "relative_offset": row.relative_offset,
+                feature_name: float(value),
+            }
+        )
+    return chart_rows
 
 
 def render_app(
@@ -184,28 +461,75 @@ def render_app(
 
     _reset_column_widget_state_if_schema_changed(columns)
 
+    st.subheader("Analysis mode")
+    if _SESSION_ANALYSIS_MODE_KEY not in st.session_state:
+        st.session_state[_SESSION_ANALYSIS_MODE_KEY] = (
+            AnalysisExecutionMode.SUPERVISED.value
+        )
+    previous_mode = str(st.session_state.get(_SESSION_ANALYSIS_MODE_KEY))
+    analysis_mode = AnalysisExecutionMode(
+        st.selectbox(
+            "Analysis mode",
+            options=[
+                AnalysisExecutionMode.SUPERVISED.value,
+                AnalysisExecutionMode.ANOMALY_ONLY.value,
+            ],
+            key=_SESSION_ANALYSIS_MODE_KEY,
+            help=(
+                "SUPERVISED requires a target and recommendation settings. "
+                "ANOMALY_ONLY runs label-free anomaly detection without a target."
+            ),
+        )
+    )
+    if (
+        previous_mode == AnalysisExecutionMode.SUPERVISED.value
+        and analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
+    ):
+        st.session_state[_SESSION_TARGET_KEY] = _TARGET_PLACEHOLDER
+    anomaly_only = analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
+
     st.subheader("Column configuration")
     st.caption(
         "Suggested target candidates are based on column structure and names. "
-        "The user must confirm the final prediction target."
+        "The user must confirm the final prediction target for supervised mode."
     )
 
     _render_configuration_summary(config_report)
 
-    target_options = _build_target_options(columns, config_report.target_candidates)
-    if _SESSION_TARGET_KEY not in st.session_state:
-        st.session_state[_SESSION_TARGET_KEY] = _TARGET_PLACEHOLDER
-    target_selection = st.selectbox(
-        "Target column",
-        options=target_options,
-        key=_SESSION_TARGET_KEY,
-        help="Automatic suggestions are not final. Confirm the prediction target.",
-    )
-    selected_target = (
-        None if target_selection == _TARGET_PLACEHOLDER else target_selection
-    )
-    if selected_target is None:
-        st.warning("Select a target column before running analysis.")
+    selected_target: str | None = None
+    target_has_usable_variation = True
+    if anomaly_only:
+        st.info("Target column: not required for anomaly-only analysis.")
+    else:
+        target_options = _build_target_options(columns, config_report.target_candidates)
+        if _SESSION_TARGET_KEY not in st.session_state:
+            st.session_state[_SESSION_TARGET_KEY] = _TARGET_PLACEHOLDER
+        target_selection = st.selectbox(
+            "Target column",
+            options=target_options,
+            key=_SESSION_TARGET_KEY,
+            help="Automatic suggestions are not final. Confirm the prediction target.",
+        )
+        selected_target = (
+            None if target_selection == _TARGET_PLACEHOLDER else target_selection
+        )
+        if selected_target is None:
+            st.warning("Select a target column before running analysis.")
+        elif analysis_frame is not None and selected_target in analysis_frame.columns:
+            target_assessment = evaluate_target_suitability(
+                analysis_frame,
+                selected_target,
+                requested_task=None,
+            )
+            target_has_usable_variation = target_assessment.suitable
+            if not target_has_usable_variation:
+                if target_assessment.is_constant:
+                    st.error(
+                        f"{selected_target} cannot be used as a regression target "
+                        "because it contains only one distinct non-null value."
+                    )
+                else:
+                    st.error(target_assessment.message)
 
     timestamp_help = _timestamp_help_text(config_report)
     timestamp_options = _build_timestamp_options(
@@ -240,8 +564,15 @@ def render_app(
         "Identifier columns",
         options=columns,
         key=_SESSION_IDENTIFIERS_KEY,
-        help="Suggested; review before running.",
+        help=(
+            "Suggested only when an identifier-like column has at least two "
+            "distinct non-null values. Constant or all-null identifier-like "
+            "columns are not selected by default."
+        ),
     )
+    for warning in config_report.warnings:
+        if "resembles an identifier but is constant" in warning:
+            st.info(warning)
 
     excluded_default = [
         name
@@ -305,6 +636,161 @@ def render_app(
                 default=manual_default,
             )
 
+    cohort_filter: NumericCohortFilter | None = None
+    cohort_filter_ready = True
+    modeling_feature_columns = list(feature_columns)
+    if anomaly_only:
+        st.subheader("Operating cohort filter")
+        st.caption(
+            "Restrict anomaly analysis to a user-confirmed numeric operating "
+            "range. This can reduce false positives caused by comparing "
+            "different operating regimes."
+        )
+        restrict_cohort = st.checkbox(
+            "Restrict analysis to an operating range",
+            value=False,
+            key="ui_restrict_operating_cohort",
+        )
+        if restrict_cohort:
+            cohort_candidates = (
+                list_numeric_cohort_filter_candidates(
+                    analysis_frame,
+                    active_feature_columns=list(feature_columns),
+                    identifier_columns=list(identifier_columns),
+                    timestamp_column=selected_timestamp,
+                )
+                if analysis_frame is not None
+                else []
+            )
+            cohort_options = [_COHORT_COLUMN_PLACEHOLDER, *cohort_candidates]
+            selected_cohort_column = st.selectbox(
+                "Cohort column",
+                options=cohort_options,
+                index=0,
+                key="ui_cohort_filter_column",
+            )
+            lower_text = st.text_input(
+                "Lower bound",
+                value="",
+                key="ui_cohort_filter_lower",
+                help="Enter a finite number. No default bound is inferred.",
+            )
+            upper_text = st.text_input(
+                "Upper bound",
+                value="",
+                key="ui_cohort_filter_upper",
+                help="Enter a finite number. No default bound is inferred.",
+            )
+            include_lower = st.checkbox(
+                "Include lower bound",
+                value=True,
+                key="ui_cohort_filter_include_lower",
+            )
+            include_upper = st.checkbox(
+                "Include upper bound",
+                value=True,
+                key="ui_cohort_filter_include_upper",
+            )
+            exclude_filter_column = st.checkbox(
+                "Exclude cohort column from anomaly features",
+                value=True,
+                key="ui_cohort_filter_exclude_feature",
+            )
+
+            if (
+                selected_cohort_column != _COHORT_COLUMN_PLACEHOLDER
+                and analysis_frame is not None
+            ):
+                observed = observed_numeric_range(
+                    analysis_frame,
+                    selected_cohort_column,
+                )
+                if observed is not None:
+                    st.caption(
+                        "Observed range in uploaded data: "
+                        f"{observed[0]} to {observed[1]}"
+                    )
+
+            lower_value: float | None = None
+            upper_value: float | None = None
+            bounds_ok = True
+            try:
+                if str(lower_text).strip() == "" or str(upper_text).strip() == "":
+                    bounds_ok = False
+                else:
+                    lower_value = float(str(lower_text).strip())
+                    upper_value = float(str(upper_text).strip())
+                    if not math.isfinite(lower_value) or not math.isfinite(upper_value):
+                        bounds_ok = False
+                    elif lower_value > upper_value:
+                        bounds_ok = False
+            except ValueError:
+                bounds_ok = False
+
+            preview_retained: int | None = None
+            if (
+                selected_cohort_column != _COHORT_COLUMN_PLACEHOLDER
+                and bounds_ok
+                and lower_value is not None
+                and upper_value is not None
+                and analysis_frame is not None
+            ):
+                try:
+                    preview_filter = NumericCohortFilter(
+                        column_name=selected_cohort_column,
+                        lower_bound=lower_value,
+                        upper_bound=upper_value,
+                        include_lower=include_lower,
+                        include_upper=include_upper,
+                        exclude_filter_column_from_features=exclude_filter_column,
+                    )
+                    preview_retained = preview_numeric_cohort_filter_row_count(
+                        analysis_frame,
+                        preview_filter,
+                    )
+                    st.caption(
+                        f"Preview: {preview_retained:,} of "
+                        f"{analysis_frame.height:,} rows would be included."
+                    )
+                    cohort_filter = preview_filter
+                except (DataValidationError, ValidationError, ValueError) as exc:
+                    cohort_filter_ready = False
+                    st.warning(str(exc))
+            else:
+                cohort_filter_ready = False
+
+            if preview_retained is not None and preview_retained <= 0:
+                cohort_filter_ready = False
+                st.warning(
+                    "The configured operating range retains zero rows. "
+                    "Adjust the bounds before running analysis."
+                )
+
+            if (
+                cohort_filter is not None
+                and cohort_filter.exclude_filter_column_from_features
+                and cohort_filter.column_name in modeling_feature_columns
+            ):
+                modeling_feature_columns = [
+                    name
+                    for name in modeling_feature_columns
+                    if name != cohort_filter.column_name
+                ]
+                st.caption(
+                    "Active modeling features after excluding the cohort "
+                    f"column: {len(modeling_feature_columns)}"
+                )
+
+            if selected_cohort_column == _COHORT_COLUMN_PLACEHOLDER:
+                st.warning("Select a cohort column before running analysis.")
+            if not bounds_ok:
+                st.warning(
+                    "Provide finite lower and upper bounds with lower <= upper."
+                )
+        else:
+            cohort_filter = None
+            cohort_filter_ready = True
+
     st.subheader("Column role overrides")
     st.caption(
         "Overrides are optional. Controllability is not confirmed by selecting "
@@ -329,177 +815,227 @@ def render_app(
         if selected_role != _ROLE_NONE:
             column_role_overrides[feature_name] = ColumnRole(selected_role)
 
-    st.subheader("Recommendation objective")
-    st.caption(
-        "Objective is not inferred. Select an objective explicitly before running."
-    )
-    objective_options = [
-        _OBJECTIVE_PLACEHOLDER,
-        *[item.value for item in RecommendationObjective],
-    ]
-    objective_selection = st.selectbox(
-        "Objective",
-        options=objective_options,
-        index=0,
-    )
+    requested_task: AnalysisTask | None = None
+    analysis_task_selection_valid = True
     selected_objective: RecommendationObjective | None = None
-    if objective_selection != _OBJECTIVE_PLACEHOLDER:
-        selected_objective = RecommendationObjective(objective_selection)
-    else:
-        st.warning("Select a recommendation objective before running analysis.")
-
     quality_direction: QualityOptimizationDirection | None = None
     quality_target: float | None = None
-    needs_quality = selected_objective in {
-        RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
-        RecommendationObjective.BALANCE_QUALITY_AND_ANOMALY,
-    }
     quality_direction_selected = True
-    if needs_quality:
-        quality_options = [
-            _QUALITY_DIRECTION_PLACEHOLDER,
-            *[item.value for item in QualityOptimizationDirection],
-        ]
-        quality_selection = st.selectbox(
-            "Quality direction",
-            options=quality_options,
-            index=0,
-        )
-        if quality_selection == _QUALITY_DIRECTION_PLACEHOLDER:
-            quality_direction_selected = False
-            st.warning("Select a quality optimization direction before running.")
-        else:
-            quality_direction = QualityOptimizationDirection(quality_selection)
-            if quality_direction is QualityOptimizationDirection.TARGET:
-                quality_target = float(
-                    st.number_input("Quality target", value=0.0, format="%.6f")
-                )
-
-    st.subheader("Model performance acceptance rules")
-    st.caption(
-        "Provide at least one complete metric rule. Direction is never inferred "
-        "from the metric name. Arbitrary defaults are not submitted."
-    )
-    st.markdown(
-        "- R² generally uses HIGHER_IS_BETTER.\n"
-        "- RMSE and MAE generally use LOWER_IS_BETTER.\n"
-        "- The user must confirm the metric direction and threshold."
-    )
-    rule_count = int(
-        st.number_input(
-            "Number of performance rules",
-            min_value=1,
-            max_value=20,
-            value=1,
-            step=1,
-        )
-    )
     performance_rule_rows: list[dict[str, Any]] = []
-    rule_issues: list[str] = []
     complete_rule_count = 0
-    direction_options = [
-        _DIRECTION_PLACEHOLDER,
-        *[item.value for item in MetricAcceptanceDirection],
-    ]
-    for index in range(rule_count):
-        st.markdown(f"Rule {index + 1}")
-        metric_name = st.text_input(
-            f"Metric name #{index + 1}",
-            value="",
-            key=f"metric_name_{index}",
-        )
-        direction_selection = st.selectbox(
-            f"Direction #{index + 1}",
-            options=direction_options,
-            index=0,
-            key=f"metric_direction_{index}",
-        )
-        threshold_text = st.text_input(
-            f"Threshold #{index + 1}",
-            value="",
-            key=f"metric_threshold_{index}",
-            help="Enter a finite numeric threshold. Leave blank until confirmed.",
-        )
-        required = st.checkbox(
-            f"Required #{index + 1}",
-            value=True,
-            key=f"metric_required_{index}",
-        )
-        missing = _performance_rule_missing_fields(
-            metric_name=metric_name,
-            direction_selection=direction_selection,
-            threshold_text=threshold_text,
-        )
-        if missing:
-            rule_issues.append(f"Rule {index + 1} missing: {', '.join(missing)}")
-            continue
-        threshold_value = float(str(threshold_text).strip())
-        performance_rule_rows.append(
-            {
-                "metric_name": str(metric_name).strip(),
-                "direction": direction_selection,
-                "threshold": threshold_value,
-                "required": bool(required),
-            }
-        )
-        complete_rule_count += 1
-
-    if complete_rule_count < 1:
-        st.warning(
-            "Configure at least one complete performance rule "
-            "(metric name, direction, and finite threshold)."
-        )
-    for issue in rule_issues:
-        st.warning(issue)
-
-    st.subheader("Process variable constraints")
-    st.caption(
-        "Constraints are not inferred from dataset min/max. Variables without "
-        "constraints may be excluded from recommendation candidates."
-    )
-    constrained_variables = st.multiselect(
-        "Variables with recommendation constraints",
-        options=feature_columns,
-        default=[],
-    )
     constraint_rows: list[dict[str, float | str]] = []
-    for variable in constrained_variables:
-        minimum = st.number_input(
-            f"Minimum for {variable}",
-            value=0.0,
-            format="%.6f",
-            key=f"constraint_min_{variable}",
-        )
-        maximum = st.number_input(
-            f"Maximum for {variable}",
-            value=1.0,
-            format="%.6f",
-            key=f"constraint_max_{variable}",
-        )
-        constraint_rows.append(
-            {
-                "variable": variable,
-                "minimum": float(minimum),
-                "maximum": float(maximum),
-            }
-        )
+    confirmed_controllable: list[str] = []
+    verified_variables: list[str] = []
 
-    st.subheader("Controllability and verification")
-    st.caption(
-        "Role override, controllability confirmation, and verification are "
-        "independent inputs and are not auto-aligned. Recommended features are "
-        "not auto-selected as controllable or verified."
-    )
-    confirmed_controllable = st.multiselect(
-        "Confirmed controllable variables",
-        options=feature_columns,
-        default=[],
-    )
-    verified_variables = st.multiselect(
-        "Verified variables",
-        options=feature_columns,
-        default=[],
-    )
+    if anomaly_only:
+        st.subheader("Analysis task")
+        st.info("Analysis task: not applicable for anomaly-only analysis.")
+        st.subheader("Recommendation objective")
+        st.info(_ANOMALY_ONLY_RECOMMENDATION_NOTE)
+        st.subheader("Model performance acceptance rules")
+        st.info(_ANOMALY_ONLY_PERFORMANCE_NOTE)
+    else:
+        st.subheader("Analysis task")
+        task_options = [
+            _TASK_AUTO,
+            AnalysisTask.REGRESSION.value,
+            AnalysisTask.CLASSIFICATION.value,
+        ]
+        task_selection = st.selectbox(
+            "Analysis task",
+            options=task_options,
+            index=0,
+            help=_TASK_HELP,
+        )
+        if task_selection == AnalysisTask.REGRESSION.value:
+            requested_task = AnalysisTask.REGRESSION
+        elif task_selection == AnalysisTask.CLASSIFICATION.value:
+            requested_task = AnalysisTask.CLASSIFICATION
+            st.info(
+                "Classification modeling is not yet supported by this workflow. "
+                "Selecting CLASSIFICATION will produce a structured refusal."
+            )
+        analysis_task_selection_valid = task_selection in task_options
+        if (
+            requested_task is AnalysisTask.REGRESSION
+            and selected_target is not None
+            and analysis_frame is not None
+            and selected_target in analysis_frame.columns
+        ):
+            regression_target_assessment = evaluate_target_suitability(
+                analysis_frame,
+                selected_target,
+                requested_task=AnalysisTask.REGRESSION,
+            )
+            if not regression_target_assessment.suitable:
+                target_has_usable_variation = False
+                if not regression_target_assessment.is_constant:
+                    st.error(regression_target_assessment.message)
+
+        st.subheader("Recommendation objective")
+        st.caption(
+            "Objective is not inferred. Select an objective explicitly before running."
+        )
+        objective_options = [
+            _OBJECTIVE_PLACEHOLDER,
+            *[item.value for item in RecommendationObjective],
+        ]
+        objective_selection = st.selectbox(
+            "Objective",
+            options=objective_options,
+            index=0,
+        )
+        if objective_selection != _OBJECTIVE_PLACEHOLDER:
+            selected_objective = RecommendationObjective(objective_selection)
+        else:
+            st.warning("Select a recommendation objective before running analysis.")
+
+        needs_quality = selected_objective in {
+            RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
+            RecommendationObjective.BALANCE_QUALITY_AND_ANOMALY,
+        }
+        if needs_quality:
+            quality_options = [
+                _QUALITY_DIRECTION_PLACEHOLDER,
+                *[item.value for item in QualityOptimizationDirection],
+            ]
+            quality_selection = st.selectbox(
+                "Quality direction",
+                options=quality_options,
+                index=0,
+            )
+            if quality_selection == _QUALITY_DIRECTION_PLACEHOLDER:
+                quality_direction_selected = False
+                st.warning("Select a quality optimization direction before running.")
+            else:
+                quality_direction = QualityOptimizationDirection(quality_selection)
+                if quality_direction is QualityOptimizationDirection.TARGET:
+                    quality_target = float(
+                        st.number_input("Quality target", value=0.0, format="%.6f")
+                    )
+
+        st.subheader("Model performance acceptance rules")
+        st.caption(
+            "Provide at least one complete metric rule. Direction is never inferred "
+            "from the metric name. Arbitrary defaults are not submitted."
+        )
+        st.markdown(
+            "- R² generally uses HIGHER_IS_BETTER.\n"
+            "- RMSE and MAE generally use LOWER_IS_BETTER.\n"
+            "- The user must confirm the metric direction and threshold."
+        )
+        rule_count = int(
+            st.number_input(
+                "Number of performance rules",
+                min_value=1,
+                max_value=20,
+                value=1,
+                step=1,
+            )
+        )
+        rule_issues: list[str] = []
+        direction_options = [
+            _DIRECTION_PLACEHOLDER,
+            *[item.value for item in MetricAcceptanceDirection],
+        ]
+        for index in range(rule_count):
+            st.markdown(f"Rule {index + 1}")
+            metric_name = st.text_input(
+                f"Metric name #{index + 1}",
+                value="",
+                key=f"metric_name_{index}",
+            )
+            direction_selection = st.selectbox(
+                f"Direction #{index + 1}",
+                options=direction_options,
+                index=0,
+                key=f"metric_direction_{index}",
+            )
+            threshold_text = st.text_input(
+                f"Threshold #{index + 1}",
+                value="",
+                key=f"metric_threshold_{index}",
+                help="Enter a finite numeric threshold. Leave blank until confirmed.",
+            )
+            required = st.checkbox(
+                f"Required #{index + 1}",
+                value=True,
+                key=f"metric_required_{index}",
+            )
+            missing = _performance_rule_missing_fields(
+                metric_name=metric_name,
+                direction_selection=direction_selection,
+                threshold_text=threshold_text,
+            )
+            if missing:
+                rule_issues.append(f"Rule {index + 1} missing: {', '.join(missing)}")
+                continue
+            threshold_value = float(str(threshold_text).strip())
+            performance_rule_rows.append(
+                {
+                    "metric_name": str(metric_name).strip(),
+                    "direction": direction_selection,
+                    "threshold": threshold_value,
+                    "required": bool(required),
+                }
+            )
+            complete_rule_count += 1
+
+        if complete_rule_count < 1:
+            st.warning(
+                "Configure at least one complete performance rule "
+                "(metric name, direction, and finite threshold)."
+            )
+        for issue in rule_issues:
+            st.warning(issue)
+
+        st.subheader("Process variable constraints")
+        st.caption(
+            "Constraints are not inferred from dataset min/max. Variables without "
+            "constraints may be excluded from recommendation candidates."
+        )
+        constrained_variables = st.multiselect(
+            "Variables with recommendation constraints",
+            options=feature_columns,
+            default=[],
+        )
+        for variable in constrained_variables:
+            minimum = st.number_input(
+                f"Minimum for {variable}",
+                value=0.0,
+                format="%.6f",
+                key=f"constraint_min_{variable}",
+            )
+            maximum = st.number_input(
+                f"Maximum for {variable}",
+                value=1.0,
+                format="%.6f",
+                key=f"constraint_max_{variable}",
+            )
+            constraint_rows.append(
+                {
+                    "variable": variable,
+                    "minimum": float(minimum),
+                    "maximum": float(maximum),
+                }
+            )
+
+        st.subheader("Controllability and verification")
+        st.caption(
+            "Role override, controllability confirmation, and verification are "
+            "independent inputs and are not auto-aligned. Recommended features are "
+            "not auto-selected as controllable or verified."
+        )
+        confirmed_controllable = st.multiselect(
+            "Confirmed controllable variables",
+            options=feature_columns,
+            default=[],
+        )
+        verified_variables = st.multiselect(
+            "Verified variables",
+            options=feature_columns,
+            default=[],
+        )
 
     st.subheader("Operating point and change limits")
     max_feature_count = max(1, len(feature_columns) or 1)
@@ -512,13 +1048,16 @@ def render_app(
             step=1,
         )
     )
+    default_operating = (
+        OperatingPointSelectionMode.TOP_UNSUPERVISED_ANOMALY
+        if anomaly_only
+        else OperatingPointSelectionMode.TOP_RESIDUAL_ANOMALY
+    )
     operating_mode = OperatingPointSelectionMode(
         st.selectbox(
             "Operating-point selection mode",
             options=[item.value for item in OperatingPointSelectionMode],
-            index=list(OperatingPointSelectionMode).index(
-                OperatingPointSelectionMode.TOP_RESIDUAL_ANOMALY
-            ),
+            index=list(OperatingPointSelectionMode).index(default_operating),
         )
     )
     explicit_operating_row_id: int | str | None = None
@@ -534,25 +1073,48 @@ def render_app(
         len(feature_columns) >= 1
         and 1 <= max_simultaneous_changes <= len(feature_columns)
     )
-    readiness = {
-        "CSV parsed": True,
-        "target selected": selected_target is not None,
-        "feature count >= 1": len(feature_columns) >= 1,
-        "objective selected": selected_objective is not None,
-        "required quality direction selected when applicable": (
-            quality_direction_selected
-        ),
-        "at least one complete performance rule": complete_rule_count >= 1,
-        "max simultaneous changes valid": max_changes_valid,
-        "explicit row ID supplied when required": explicit_row_id_ok,
-    }
+    if anomaly_only:
+        readiness = {
+            "CSV parsed": True,
+            "feature count >= 1": len(modeling_feature_columns) >= 1,
+            "analysis mode valid": analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY,
+            "identifier/timestamp conflicts absent": (
+                selected_timestamp not in identifier_columns
+                if selected_timestamp is not None
+                else True
+            ),
+            "feature-only split row count available": (
+                analysis_frame is not None and analysis_frame.height >= 5
+            ),
+            "operating cohort filter valid": cohort_filter_ready,
+            "operating-point selection valid": explicit_row_id_ok,
+            "max simultaneous changes valid": max_changes_valid,
+        }
+    else:
+        readiness = {
+            "CSV parsed": True,
+            "target selected": selected_target is not None,
+            "selected target has usable variation": target_has_usable_variation,
+            "feature count >= 1": len(feature_columns) >= 1,
+            "analysis task selection valid": analysis_task_selection_valid,
+            "objective selected": selected_objective is not None,
+            "required quality direction selected when applicable": (
+                quality_direction_selected
+            ),
+            "at least one complete performance rule": complete_rule_count >= 1,
+            "max simultaneous changes valid": max_changes_valid,
+            "explicit row ID supplied when required": explicit_row_id_ok,
+        }
     st.subheader("Run readiness")
     for label, ready in readiness.items():
         st.write(f"{'True' if ready else 'False'}: {label}")
-    st.caption(
-        "Empty constraints, controllability, or verification inputs can still allow "
-        "analysis to run, but recommendation may remain READY or REFUSED."
-    )
+    if anomaly_only:
+        st.caption(_ANOMALY_ONLY_RECOMMENDATION_NOTE)
+    else:
+        st.caption(
+            "Empty constraints, controllability, or verification inputs can still allow "
+            "analysis to run, but recommendation may remain READY or REFUSED."
+        )
 
     run_disabled = not all(readiness.values())
     submitted = st.button(
@@ -564,8 +1126,43 @@ def render_app(
     if submitted:
         if upload_bytes is None:
             st.error("CSV upload is required before running the workflow.")
+        elif anomaly_only:
+            _run_workflow_from_upload(
+                upload_bytes=upload_bytes,
+                analysis_mode=analysis_mode,
+                target_column=None,
+                feature_columns=list(feature_columns),
+                timestamp_selection=(
+                    _TIMESTAMP_NONE
+                    if selected_timestamp is None
+                    else selected_timestamp
+                ),
+                identifier_columns=list(identifier_columns),
+                excluded_columns=list(excluded_columns),
+                column_role_overrides=dict(column_role_overrides),
+                requested_task=None,
+                objective=None,
+                quality_direction=None,
+                quality_target=None,
+                performance_rule_rows=[],
+                constraint_rows=[],
+                confirmed_controllable=[],
+                verified_variables=[],
+                max_simultaneous_changes=max_simultaneous_changes,
+                operating_mode=operating_mode,
+                explicit_operating_row_id=explicit_operating_row_id,
+                cohort_filter=cohort_filter,
+                workflow_factory=workflow_factory,
+                request_builder=active_request_builder,
+                report_builder=active_report_builder,
+            )
         elif selected_target is None:
             st.error("Select a target column before running the workflow.")
+        elif not target_has_usable_variation:
+            st.error(
+                f"{selected_target} cannot be used as a regression target because "
+                "it lacks usable target variation."
+            )
         elif selected_objective is None:
             st.error("Select a recommendation objective before running the workflow.")
         elif complete_rule_count < 1:
@@ -573,6 +1170,7 @@ def render_app(
         else:
             _run_workflow_from_upload(
                 upload_bytes=upload_bytes,
+                analysis_mode=analysis_mode,
                 target_column=selected_target,
                 feature_columns=list(feature_columns),
                 timestamp_selection=(
@@ -582,7 +1180,8 @@ def render_app(
                 ),
                 identifier_columns=list(identifier_columns),
                 excluded_columns=list(excluded_columns),
-                column_role_overrides=column_role_overrides,
+                column_role_overrides=dict(column_role_overrides),
+                requested_task=requested_task,
                 objective=selected_objective,
                 quality_direction=quality_direction,
                 quality_target=quality_target,
@@ -593,13 +1192,14 @@ def render_app(
                 max_simultaneous_changes=max_simultaneous_changes,
                 operating_mode=operating_mode,
                 explicit_operating_row_id=explicit_operating_row_id,
+                cohort_filter=None,
                 workflow_factory=workflow_factory,
                 request_builder=active_request_builder,
                 report_builder=active_report_builder,
             )
 
     _render_cached_report_if_any()
-
+    return
 
 def render_presentation_report(report: WorkflowPresentationReport) -> None:
     """Render a ``WorkflowPresentationReport`` in section order.
@@ -647,35 +1247,233 @@ def render_presentation_report(report: WorkflowPresentationReport) -> None:
         else str(data.selected_operating_row_id)
     )
     metric_cols2[3].metric("Operating row ID", operating_id)
+    st.metric("Cohort rows", data.cohort_row_count)
+
+    cohort = report.cohort_filter_summary
+    st.subheader("Operating cohort filter")
+    if cohort.configured:
+        st.write(
+            {
+                "Cohort filter": cohort.column_name,
+                "Range": cohort.range_display,
+                "Rows retained": (
+                    f"{cohort.retained_row_count:,} / {cohort.source_row_count:,}"
+                ),
+                "Filter column used as model feature": (
+                    cohort.filter_column_used_as_feature_display
+                ),
+            }
+        )
+        st.info(_COHORT_FILTER_INTERPRETATION_NOTE)
+    else:
+        st.write(
+            {
+                "Cohort filter": "Not configured",
+                "Rows retained": f"{cohort.retained_row_count:,}",
+            }
+        )
 
     routing = report.routing_summary
     model = report.model_summary
+    analysis_mode_value = report.metadata.get("analysis_mode")
+    anomaly_only_report = analysis_mode_value == AnalysisExecutionMode.ANOMALY_ONLY.value
     st.header("Routing summary")
-    st.write(
-        {
-            "industry": _display_optional(routing.selected_industry),
-            "task": _display_optional(
-                None if routing.selected_task is None else routing.selected_task.value
-            ),
-            "target_column": _display_optional(routing.target_column),
-            "feature_count": _display_optional(routing.feature_count),
-        }
-    )
+    if anomaly_only_report:
+        st.write(
+            {
+                "analysis_mode": AnalysisExecutionMode.ANOMALY_ONLY.value,
+                "industry": _display_optional(routing.selected_industry),
+                "target": "Not required",
+                "analysis_task": _NOT_APPLICABLE,
+                "feature_count": _display_optional(routing.feature_count),
+            }
+        )
+    else:
+        st.write(
+            {
+                "analysis_mode": _display_optional(analysis_mode_value),
+                "industry": _display_optional(routing.selected_industry),
+                "inferred_task": _display_optional(
+                    None
+                    if routing.inferred_task is None
+                    else routing.inferred_task.value
+                ),
+                "selected_task": _display_optional(
+                    None
+                    if routing.selected_task is None
+                    else routing.selected_task.value
+                ),
+                "selection_source": _display_optional(routing.task_selection_source),
+                "override_applied": routing.task_override_applied,
+                "target_column": _display_optional(routing.target_column),
+                "feature_count": _display_optional(routing.feature_count),
+                "target_suitable": _display_optional(routing.target_suitable),
+                "target_unique_non_null_count": _display_optional(
+                    routing.target_unique_non_null_count
+                ),
+                "target_refusal_code": _display_optional(routing.target_refusal_code),
+                "target_suitability_message": _display_optional(
+                    routing.target_suitability_message
+                ),
+            }
+        )
 
     st.header("Model summary")
-    st.write(
-        {
-            "supervised_model_key": _display_optional(model.supervised_model_key),
-            "anomaly_model_key": _display_optional(model.anomaly_model_key),
-            "independent_test_evaluation": model.independent_test_evaluation_performed,
-            "residual_calibration": model.residual_calibration_performed,
-            "anomaly_score_direction": _display_optional(model.anomaly_score_direction),
+    if anomaly_only_report:
+        st.write(
+            {
+                "supervised_model": _NOT_APPLICABLE,
+                "anomaly_model": _display_optional(model.anomaly_model_key),
+                "residual_calibration": _NOT_APPLICABLE,
+                "independent_test_evaluation": (
+                    model.independent_test_evaluation_performed
+                ),
+                "anomaly_score_direction": _display_optional(
+                    model.anomaly_score_direction
+                ),
+                "recommendation": "Not enabled for anomaly-only mode",
+            }
+        )
+    else:
+        st.write(
+            {
+                "supervised_model_key": _display_optional(model.supervised_model_key),
+                "anomaly_model_key": _display_optional(model.anomaly_model_key),
+                "independent_test_evaluation": (
+                    model.independent_test_evaluation_performed
+                ),
+                "residual_calibration": model.residual_calibration_performed,
+                "anomaly_score_direction": _display_optional(
+                    model.anomaly_score_direction
+                ),
+            }
+        )
+
+    st.header("Detected anomaly events")
+    st.caption(_ANOMALY_EVENTS_CAPTION)
+    if not report.anomaly_events:
+        st.write("No anomaly events were selected.")
+    else:
+        selection_sources = sorted(
+            {event.selection_source for event in report.anomaly_events}
+        )
+        st.caption(f"Selection source: {', '.join(selection_sources)}")
+        st.dataframe(
+            _anomaly_event_table_rows(report.anomaly_events),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            label="Download anomaly events CSV",
+            data=_csv_bytes_from_rows(
+                _anomaly_event_download_rows(report.anomaly_events)
+            ),
+            file_name="anomaly_events.csv",
+            mime="text/csv",
+            key="download_anomaly_events_csv",
+        )
+
+    st.header("Anomaly context explorer")
+    st.caption(_ANOMALY_CONTEXT_CAPTION)
+    st.caption(_ANOMALY_CONTEXT_ORDER_CAPTION)
+    if report.cohort_filter_summary.configured:
+        st.caption(_ANOMALY_CONTEXT_FILTERED_CAPTION)
+    context_windows = report.anomaly_context_windows
+    if not context_windows:
+        st.write("No anomaly context windows are available.")
+    else:
+        operating_ids = {
+            event.original_row_id
+            for event in report.anomaly_events
+            if event.is_operating_row
         }
-    )
+        option_labels = [
+            _context_event_option_label(
+                window,
+                is_operating=window.center_original_row_id in operating_ids,
+            )
+            for window in context_windows
+        ]
+        default_index = _default_context_window_index(
+            context_windows,
+            report.anomaly_events,
+        )
+        selected_label = st.selectbox(
+            "Select anomaly event",
+            options=option_labels,
+            index=default_index,
+            key="anomaly_context_event_selector",
+        )
+        selected_window = context_windows[option_labels.index(selected_label)]
+        st.markdown(
+            f"- Center original row ID: `{selected_window.center_original_row_id}`\n"
+            f"- Anomaly score: `{selected_window.center_anomaly_score}`\n"
+            f"- Analysis order basis: `{selected_window.order_basis.value}`\n"
+            f"- Window radius: `{selected_window.radius}`\n"
+            f"- Included features: `{', '.join(selected_window.feature_names)}`"
+        )
+        st.caption(f"Fixed context radius contract: {ANOMALY_CONTEXT_RADIUS}")
+        st.dataframe(
+            _context_table_rows(selected_window),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if selected_window.feature_names:
+            feature_name = st.selectbox(
+                "Context feature",
+                options=list(selected_window.feature_names),
+                index=0,
+                key=(
+                    "anomaly_context_feature_selector_"
+                    f"{selected_window.event_rank}"
+                ),
+            )
+            if _feature_values_are_numeric(selected_window, feature_name):
+                chart_rows = _context_chart_rows(selected_window, feature_name)
+                if chart_rows:
+                    chart_frame = pd.DataFrame(chart_rows).set_index("relative_offset")
+                    st.line_chart(chart_frame, use_container_width=True)
+                    st.caption(
+                        "Center event is at relative offset 0 on the analysis-order "
+                        "axis."
+                    )
+            else:
+                st.caption(
+                    "Selected context feature is non-numeric; chart is omitted."
+                )
+        st.download_button(
+            label="Download selected context CSV",
+            data=_csv_bytes_from_rows(_context_download_rows(selected_window)),
+            file_name=f"anomaly_context_rank_{selected_window.event_rank}.csv",
+            mime="text/csv",
+            key=f"download_anomaly_context_rank_{selected_window.event_rank}",
+        )
+
+    st.header("Likely associated factors")
+    st.caption(_DIAGNOSIS_FACTORS_CAPTION)
+    if not report.diagnosis_factors:
+        st.write("No diagnosis factors were produced.")
+    else:
+        st.dataframe(
+            _diagnosis_factor_table_rows(report.diagnosis_factors),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            label="Download diagnosis factors CSV",
+            data=_csv_bytes_from_rows(
+                _diagnosis_factor_download_rows(report.diagnosis_factors)
+            ),
+            file_name="diagnosis_factors.csv",
+            mime="text/csv",
+            key="download_diagnosis_factors_csv",
+        )
 
     st.header("Model performance")
     performance = report.model_performance
-    if performance is None:
+    if anomaly_only_report and performance is None:
+        st.write(_ANOMALY_ONLY_PERFORMANCE_NOTE)
+    elif performance is None:
         st.write(_NOT_AVAILABLE)
     else:
         if performance.status is ModelPerformanceAcceptanceStatus.ACCEPTABLE:
@@ -734,7 +1532,9 @@ def render_presentation_report(report: WorkflowPresentationReport) -> None:
 
     st.header("Recommendation")
     recommendation = report.recommendation
-    if recommendation is None:
+    if anomaly_only_report and recommendation is None:
+        st.write(_ANOMALY_ONLY_RECOMMENDATION_NOTE)
+    elif recommendation is None:
         st.write(_NOT_AVAILABLE)
     elif recommendation.status is RecommendationStatus.GENERATED:
         st.success(f"Status: {recommendation.status.value}")
@@ -816,13 +1616,15 @@ def render_presentation_report(report: WorkflowPresentationReport) -> None:
 def _run_workflow_from_upload(
     *,
     upload_bytes: bytes,
-    target_column: str,
+    analysis_mode: AnalysisExecutionMode,
+    target_column: str | None,
     feature_columns: list[str],
     timestamp_selection: str,
     identifier_columns: list[str],
     excluded_columns: list[str],
     column_role_overrides: dict[str, ColumnRole],
-    objective: RecommendationObjective,
+    requested_task: AnalysisTask | None,
+    objective: RecommendationObjective | None,
     quality_direction: QualityOptimizationDirection | None,
     quality_target: float | None,
     performance_rule_rows: Sequence[Mapping[str, Any]],
@@ -832,6 +1634,7 @@ def _run_workflow_from_upload(
     max_simultaneous_changes: int,
     operating_mode: OperatingPointSelectionMode,
     explicit_operating_row_id: int | str | None,
+    cohort_filter: NumericCohortFilter | None,
     workflow_factory: WorkflowFactory,
     request_builder: WorkflowUiRequestBuilder,
     report_builder: AnalysisWorkflowReportBuilder,
@@ -874,12 +1677,14 @@ def _run_workflow_from_upload(
             for row in constraint_rows
         ]
         submission = WorkflowUiSubmission(
+            analysis_mode=analysis_mode,
             target_column=target_column,
             feature_columns=feature_columns,
             timestamp_column=timestamp_column,
             identifier_columns=identifier_columns,
             excluded_columns=excluded_columns,
             column_role_overrides=column_role_overrides,
+            requested_task=requested_task,
             objective=objective,
             quality_direction=quality_direction,
             quality_target=quality_target,
@@ -890,6 +1695,9 @@ def _run_workflow_from_upload(
             max_simultaneous_changes=max_simultaneous_changes,
             operating_point_selection=operating_mode,
             explicit_operating_row_id=row_id,
+            cohort_filter=(
+                None if cohort_filter is None else cohort_filter.model_copy(deep=True)
+            ),
             metadata={"ui_entry": "streamlit_form"},
         )
     except (ValidationError, ValueError, TypeError) as exc:

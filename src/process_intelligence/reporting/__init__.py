@@ -6,10 +6,17 @@ Does not expose Streamlit, REST, CLI, persistence, or rendering helpers.
 
 from process_intelligence.reporting.builder import AnalysisWorkflowReportBuilder
 from process_intelligence.reporting.schemas import (
+    AnomalyContextIdentifierValueView,
+    AnomalyContextRowView,
+    AnomalyContextValueView,
+    AnomalyContextWindowView,
+    AnomalyEventView,
+    DiagnosisFactorView,
     ModelPerformanceView,
     PerformanceMetricView,
     RecommendationChangeView,
     RecommendationView,
+    WorkflowCohortFilterSummaryView,
     WorkflowDataSummaryView,
     WorkflowModelSummaryView,
     WorkflowOverviewView,
@@ -21,10 +28,17 @@ from process_intelligence.reporting.schemas import (
 
 __all__ = [
     "AnalysisWorkflowReportBuilder",
+    "AnomalyContextIdentifierValueView",
+    "AnomalyContextRowView",
+    "AnomalyContextValueView",
+    "AnomalyContextWindowView",
+    "AnomalyEventView",
+    "DiagnosisFactorView",
     "ModelPerformanceView",
     "PerformanceMetricView",
     "RecommendationChangeView",
     "RecommendationView",
+    "WorkflowCohortFilterSummaryView",
     "WorkflowDataSummaryView",
     "WorkflowModelSummaryView",
     "WorkflowOverviewView",

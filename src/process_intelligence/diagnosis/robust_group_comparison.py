@@ -24,7 +24,11 @@ from process_intelligence.core.schemas import (
     ExplanationResult,
     RootCauseFactor,
 )
-from process_intelligence.diagnosis.enums import DiagnosisMethod, DiagnosisScope
+from process_intelligence.diagnosis.enums import (
+    DiagnosisMethod,
+    DiagnosisScope,
+    RobustScaleStatus,
+)
 from process_intelligence.diagnosis.protocols import BaseRootCauseDiagnoser
 from process_intelligence.diagnosis.schemas import (
     DiagnosisBatchResult,
@@ -62,9 +66,9 @@ _CAVEAT_ASSOCIATION = (
 _CAVEAT_REFERENCE = (
     "Robust scores depend on the selected normal reference group."
 )
-_CAVEAT_NEAR_ZERO = (
-    "At least one feature had near-zero reference dispersion; "
-    "minimum_scale was applied."
+_CAVEAT_ZERO_VARIANCE = (
+    "At least one feature has zero robust variance in the reference group; "
+    "standardized robust z-scores are unavailable for those features."
 )
 _CAVEAT_EXPLANATION = (
     "Model explanation was supplied but not combined in this method."
@@ -76,7 +80,10 @@ _CAVEAT_ENSEMBLE_HEURISTIC = (
     "Ensemble association scores are a deterministic ranking heuristic, "
     "not a causal estimate or probability."
 )
-_WARNING_NEAR_ZERO_DISPERSION = "reference dispersion was near zero"
+_WARNING_ZERO_VARIANCE = (
+    "Robust standardized score is unavailable because the reference group "
+    "has zero robust variance."
+)
 
 _BATCH_WARNING_ASSOCIATION = (
     "Association does not establish causation across diagnosed events."
@@ -149,6 +156,16 @@ def _require_unit_interval(value: object, *, field_name: str) -> float:
     if number < 0.0 or number > 1.0:
         raise ValueError(f"{field_name} must be in [0.0, 1.0], got {number}")
     return number
+
+
+def _require_optional_non_negative_finite_float(
+    value: object,
+    *,
+    field_name: str,
+) -> float | None:
+    if value is None:
+        return None
+    return _require_non_negative_finite_float(value, field_name=field_name)
 
 
 def _require_strict_int_ge1(value: object, *, field_name: str) -> int:
@@ -226,6 +243,12 @@ class RobustFeatureStatistic(BaseModel):
     Stores scalar summaries used to rank likely drivers. Does not embed
     estimators, DataFrames, or full arrays. Not required on public diagnosis
     payloads; useful for tests and optional scalar metadata.
+
+    Ranking uses ``raw_association_score``, which equals the bounded
+    ``confidence`` for both ``AVAILABLE`` and ``ZERO_VARIANCE`` so factors
+    share one comparable unit-interval scale. When ``robust_scale_status`` is
+    ``ZERO_VARIANCE``, ``robust_z_score`` is ``None`` (not an epsilon-divided
+    pseudo-z); robust z-scores remain supporting statistics only.
     """
 
     feature_name: str
@@ -235,8 +258,10 @@ class RobustFeatureStatistic(BaseModel):
     anomaly_median: float
     signed_location_difference: float
     median_absolute_deviation: float
-    effective_scale: float
-    robust_z_score: float
+    robust_scale: float
+    robust_scale_status: RobustScaleStatus
+    effective_scale: float | None
+    robust_z_score: float | None
     deviation_prevalence: float
     raw_association_score: float
     normalized_association_score: float
@@ -267,23 +292,51 @@ class RobustFeatureStatistic(BaseModel):
     def _validate_finite_stats(cls, value: object) -> float:
         return _require_finite_float(value, field_name="statistic")
 
-    @field_validator("median_absolute_deviation", mode="before")
+    @field_validator(
+        "median_absolute_deviation",
+        "robust_scale",
+        mode="before",
+    )
     @classmethod
-    def _validate_mad(cls, value: object) -> float:
-        return _require_non_negative_finite_float(
-            value,
-            field_name="median_absolute_deviation",
+    def _validate_non_negative_scales(cls, value: object) -> float:
+        return _require_non_negative_finite_float(value, field_name="scale field")
+
+    @field_validator("robust_scale_status", mode="before")
+    @classmethod
+    def _validate_robust_scale_status(cls, value: object) -> RobustScaleStatus:
+        if isinstance(value, RobustScaleStatus):
+            return value
+        if isinstance(value, str):
+            try:
+                return RobustScaleStatus(value)
+            except ValueError as exc:
+                raise ValueError(f"invalid RobustScaleStatus: {value!r}") from exc
+        raise ValueError(
+            f"robust_scale_status must be RobustScaleStatus, got {type(value).__name__}"
         )
 
     @field_validator("effective_scale", mode="before")
     @classmethod
-    def _validate_effective_scale(cls, value: object) -> float:
+    def _validate_effective_scale(cls, value: object) -> float | None:
+        if value is None:
+            return None
         return _require_positive_finite_float(value, field_name="effective_scale")
 
-    @field_validator("robust_z_score", "raw_association_score", mode="before")
+    @field_validator("robust_z_score", mode="before")
     @classmethod
-    def _validate_non_negative_scores(cls, value: object) -> float:
-        return _require_non_negative_finite_float(value, field_name="score")
+    def _validate_robust_z_score(cls, value: object) -> float | None:
+        return _require_optional_non_negative_finite_float(
+            value,
+            field_name="robust_z_score",
+        )
+
+    @field_validator("raw_association_score", mode="before")
+    @classmethod
+    def _validate_raw_association_score(cls, value: object) -> float:
+        return _require_non_negative_finite_float(
+            value,
+            field_name="raw_association_score",
+        )
 
     @field_validator(
         "deviation_prevalence",
@@ -838,7 +891,7 @@ class RobustGroupComparisonDiagnoser(BaseRootCauseDiagnoser):
         ]
 
         near_zero = any(
-            _WARNING_NEAR_ZERO_DISPERSION in statistic.warnings
+            statistic.robust_scale_status is RobustScaleStatus.ZERO_VARIANCE
             for statistic in statistics
         )
         factors = self._statistics_to_factors(
@@ -848,7 +901,7 @@ class RobustGroupComparisonDiagnoser(BaseRootCauseDiagnoser):
         )
         method_used = self._method_used(request.method)
         caveats = self._build_caveats(
-            near_zero_dispersion=near_zero,
+            zero_variance_scale=near_zero,
             explanation_unused=explanation_unused,
             has_factors=bool(factors),
             method=request.method,
@@ -900,31 +953,29 @@ class RobustGroupComparisonDiagnoser(BaseRootCauseDiagnoser):
         median_absolute_deviation = float(
             np.median(np.abs(reference_values - reference_median))
         )
-        robust_scale = _ROBUST_SCALE_CONSTANT * median_absolute_deviation
+        robust_scale = float(_ROBUST_SCALE_CONSTANT * median_absolute_deviation)
         warnings: list[str] = []
-        if robust_scale <= self._config.minimum_scale:
-            effective_scale = float(self._config.minimum_scale)
-            warnings.append(_WARNING_NEAR_ZERO_DISPERSION)
-        else:
-            effective_scale = float(robust_scale)
 
-        row_robust_z = np.abs(anomaly_values - reference_median) / effective_scale
-        robust_z_score = abs(signed_location_difference) / effective_scale
-        if not math.isfinite(robust_z_score):
-            raise DataValidationError(
-                f"feature {feature_name!r} produced a non-finite robust z-score"
+        if robust_scale <= self._config.minimum_scale:
+            robust_scale_status = RobustScaleStatus.ZERO_VARIANCE
+            effective_scale: float | None = None
+            robust_z_score: float | None = None
+            warnings.append(_WARNING_ZERO_VARIANCE)
+            abs_location_gaps = np.abs(anomaly_values - reference_median)
+            deviation_prevalence = float(
+                np.mean(abs_location_gaps > self._config.direction_tolerance)
             )
-        deviation_prevalence = float(
-            np.mean(row_robust_z >= self._config.z_score_threshold)
-        )
-        raw_association_score = self._raw_association_score(
-            robust_z_score=robust_z_score,
-            deviation_prevalence=deviation_prevalence,
-            method=request.method,
-        )
-        if not math.isfinite(raw_association_score):
-            raise DataValidationError(
-                f"feature {feature_name!r} produced a non-finite association score"
+        else:
+            robust_scale_status = RobustScaleStatus.AVAILABLE
+            effective_scale = float(robust_scale)
+            robust_z_score = abs(signed_location_difference) / effective_scale
+            if not math.isfinite(robust_z_score):
+                raise DataValidationError(
+                    f"feature {feature_name!r} produced a non-finite robust z-score"
+                )
+            row_robust_z = np.abs(anomaly_values - reference_median) / effective_scale
+            deviation_prevalence = float(
+                np.mean(row_robust_z >= self._config.z_score_threshold)
             )
 
         direction = self._resolve_direction(
@@ -939,11 +990,24 @@ class RobustGroupComparisonDiagnoser(BaseRootCauseDiagnoser):
         confidence = self._compute_confidence(
             robust_z_score=robust_z_score,
             deviation_prevalence=deviation_prevalence,
+            signed_location_difference=signed_location_difference,
             reference_row_count=len(reference_indices),
             anomaly_row_count=len(anomaly_indices),
             request=request,
             allow_single_anomaly_row=single_event_like,
+            robust_scale_status=robust_scale_status,
         )
+        raw_association_score = self._raw_association_score(
+            robust_z_score=robust_z_score,
+            deviation_prevalence=deviation_prevalence,
+            confidence=confidence,
+            method=request.method,
+            robust_scale_status=robust_scale_status,
+        )
+        if not math.isfinite(raw_association_score):
+            raise DataValidationError(
+                f"feature {feature_name!r} produced a non-finite association score"
+            )
 
         return RobustFeatureStatistic(
             feature_name=feature_name,
@@ -953,8 +1017,12 @@ class RobustGroupComparisonDiagnoser(BaseRootCauseDiagnoser):
             anomaly_median=anomaly_median,
             signed_location_difference=signed_location_difference,
             median_absolute_deviation=median_absolute_deviation,
+            robust_scale=robust_scale,
+            robust_scale_status=robust_scale_status,
             effective_scale=effective_scale,
-            robust_z_score=float(robust_z_score),
+            robust_z_score=(
+                None if robust_z_score is None else float(robust_z_score)
+            ),
             deviation_prevalence=float(deviation_prevalence),
             raw_association_score=float(raw_association_score),
             normalized_association_score=0.0,
@@ -966,13 +1034,19 @@ class RobustGroupComparisonDiagnoser(BaseRootCauseDiagnoser):
     def _raw_association_score(
         self,
         *,
-        robust_z_score: float,
+        robust_z_score: float | None,
         deviation_prevalence: float,
+        confidence: float,
         method: DiagnosisMethod,
+        robust_scale_status: RobustScaleStatus,
     ) -> float:
-        if method is DiagnosisMethod.ENSEMBLE:
-            return robust_z_score * (0.5 + 0.5 * deviation_prevalence)
-        return float(robust_z_score)
+        """Return the unified bounded ranking score for one feature.
+
+        ``robust_z_score`` / method-specific blends are intentionally unused so
+        AVAILABLE and ZERO_VARIANCE share the existing confidence scale.
+        """
+        _ = (robust_z_score, deviation_prevalence, method, robust_scale_status)
+        return float(confidence)
 
     def _resolve_direction(
         self,
@@ -999,14 +1073,26 @@ class RobustGroupComparisonDiagnoser(BaseRootCauseDiagnoser):
     def _compute_confidence(
         self,
         *,
-        robust_z_score: float,
+        robust_z_score: float | None,
         deviation_prevalence: float,
+        signed_location_difference: float,
         reference_row_count: int,
         anomaly_row_count: int,
         request: DiagnosisRequest,
         allow_single_anomaly_row: bool,
+        robust_scale_status: RobustScaleStatus,
     ) -> float:
-        effect_strength = robust_z_score / (robust_z_score + 1.0)
+        if (
+            robust_scale_status is RobustScaleStatus.AVAILABLE
+            and robust_z_score is not None
+        ):
+            effect_strength = float(robust_z_score) / (float(robust_z_score) + 1.0)
+        elif abs(signed_location_difference) > self._config.direction_tolerance:
+            # Zero-variance with a location shift: use the existing bounded
+            # prevalence of rows that differ from the reference median.
+            effect_strength = float(deviation_prevalence)
+        else:
+            effect_strength = 0.0
         reference_support = min(
             1.0,
             reference_row_count / request.minimum_reference_rows,
@@ -1067,11 +1153,13 @@ class RobustGroupComparisonDiagnoser(BaseRootCauseDiagnoser):
                 )
             )
 
+        # Ranking score (= confidence) descending; prevalence then feature
+        # order for deterministic ties. Do not tie-break on raw unit gaps or
+        # robust-z availability (would favor AVAILABLE over ZERO_VARIANCE).
         normalized_stats.sort(
             key=lambda item: (
                 -item.raw_association_score,
                 -item.deviation_prevalence,
-                -item.confidence,
                 order_index.get(item.feature_name, len(order_index)),
             )
         )
@@ -1083,14 +1171,24 @@ class RobustGroupComparisonDiagnoser(BaseRootCauseDiagnoser):
         statistic: RobustFeatureStatistic,
     ) -> RootCauseFactor:
         summary = self._direction_summary(statistic.direction)
+        if statistic.robust_z_score is None:
+            robust_z_text = "robust_z_score=None"
+        else:
+            robust_z_text = f"robust_z_score={statistic.robust_z_score:.6g}"
+        if statistic.effective_scale is None:
+            effective_scale_text = "effective_scale=None"
+        else:
+            effective_scale_text = f"effective_scale={statistic.effective_scale:.6g}"
         evidence = (
             f"{summary} "
             f"reference_median={statistic.reference_median:.6g}; "
             f"anomaly_median={statistic.anomaly_median:.6g}; "
             f"signed_location_difference={statistic.signed_location_difference:.6g}; "
             f"MAD={statistic.median_absolute_deviation:.6g}; "
-            f"effective_scale={statistic.effective_scale:.6g}; "
-            f"robust_z_score={statistic.robust_z_score:.6g}; "
+            f"robust_scale={statistic.robust_scale:.6g}; "
+            f"robust_scale_status={statistic.robust_scale_status.value}; "
+            f"{effective_scale_text}; "
+            f"{robust_z_text}; "
             f"deviation_prevalence={statistic.deviation_prevalence:.6g}; "
             f"raw_association_score={statistic.raw_association_score:.6g}; "
             f"normalized_association_score={statistic.normalized_association_score:.6g}; "
@@ -1099,6 +1197,8 @@ class RobustGroupComparisonDiagnoser(BaseRootCauseDiagnoser):
             "The association should be reviewed with process context before "
             "action is taken."
         )
+        if statistic.warnings:
+            evidence = f"{evidence} {' '.join(statistic.warnings)}"
         return RootCauseFactor(
             variable=statistic.feature_name,
             direction=statistic.direction,
@@ -1148,7 +1248,7 @@ class RobustGroupComparisonDiagnoser(BaseRootCauseDiagnoser):
     def _build_caveats(
         self,
         *,
-        near_zero_dispersion: bool,
+        zero_variance_scale: bool,
         explanation_unused: bool,
         has_factors: bool,
         method: DiagnosisMethod,
@@ -1156,8 +1256,8 @@ class RobustGroupComparisonDiagnoser(BaseRootCauseDiagnoser):
         caveats = [_CAVEAT_ASSOCIATION, _CAVEAT_REFERENCE]
         if method is DiagnosisMethod.ENSEMBLE:
             caveats.append(_CAVEAT_ENSEMBLE_HEURISTIC)
-        if near_zero_dispersion:
-            caveats.append(_CAVEAT_NEAR_ZERO)
+        if zero_variance_scale:
+            caveats.append(_CAVEAT_ZERO_VARIANCE)
         if explanation_unused:
             caveats.append(_CAVEAT_EXPLANATION)
         if not has_factors:

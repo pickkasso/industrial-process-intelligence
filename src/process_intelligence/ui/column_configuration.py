@@ -7,12 +7,18 @@ values, infer final roles, controllability, or recommendation constraints.
 Category precedence (single category per column):
 
 1. all-null / unsupported dtype
-2. identifier name heuristic
-3. timestamp name heuristic
-4. high-confidence target name heuristic
-5. constant column
-6. numeric feature candidate
-7. review required / excluded
+2. identifier name heuristic with usable distinct non-null values (>= 2)
+3. identifier-like name that is constant / all-null / unusable → review
+4. timestamp name heuristic
+5. high-confidence target name heuristic
+6. constant column
+7. numeric feature candidate
+8. review required / excluded
+
+Identifier-like names are separated from identifier suitability: a constant or
+all-null SerialNumber may look like an identifier but is not an automatic
+identifier candidate. Target suitability is tracked separately from category
+via ``suitable_as_target``.
 """
 
 from __future__ import annotations
@@ -225,6 +231,7 @@ class UiColumnSuggestion(BaseModel):
     unique_count: int
     unique_ratio: float
     constant: bool
+    suitable_as_target: bool
     monotonic_non_decreasing: bool | None
 
     @field_validator("column", "dtype", mode="before")
@@ -263,7 +270,7 @@ class UiColumnSuggestion(BaseModel):
     def _validate_counts(cls, value: object) -> int:
         return _require_strict_int_ge(value, field_name="count", minimum=0)
 
-    @field_validator("numeric", "constant", mode="before")
+    @field_validator("numeric", "constant", "suitable_as_target", mode="before")
     @classmethod
     def _validate_bools(cls, value: object) -> bool:
         return _require_strict_bool(value, field_name="bool field")
@@ -633,6 +640,16 @@ class AutomaticColumnConfigurator:
             warnings.append(
                 "No numeric feature candidates were recommended; review columns manually."
             )
+        for item in suggestions:
+            if not item.constant:
+                continue
+            normalized = normalize_column_name_for_heuristic(item.column)
+            if normalized not in _IDENTIFIER_NAME_TOKENS:
+                continue
+            warnings.append(
+                f"{item.column} resembles an identifier but is constant and was "
+                "not selected as an identifier."
+            )
 
         return UiColumnConfigurationReport(
             column_count=len(suggestions),
@@ -692,8 +709,16 @@ class AutomaticColumnConfigurator:
         unique_count = int(series.n_unique())
         unique_ratio = float(unique_count) / float(row_count)
         non_null = series.drop_nulls()
-        constant = non_null.len() > 0 and int(non_null.n_unique()) == 1
+        unique_non_null_count = int(non_null.n_unique()) if non_null.len() > 0 else 0
+        constant = non_null.len() > 0 and unique_non_null_count == 1
         all_null = null_count == row_count
+        suitable_as_identifier = (
+            not all_null and not constant and unique_non_null_count >= 2
+        )
+        suitable_as_target = (
+            is_numeric and not all_null and not constant and non_null.len() > 0
+            and unique_non_null_count >= 2
+        )
 
         monotonic: bool | None
         if is_numeric and non_null.len() > 0:
@@ -725,24 +750,37 @@ class AutomaticColumnConfigurator:
             reasons.append("numeric values are monotonic non-decreasing")
         elif is_numeric and monotonic is False:
             reasons.append("numeric values are not monotonic non-decreasing")
+        if target_priority is not None and not suitable_as_target:
+            reasons.append("not suitable as supervised regression target")
+        if identifier_name and not suitable_as_identifier:
+            if all_null:
+                reasons.append(
+                    "identifier-like name but all-null; not selected as identifier"
+                )
+            elif constant:
+                reasons.append(
+                    "identifier-like name but constant; not selected as identifier"
+                )
+            else:
+                reasons.append(
+                    "identifier-like name but fewer than two distinct non-null "
+                    "values; not selected as identifier"
+                )
 
         category: UiColumnSuggestionCategory
         priority = 0
         confidence = 0.4
 
         if unsupported or all_null:
-            category = UiColumnSuggestionCategory.EXCLUDED_CANDIDATE
-            priority = 0
-            confidence = 0.95
             if identifier_name:
-                category = UiColumnSuggestionCategory.IDENTIFIER_CANDIDATE
-                priority = 50
-                confidence = self._identifier_confidence(unique_ratio)
-            elif timestamp_name:
-                category = UiColumnSuggestionCategory.TIMESTAMP_CANDIDATE
-                priority = 50
-                confidence = 0.75
-        elif identifier_name:
+                category = UiColumnSuggestionCategory.REVIEW_REQUIRED
+                priority = 20
+                confidence = 0.7
+            else:
+                category = UiColumnSuggestionCategory.EXCLUDED_CANDIDATE
+                priority = 0
+                confidence = 0.95
+        elif identifier_name and suitable_as_identifier:
             category = UiColumnSuggestionCategory.IDENTIFIER_CANDIDATE
             priority = 50
             confidence = self._identifier_confidence(unique_ratio)
@@ -750,6 +788,10 @@ class AutomaticColumnConfigurator:
                 reasons.append(
                     "unique ratio meets identifier uniqueness heuristic"
                 )
+        elif identifier_name:
+            category = UiColumnSuggestionCategory.REVIEW_REQUIRED
+            priority = 20
+            confidence = 0.7
         elif timestamp_name:
             category = UiColumnSuggestionCategory.TIMESTAMP_CANDIDATE
             priority = 50
@@ -815,6 +857,7 @@ class AutomaticColumnConfigurator:
             unique_count=unique_count,
             unique_ratio=unique_ratio,
             constant=constant,
+            suitable_as_target=suitable_as_target,
             monotonic_non_decreasing=monotonic,
         )
 

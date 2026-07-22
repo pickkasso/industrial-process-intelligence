@@ -5,7 +5,11 @@ from process_intelligence.diagnosis.ensemble import (
     DiagnosisEnsembleDiagnoser,
     EnsembleFactorStatistic,
 )
-from process_intelligence.diagnosis.enums import DiagnosisMethod, DiagnosisScope
+from process_intelligence.diagnosis.enums import (
+    DiagnosisMethod,
+    DiagnosisScope,
+    RobustScaleStatus,
+)
 from process_intelligence.diagnosis.protocols import BaseRootCauseDiagnoser
 from process_intelligence.diagnosis.residual_association import (
     ResidualAssociationConfig,
@@ -41,4 +45,5 @@ __all__ = [
     "RobustFeatureStatistic",
     "RobustGroupComparisonConfig",
     "RobustGroupComparisonDiagnoser",
+    "RobustScaleStatus",
 ]

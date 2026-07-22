@@ -226,6 +226,37 @@ def test_evaluate_regression_single_sample_r2_none_and_warning() -> None:
                for warning in metrics.warnings)
 
 
+def test_evaluate_regression_constant_y_true_r2_unavailable() -> None:
+    metrics = evaluate_regression([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+    assert metrics.r2 is None
+    assert metrics.mae == 0.0
+    assert metrics.rmse == 0.0
+    assert any("constant" in warning.lower() for warning in metrics.warnings)
+    assert any("R²" in warning or "R2" in warning or "r2" in warning.lower()
+               for warning in metrics.warnings)
+
+
+def test_evaluate_regression_constant_y_true_ignores_library_r2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import process_intelligence.evaluation.metrics as metrics_module
+
+    def _fake_r2_score(*_args: object, **_kwargs: object) -> float:
+        return 1.0
+
+    monkeypatch.setattr(metrics_module, "r2_score", _fake_r2_score)
+    metrics = evaluate_regression([2.5, 2.5, 2.5, 2.5], [1.0, 3.0, 2.0, 4.0])
+    assert metrics.r2 is None
+    assert metrics.mae > 0.0
+    assert any("constant" in warning.lower() for warning in metrics.warnings)
+
+
+def test_evaluate_regression_varying_y_true_r2_unchanged() -> None:
+    metrics = evaluate_regression([1.0, 2.0, 3.0], [1.0, 2.0, 3.0])
+    assert metrics.r2 == 1.0
+    assert metrics.warnings == []
+
+
 def test_evaluate_regression_accepts_polars_pandas_numpy_sequence() -> None:
     values = [1.0, 2.0, 3.0]
     for true_values, pred_values in (

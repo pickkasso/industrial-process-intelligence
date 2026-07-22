@@ -31,3 +31,18 @@ class DiagnosisScope(StrEnum):
     TOP_ANOMALIES = "TOP_ANOMALIES"
     ANOMALY_GROUP = "ANOMALY_GROUP"
     GLOBAL = "GLOBAL"
+
+
+class RobustScaleStatus(StrEnum):
+    """Availability of the reference-group robust scale used for standardization.
+
+    ``AVAILABLE`` means a positive robust scale was observed and a finite
+    robust z-score may be reported. ``ZERO_VARIANCE`` means the reference
+    robust scale is at or below the configured numerical floor, so a
+    standardized score is undefined. ``INSUFFICIENT_DATA`` reserves the case
+    where scale cannot be estimated from the available reference values.
+    """
+
+    AVAILABLE = "AVAILABLE"
+    ZERO_VARIANCE = "ZERO_VARIANCE"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"

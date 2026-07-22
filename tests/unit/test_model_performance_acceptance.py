@@ -258,6 +258,41 @@ def test_required_metric_unavailable_is_unavailable() -> None:
     assert outcome.report.metric_results[0].passed is None
 
 
+def test_missing_r2_from_constant_target_is_not_acceptable() -> None:
+    """Constant-target defense: omitted R² must not yield ACCEPTABLE."""
+    outcome = ModelPerformanceAssessor(
+        policy=ModelPerformanceAcceptancePolicy(
+            rules=[
+                _rule("r2", threshold=0.0),
+                _rule(
+                    "mae",
+                    direction=MetricAcceptanceDirection.LOWER_IS_BETTER,
+                    threshold=1_000.0,
+                ),
+                _rule(
+                    "rmse",
+                    direction=MetricAcceptanceDirection.LOWER_IS_BETTER,
+                    threshold=1_000.0,
+                ),
+            ],
+        )
+    ).assess(
+        _final_report(
+            test_metrics={"rmse": 0.0, "mae": 0.0},
+            validation_metrics={"rmse": 0.0, "mae": 0.0},
+        )
+    )
+    assert outcome.report.status is not ModelPerformanceAcceptanceStatus.ACCEPTABLE
+    assert outcome.report.status is ModelPerformanceAcceptanceStatus.UNAVAILABLE
+    r2_result = next(
+        item for item in outcome.report.metric_results if item.metric_name == "r2"
+    )
+    assert r2_result.available is False
+    assert r2_result.observed_value is None
+    assert r2_result.passed is None
+    assert outcome.report.independent_test_evaluation is True
+
+
 # --- 14-18. report statuses ---
 
 

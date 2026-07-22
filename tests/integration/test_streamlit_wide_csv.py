@@ -83,9 +83,17 @@ class _DeterministicWorkflow:
             diagnosis_factor_count=0,
             raw_row_count=8,
             processed_row_count=8,
+            cohort_row_count=8,
             train_row_count=4,
             validation_row_count=2,
             test_row_count=2,
+            cohort_filter_summary={
+                "configured": False,
+                "source_row_count": 8,
+                "retained_row_count": 8,
+                "excluded_row_count": 0,
+                "null_excluded_count": 0,
+            },
             started_at=_UTC_START,
             completed_at=_UTC_END,
             total_seconds=60.0,
@@ -213,6 +221,10 @@ def test_wide_csv_column_configuration_ui() -> None:
     assert "SOH" in list(target_box.options)
     assert list(target_box.options).index("SOH") < list(target_box.options).index("Date")
 
+    task_box = next(item for item in at.selectbox if item.label == "Analysis task")
+    assert task_box.value == "AUTO"
+    assert list(task_box.options) == ["AUTO", "REGRESSION", "CLASSIFICATION"]
+
     objective_box = next(item for item in at.selectbox if item.label == "Objective")
     assert list(objective_box.options)[0] == "(select objective)"
     assert objective_box.value == "(select objective)"
@@ -295,6 +307,8 @@ def test_wide_csv_column_configuration_ui() -> None:
     # Select target and verify feature / excluded conflict handling.
     at = target_box.select("SOH").run()
     assert not at.exception
+    task_after_soh = next(item for item in at.selectbox if item.label == "Analysis task")
+    assert task_after_soh.value == "AUTO"
     active = resolve_active_feature_columns(
         recommended,
         selected_target="SOH",
@@ -313,6 +327,8 @@ def test_wide_csv_column_configuration_ui() -> None:
 
     blob_target = _text_blob(at)
     assert "True: target selected" in blob_target
+    assert "True: selected target has usable variation" in blob_target
+    assert "True: analysis task selection valid" in blob_target
     assert "False: objective selected" in blob_target
 
     at = _select_objective(at)
@@ -394,3 +410,134 @@ def test_wide_csv_column_configuration_ui() -> None:
     # CSV raw values unchanged after UI parse + configurator analysis.
     assert original_frame.to_dicts() == before_dicts
     assert [str(dtype) for dtype in original_frame.dtypes] == before_dtypes
+
+
+def _constant_serial_csv_bytes(*, sensor_count: int = 20) -> bytes:
+    """Wide CSV where SerialNumber is constant across all rows."""
+    columns = ["Date", "Time", "SerialNumber"]
+    columns.extend(f"sensor_{index:03d}" for index in range(sensor_count))
+    columns.append("SOH")
+    header = ",".join(columns)
+    rows: list[str] = []
+    for row_index in range(8):
+        values: list[str] = [
+            f"2020-01-{row_index + 1:02d}",
+            f"10:{row_index:02d}:00",
+            "1",
+        ]
+        for sensor_index in range(sensor_count):
+            values.append(f"{row_index + sensor_index * 0.01:.4f}")
+        values.append(f"{0.95 - row_index * 0.01:.4f}")
+        rows.append(",".join(values))
+    return ("\n".join([header, *rows]) + "\n").encode("utf-8")
+
+
+def test_constant_serial_number_not_default_identifier() -> None:
+    csv_bytes = _constant_serial_csv_bytes()
+    frame = pl.read_csv(BytesIO(csv_bytes), infer_schema_length=None)
+    before = frame.to_dicts()
+    report = AutomaticColumnConfigurator().analyze(frame)
+    assert frame.to_dicts() == before
+    assert "SerialNumber" not in report.identifier_candidates
+    assert "SerialNumber" not in report.recommended_feature_columns
+    assert any(
+        "resembles an identifier but is constant" in warning
+        for warning in report.warnings
+    )
+
+    at = _upload_wide(_make_app().run(), csv_bytes)
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "resembles an identifier but is constant" in blob
+    identifier_box = next(
+        item for item in at.multiselect if item.label == "Identifier columns"
+    )
+    assert "SerialNumber" not in list(identifier_box.value)
+    # Manual selection remains available.
+    assert "SerialNumber" in list(identifier_box.options)
+
+
+def _constant_soh_csv_bytes(*, sensor_count: int = 20) -> bytes:
+    """Battery-like CSV where SOH is numeric and entirely zero."""
+    columns = ["Date", "Time", "SerialNumber"]
+    columns.extend(f"sensor_{index:03d}" for index in range(sensor_count))
+    columns.append("SOH")
+    header = ",".join(columns)
+    rows: list[str] = []
+    for row_index in range(8):
+        values: list[str] = [
+            f"2020-01-{row_index + 1:02d}",
+            f"10:{row_index:02d}:00",
+            str(1000 + row_index),
+        ]
+        for sensor_index in range(sensor_count):
+            values.append(f"{row_index + sensor_index * 0.01:.4f}")
+        values.append("0")
+        rows.append(",".join(values))
+    return ("\n".join([header, *rows]) + "\n").encode("utf-8")
+
+
+class _CountingWorkflow:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, request: object) -> AnalysisWorkflowOutcome:
+        self.calls += 1
+        raise AssertionError(
+            f"workflow.run must not be called for constant targets; got {request!r}"
+        )
+
+
+def test_constant_soh_blocks_run_without_workflow_or_temp_csv() -> None:
+    csv_bytes = _constant_soh_csv_bytes()
+    before_frame = pl.read_csv(BytesIO(csv_bytes))
+    before_dicts = before_frame.to_dicts()
+    before_soh = before_frame.get_column("SOH").to_list()
+    assert set(before_soh) == {0}
+
+    configurator = AutomaticColumnConfigurator()
+    report = configurator.analyze(before_frame)
+    assert "SOH" in report.target_candidates
+    soh = next(item for item in report.suggestions if item.column == "SOH")
+    assert soh.constant is True
+    assert soh.suitable_as_target is False
+    assert "SOH" not in report.recommended_feature_columns
+    assert "SOH" not in report.excluded_candidates
+
+    counter = _CountingWorkflow()
+    at = AppTest.from_function(
+        _ui_entry,
+        default_timeout=60,
+        kwargs={"workflow_factory": lambda: counter},
+    )
+    at = at.run()
+    at = _upload_wide(at, csv_bytes)
+    assert not at.exception
+
+    target_box = next(item for item in at.selectbox if item.label == "Target column")
+    assert "SOH" in list(target_box.options)
+    at = target_box.select("SOH").run()
+    assert not at.exception
+
+    blob = _text_blob(at)
+    assert "True: target selected" in blob
+    assert "False: selected target has usable variation" in blob
+    assert "cannot be used as a regression target" in blob.lower()
+    assert "SOH" in blob
+
+    # Target selection must not auto-switch away from SOH.
+    target_after = next(item for item in at.selectbox if item.label == "Target column")
+    assert target_after.value == "SOH"
+
+    at = _select_objective(at)
+    at = _complete_performance_rule(at)
+    assert not at.exception
+    run_button = next(item for item in at.button if item.label == "Run analysis")
+    assert run_button.disabled is True
+
+    # Even if somehow clicked, readiness remains blocked and no workflow call.
+    assert counter.calls == 0
+
+    after_frame = pl.read_csv(BytesIO(csv_bytes))
+    assert after_frame.to_dicts() == before_dicts
+    assert after_frame.get_column("SOH").to_list() == before_soh

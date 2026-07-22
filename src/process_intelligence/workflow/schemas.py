@@ -15,7 +15,11 @@ from typing import Self
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from process_intelligence.core.enums import AnalysisTask, ColumnRole
-from process_intelligence.core.schemas import VariableConstraint
+from process_intelligence.core.schemas import (
+    AnomalyEvent,
+    RootCauseFactor,
+    VariableConstraint,
+)
 from process_intelligence.evaluation.performance_acceptance import (
     ModelPerformanceAcceptancePolicy,
     ModelPerformanceAcceptanceReport,
@@ -29,9 +33,12 @@ from process_intelligence.recommendation.scenario_ranking import (
 )
 from process_intelligence.recommendation.schemas import RecommendationResult
 from process_intelligence.workflow.enums import (
+    AnalysisExecutionMode,
     AnalysisWorkflowStage,
     AnalysisWorkflowStatus,
+    AnomalyContextOrderBasis,
     OperatingPointSelectionMode,
+    TaskSelectionSource,
 )
 
 ScalarMetadataValue = str | int | float | bool | None
@@ -40,6 +47,12 @@ ScalarMetadataValue = str | int | float | bool | None
 _ORIGINAL_ROW_ID = "_original_row_id"
 
 _CANONICAL_STAGES: tuple[AnalysisWorkflowStage, ...] = tuple(AnalysisWorkflowStage)
+
+ANOMALY_CONTEXT_RADIUS = 3
+"""Fixed analysis-order radius for anomaly context windows (center ± radius)."""
+
+ANOMALY_CONTEXT_MAX_FEATURES = 5
+"""Maximum diagnosis features included in each anomaly context window."""
 
 
 def _require_non_empty_str(value: object, *, field_name: str) -> str:
@@ -83,6 +96,35 @@ def _require_strict_int_ge(
 
 def _require_strict_int_ge0(value: object, *, field_name: str) -> int:
     return _require_strict_int_ge(value, field_name=field_name, minimum=0)
+
+
+def _require_strict_int(value: object, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"{field_name} must be an int (bool not allowed), "
+            f"got {type(value).__name__}"
+        )
+    return value
+
+
+def _require_json_safe_scalar(
+    value: object,
+    *,
+    field_name: str,
+) -> ScalarMetadataValue:
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{field_name} float must be finite, got {value!r}")
+        return value
+    raise ValueError(
+        f"{field_name} must be str, int, float, bool, or None "
+        f"(no DataFrame, ndarray, estimator, or nested objects); "
+        f"got {type(value).__name__}"
+    )
 
 
 def _require_finite_float(value: object, *, field_name: str) -> float:
@@ -207,6 +249,176 @@ def _validate_constraint_list(
     return copied
 
 
+class NumericCohortFilter(BaseModel):
+    """User-confirmed numeric operating-range filter for anomaly-only analysis.
+
+    Restricts the analysis cohort to rows whose ``column_name`` values fall
+    inside the configured inclusive/exclusive bounds. Bounds are never inferred
+    from data quantiles or column names. At most one filter is supported per
+    request.
+    """
+
+    column_name: str
+    lower_bound: float
+    upper_bound: float
+    include_lower: bool = True
+    include_upper: bool = True
+    exclude_filter_column_from_features: bool = True
+
+    @field_validator("column_name", mode="before")
+    @classmethod
+    def _validate_column_name(cls, value: object) -> str:
+        return _validate_column_name(value, field_name="column_name")
+
+    @field_validator("lower_bound", "upper_bound", mode="before")
+    @classmethod
+    def _validate_bounds(cls, value: object) -> float:
+        return _require_finite_float(value, field_name="cohort filter bound")
+
+    @field_validator(
+        "include_lower",
+        "include_upper",
+        "exclude_filter_column_from_features",
+        mode="before",
+    )
+    @classmethod
+    def _validate_bool_fields(cls, value: object) -> bool:
+        return _require_strict_bool(value, field_name="cohort filter bool field")
+
+    @model_validator(mode="after")
+    def _validate_bound_order(self) -> Self:
+        if self.lower_bound > self.upper_bound:
+            raise ValueError(
+                "lower_bound must be <= upper_bound "
+                f"(got {self.lower_bound} > {self.upper_bound})"
+            )
+        return self
+
+
+class CohortFilterSummary(BaseModel):
+    """Immutable summary of the explicit operating cohort filter for one run.
+
+    Always present on workflow reports. When no filter was configured,
+    ``configured`` is False and retained rows equal the analysis source rows.
+    """
+
+    configured: bool
+    column_name: str | None = None
+    lower_bound: float | None = None
+    upper_bound: float | None = None
+    include_lower: bool | None = None
+    include_upper: bool | None = None
+    exclude_filter_column_from_features: bool | None = None
+    source_row_count: int
+    retained_row_count: int
+    excluded_row_count: int
+    null_excluded_count: int
+
+    @field_validator("configured", mode="before")
+    @classmethod
+    def _validate_configured(cls, value: object) -> bool:
+        return _require_strict_bool(value, field_name="configured")
+
+    @field_validator("column_name", mode="before")
+    @classmethod
+    def _validate_column_name(cls, value: object) -> str | None:
+        return _require_optional_non_empty_str(value, field_name="column_name")
+
+    @field_validator("lower_bound", "upper_bound", mode="before")
+    @classmethod
+    def _validate_optional_bounds(cls, value: object) -> float | None:
+        return _require_optional_finite_float(value, field_name="cohort filter bound")
+
+    @field_validator(
+        "include_lower",
+        "include_upper",
+        "exclude_filter_column_from_features",
+        mode="before",
+    )
+    @classmethod
+    def _validate_optional_bools(cls, value: object) -> bool | None:
+        if value is None:
+            return None
+        return _require_strict_bool(value, field_name="cohort filter bool field")
+
+    @field_validator(
+        "source_row_count",
+        "retained_row_count",
+        "excluded_row_count",
+        "null_excluded_count",
+        mode="before",
+    )
+    @classmethod
+    def _validate_counts(cls, value: object) -> int:
+        return _require_strict_int_ge0(value, field_name="cohort filter count")
+
+    @model_validator(mode="after")
+    def _validate_summary_consistency(self) -> Self:
+        if self.retained_row_count + self.excluded_row_count != self.source_row_count:
+            raise ValueError(
+                "retained_row_count + excluded_row_count must equal source_row_count "
+                f"(got {self.retained_row_count} + {self.excluded_row_count} != "
+                f"{self.source_row_count})"
+            )
+        if self.null_excluded_count > self.excluded_row_count:
+            raise ValueError(
+                "null_excluded_count must be <= excluded_row_count "
+                f"(got {self.null_excluded_count} > {self.excluded_row_count})"
+            )
+        if self.configured:
+            if self.column_name is None:
+                raise ValueError(
+                    "column_name is required when cohort filter is configured"
+                )
+            if self.lower_bound is None or self.upper_bound is None:
+                raise ValueError(
+                    "lower_bound and upper_bound are required when cohort filter "
+                    "is configured"
+                )
+            if self.include_lower is None or self.include_upper is None:
+                raise ValueError(
+                    "include_lower and include_upper are required when cohort "
+                    "filter is configured"
+                )
+            if self.exclude_filter_column_from_features is None:
+                raise ValueError(
+                    "exclude_filter_column_from_features is required when cohort "
+                    "filter is configured"
+                )
+            if self.lower_bound > self.upper_bound:
+                raise ValueError(
+                    "lower_bound must be <= upper_bound "
+                    f"(got {self.lower_bound} > {self.upper_bound})"
+                )
+        else:
+            if self.column_name is not None:
+                raise ValueError(
+                    "column_name must be None when cohort filter is not configured"
+                )
+            if (
+                self.lower_bound is not None
+                or self.upper_bound is not None
+                or self.include_lower is not None
+                or self.include_upper is not None
+                or self.exclude_filter_column_from_features is not None
+            ):
+                raise ValueError(
+                    "filter bounds and flags must be None when cohort filter "
+                    "is not configured"
+                )
+            if self.excluded_row_count != 0 or self.null_excluded_count != 0:
+                raise ValueError(
+                    "excluded_row_count and null_excluded_count must be 0 when "
+                    "cohort filter is not configured"
+                )
+            if self.retained_row_count != self.source_row_count:
+                raise ValueError(
+                    "retained_row_count must equal source_row_count when cohort "
+                    "filter is not configured"
+                )
+        return self
+
+
 class AnalysisWorkflowPolicy(BaseModel):
     """Configurable safety and aggregation rules for analysis workflow runs.
 
@@ -268,17 +480,22 @@ class AnalysisWorkflowRequest(BaseModel):
     Declares the CSV path, column roles, recommendation objective, constraints,
     operating-point selection mode, and explicit model-performance acceptance
     policy. Does not load data or fit models.
+
+    SUPERVISED mode requires a target, objective, and performance policy.
+    ANOMALY_ONLY mode requires those supervised fields to be absent.
     """
 
     csv_path: Path
-    target_column: str
     feature_columns: list[str]
-    model_performance_policy: ModelPerformanceAcceptancePolicy
+    analysis_mode: AnalysisExecutionMode = AnalysisExecutionMode.SUPERVISED
+    target_column: str | None = None
+    model_performance_policy: ModelPerformanceAcceptancePolicy | None = None
     timestamp_column: str | None = None
     identifier_columns: list[str] = Field(default_factory=list)
     excluded_columns: list[str] = Field(default_factory=list)
     column_role_overrides: dict[str, ColumnRole] = Field(default_factory=dict)
-    objective: RecommendationObjective
+    requested_task: AnalysisTask | None = None
+    objective: RecommendationObjective | None = None
     quality_direction: QualityOptimizationDirection | None = None
     quality_target: float | None = None
     request_constraints: list[VariableConstraint] = Field(default_factory=list)
@@ -291,6 +508,7 @@ class AnalysisWorkflowRequest(BaseModel):
         OperatingPointSelectionMode.TOP_RESIDUAL_ANOMALY
     )
     explicit_operating_row_id: int | str | None = None
+    cohort_filter: NumericCohortFilter | None = None
     metadata: dict[str, ScalarMetadataValue] = Field(default_factory=dict)
 
     @field_validator("csv_path", mode="before")
@@ -314,9 +532,26 @@ class AnalysisWorkflowRequest(BaseModel):
             )
         return path
 
+    @field_validator("analysis_mode", mode="before")
+    @classmethod
+    def _validate_analysis_mode(cls, value: object) -> AnalysisExecutionMode:
+        if isinstance(value, AnalysisExecutionMode):
+            return value
+        if isinstance(value, str):
+            try:
+                return AnalysisExecutionMode(value)
+            except ValueError as exc:
+                raise ValueError(f"invalid AnalysisExecutionMode: {value!r}") from exc
+        raise ValueError(
+            "analysis_mode must be AnalysisExecutionMode, "
+            f"got {type(value).__name__}"
+        )
+
     @field_validator("target_column", mode="before")
     @classmethod
-    def _validate_target_column(cls, value: object) -> str:
+    def _validate_target_column(cls, value: object) -> str | None:
+        if value is None:
+            return None
         return _validate_column_name(value, field_name="target_column")
 
     @field_validator("feature_columns", mode="before")
@@ -404,9 +639,38 @@ class AnalysisWorkflowRequest(BaseModel):
             cleaned[name] = role
         return cleaned
 
+    @field_validator("requested_task", mode="before")
+    @classmethod
+    def _validate_requested_task(cls, value: object) -> AnalysisTask | None:
+        if value is None:
+            return None
+        if isinstance(value, AnalysisTask):
+            task = value
+        elif isinstance(value, str):
+            try:
+                task = AnalysisTask(value)
+            except ValueError as exc:
+                raise ValueError(f"invalid AnalysisTask: {value!r}") from exc
+        else:
+            raise ValueError(
+                "requested_task must be AnalysisTask or None, "
+                f"got {type(value).__name__}"
+            )
+        if task not in {
+            AnalysisTask.REGRESSION,
+            AnalysisTask.CLASSIFICATION,
+        }:
+            raise ValueError(
+                "requested_task must be REGRESSION, CLASSIFICATION, or None, "
+                f"got {task!r}"
+            )
+        return task
+
     @field_validator("objective", mode="before")
     @classmethod
-    def _validate_objective(cls, value: object) -> RecommendationObjective:
+    def _validate_objective(cls, value: object) -> RecommendationObjective | None:
+        if value is None:
+            return None
         if isinstance(value, RecommendationObjective):
             return value
         if isinstance(value, str):
@@ -417,7 +681,8 @@ class AnalysisWorkflowRequest(BaseModel):
                     f"invalid RecommendationObjective: {value!r}"
                 ) from exc
         raise ValueError(
-            f"objective must be RecommendationObjective, got {type(value).__name__}"
+            "objective must be RecommendationObjective or None, "
+            f"got {type(value).__name__}"
         )
 
     @field_validator("quality_direction", mode="before")
@@ -551,13 +816,29 @@ class AnalysisWorkflowRequest(BaseModel):
     def _validate_model_performance_policy(
         cls,
         value: object,
-    ) -> ModelPerformanceAcceptancePolicy:
+    ) -> ModelPerformanceAcceptancePolicy | None:
+        if value is None:
+            return None
         if isinstance(value, ModelPerformanceAcceptancePolicy):
             return value.model_copy(deep=True)
         if isinstance(value, dict):
             return ModelPerformanceAcceptancePolicy.model_validate(value)
         raise ValueError(
-            "model_performance_policy must be ModelPerformanceAcceptancePolicy, "
+            "model_performance_policy must be ModelPerformanceAcceptancePolicy "
+            f"or None, got {type(value).__name__}"
+        )
+
+    @field_validator("cohort_filter", mode="before")
+    @classmethod
+    def _validate_cohort_filter(cls, value: object) -> NumericCohortFilter | None:
+        if value is None:
+            return None
+        if isinstance(value, NumericCohortFilter):
+            return value.model_copy(deep=True)
+        if isinstance(value, dict):
+            return NumericCohortFilter.model_validate(value)
+        raise ValueError(
+            "cohort_filter must be NumericCohortFilter or None, "
             f"got {type(value).__name__}"
         )
 
@@ -571,20 +852,70 @@ class AnalysisWorkflowRequest(BaseModel):
     @model_validator(mode="after")
     def _validate_cross_fields(self) -> Self:
         feature_set = set(self.feature_columns)
-        if self.target_column in feature_set:
+        identifier_set = set(self.identifier_columns)
+        excluded_set = set(self.excluded_columns)
+
+        if self.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY:
+            if self.target_column is not None:
+                raise ValueError(
+                    "target_column must be None when analysis_mode is ANOMALY_ONLY"
+                )
+            if self.requested_task is not None:
+                raise ValueError(
+                    "requested_task must be None when analysis_mode is ANOMALY_ONLY"
+                )
+            if self.model_performance_policy is not None:
+                raise ValueError(
+                    "model_performance_policy must be None when analysis_mode "
+                    "is ANOMALY_ONLY"
+                )
+            if self.objective is not None:
+                raise ValueError(
+                    "objective must be None when analysis_mode is ANOMALY_ONLY"
+                )
+            if self.quality_direction is not None:
+                raise ValueError(
+                    "quality_direction must be None when analysis_mode "
+                    "is ANOMALY_ONLY"
+                )
+            if self.quality_target is not None:
+                raise ValueError(
+                    "quality_target must be None when analysis_mode is ANOMALY_ONLY"
+                )
+        else:
+            if self.cohort_filter is not None:
+                raise ValueError(
+                    "cohort_filter is only supported when analysis_mode is "
+                    "ANOMALY_ONLY"
+                )
+            if self.target_column is None:
+                raise ValueError(
+                    "target_column is required when analysis_mode is SUPERVISED"
+                )
+            if self.model_performance_policy is None:
+                raise ValueError(
+                    "model_performance_policy is required when analysis_mode "
+                    "is SUPERVISED"
+                )
+            if self.objective is None:
+                raise ValueError(
+                    "objective is required when analysis_mode is SUPERVISED"
+                )
+
+        if self.target_column is not None and self.target_column in feature_set:
             raise ValueError(
                 "feature_columns must not include target_column "
                 f"({self.target_column!r})"
             )
 
-        identifier_set = set(self.identifier_columns)
-        excluded_set = set(self.excluded_columns)
         if identifier_set & excluded_set:
             raise ValueError(
                 "identifier_columns and excluded_columns must be disjoint: "
                 f"{sorted(identifier_set & excluded_set)}"
             )
-        if self.target_column in identifier_set or self.target_column in excluded_set:
+        if self.target_column is not None and (
+            self.target_column in identifier_set or self.target_column in excluded_set
+        ):
             raise ValueError(
                 "target_column must not appear in identifier_columns or "
                 "excluded_columns"
@@ -597,7 +928,10 @@ class AnalysisWorkflowRequest(BaseModel):
             )
 
         if self.timestamp_column is not None:
-            if self.timestamp_column == self.target_column:
+            if (
+                self.target_column is not None
+                and self.timestamp_column == self.target_column
+            ):
                 raise ValueError("timestamp_column must not equal target_column")
             if self.timestamp_column in feature_set:
                 raise ValueError("timestamp_column must not appear in feature_columns")
@@ -609,20 +943,25 @@ class AnalysisWorkflowRequest(BaseModel):
                 raise ValueError("timestamp_column must not appear in excluded_columns")
 
         for name, role in self.column_role_overrides.items():
-            if name == self.target_column and role is not ColumnRole.TARGET_QUALITY:
+            if (
+                self.target_column is not None
+                and name == self.target_column
+                and role is not ColumnRole.TARGET_QUALITY
+            ):
                 raise ValueError(
                     "target_column override must use ColumnRole.TARGET_QUALITY"
                 )
 
-        needs_quality = self.objective in {
-            RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
-            RecommendationObjective.BALANCE_QUALITY_AND_ANOMALY,
-        }
-        if needs_quality and self.quality_direction is None:
-            raise ValueError(
-                "quality_direction is required for IMPROVE_PREDICTED_QUALITY "
-                "and BALANCE_QUALITY_AND_ANOMALY objectives"
-            )
+        if self.objective is not None:
+            needs_quality = self.objective in {
+                RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
+                RecommendationObjective.BALANCE_QUALITY_AND_ANOMALY,
+            }
+            if needs_quality and self.quality_direction is None:
+                raise ValueError(
+                    "quality_direction is required for IMPROVE_PREDICTED_QUALITY "
+                    "and BALANCE_QUALITY_AND_ANOMALY objectives"
+                )
 
         if self.quality_direction is QualityOptimizationDirection.TARGET:
             if self.quality_target is None:
@@ -681,6 +1020,329 @@ class AnalysisWorkflowRequest(BaseModel):
                 "operating_point_selection is EXPLICIT_ROW_ID"
             )
 
+        return self
+
+
+class AnomalyContextValue(BaseModel):
+    """One original feature value inside an anomaly context row."""
+
+    feature_name: str
+    value: ScalarMetadataValue = None
+
+    @field_validator("feature_name", mode="before")
+    @classmethod
+    def _validate_feature_name(cls, value: object) -> str:
+        return _require_non_empty_str(value, field_name="feature_name")
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _validate_value(cls, value: object) -> ScalarMetadataValue:
+        return _require_json_safe_scalar(value, field_name="value")
+
+
+class AnomalyContextIdentifierValue(BaseModel):
+    """One original identifier value inside an anomaly context row."""
+
+    column_name: str
+    value: ScalarMetadataValue = None
+
+    @field_validator("column_name", mode="before")
+    @classmethod
+    def _validate_column_name(cls, value: object) -> str:
+        return _require_non_empty_str(value, field_name="column_name")
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _validate_value(cls, value: object) -> ScalarMetadataValue:
+        return _require_json_safe_scalar(value, field_name="value")
+
+
+class AnomalyContextRow(BaseModel):
+    """One analysis-order row inside an anomaly context window."""
+
+    analysis_position: int
+    original_row_id: int | str
+    relative_offset: int
+    is_center_event: bool
+    is_selected_anomaly_event: bool
+    identifier_values: list[AnomalyContextIdentifierValue] = Field(
+        default_factory=list
+    )
+    timestamp_value: ScalarMetadataValue = None
+    feature_values: list[AnomalyContextValue] = Field(default_factory=list)
+
+    @field_validator("analysis_position", mode="before")
+    @classmethod
+    def _validate_analysis_position(cls, value: object) -> int:
+        return _require_strict_int_ge0(value, field_name="analysis_position")
+
+    @field_validator("original_row_id", mode="before")
+    @classmethod
+    def _validate_original_row_id(cls, value: object) -> int | str:
+        if isinstance(value, bool):
+            raise ValueError("original_row_id must not be a bool")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            return _require_non_empty_str(value, field_name="original_row_id")
+        raise ValueError(
+            f"original_row_id must be int or str, got {type(value).__name__}"
+        )
+
+    @field_validator("relative_offset", mode="before")
+    @classmethod
+    def _validate_relative_offset(cls, value: object) -> int:
+        return _require_strict_int(value, field_name="relative_offset")
+
+    @field_validator("is_center_event", "is_selected_anomaly_event", mode="before")
+    @classmethod
+    def _validate_bool_fields(cls, value: object) -> bool:
+        return _require_strict_bool(value, field_name="context row bool field")
+
+    @field_validator("identifier_values", mode="before")
+    @classmethod
+    def _validate_identifier_values_before(
+        cls,
+        value: object,
+    ) -> list[AnomalyContextIdentifierValue]:
+        if value is None:
+            return []
+        if isinstance(value, tuple):
+            value = list(value)
+        if not isinstance(value, list):
+            raise ValueError(
+                "identifier_values must be a list[AnomalyContextIdentifierValue], "
+                f"got {type(value).__name__}"
+            )
+        return list(value)
+
+    @field_validator("identifier_values", mode="after")
+    @classmethod
+    def _validate_identifier_values(
+        cls,
+        value: list[AnomalyContextIdentifierValue],
+    ) -> list[AnomalyContextIdentifierValue]:
+        seen: set[str] = set()
+        copied: list[AnomalyContextIdentifierValue] = []
+        for item in value:
+            if not isinstance(item, AnomalyContextIdentifierValue):
+                raise ValueError(
+                    "identifier_values entries must be AnomalyContextIdentifierValue, "
+                    f"got {type(item).__name__}"
+                )
+            if item.column_name in seen:
+                raise ValueError(
+                    "identifier_values must not contain duplicate column_name: "
+                    f"{item.column_name!r}"
+                )
+            seen.add(item.column_name)
+            copied.append(item.model_copy(deep=True))
+        return copied
+
+    @field_validator("timestamp_value", mode="before")
+    @classmethod
+    def _validate_timestamp_value(cls, value: object) -> ScalarMetadataValue:
+        return _require_json_safe_scalar(value, field_name="timestamp_value")
+
+    @field_validator("feature_values", mode="before")
+    @classmethod
+    def _validate_feature_values_before(
+        cls,
+        value: object,
+    ) -> list[AnomalyContextValue]:
+        if value is None:
+            return []
+        if isinstance(value, tuple):
+            value = list(value)
+        if not isinstance(value, list):
+            raise ValueError(
+                "feature_values must be a list[AnomalyContextValue], "
+                f"got {type(value).__name__}"
+            )
+        return list(value)
+
+    @field_validator("feature_values", mode="after")
+    @classmethod
+    def _validate_feature_values(
+        cls,
+        value: list[AnomalyContextValue],
+    ) -> list[AnomalyContextValue]:
+        seen: set[str] = set()
+        copied: list[AnomalyContextValue] = []
+        for item in value:
+            if not isinstance(item, AnomalyContextValue):
+                raise ValueError(
+                    "feature_values entries must be AnomalyContextValue, "
+                    f"got {type(item).__name__}"
+                )
+            if item.feature_name in seen:
+                raise ValueError(
+                    "feature_values must not contain duplicate feature_name: "
+                    f"{item.feature_name!r}"
+                )
+            seen.add(item.feature_name)
+            copied.append(item.model_copy(deep=True))
+        return copied
+
+    @model_validator(mode="after")
+    def _validate_center_offset_consistency(self) -> Self:
+        if self.is_center_event and self.relative_offset != 0:
+            raise ValueError(
+                "is_center_event=True requires relative_offset=0, "
+                f"got {self.relative_offset}"
+            )
+        if self.relative_offset == 0 and not self.is_center_event:
+            raise ValueError(
+                "relative_offset=0 requires is_center_event=True"
+            )
+        return self
+
+
+class AnomalyContextWindow(BaseModel):
+    """Compact analysis-order context window for one selected anomaly event."""
+
+    event_rank: int
+    center_original_row_id: int | str
+    center_anomaly_score: float
+    radius: int = ANOMALY_CONTEXT_RADIUS
+    order_basis: AnomalyContextOrderBasis
+    feature_names: list[str] = Field(default_factory=list)
+    rows: list[AnomalyContextRow] = Field(default_factory=list)
+
+    @field_validator("event_rank", mode="before")
+    @classmethod
+    def _validate_event_rank(cls, value: object) -> int:
+        return _require_strict_int_ge(value, field_name="event_rank", minimum=1)
+
+    @field_validator("center_original_row_id", mode="before")
+    @classmethod
+    def _validate_center_original_row_id(cls, value: object) -> int | str:
+        if isinstance(value, bool):
+            raise ValueError("center_original_row_id must not be a bool")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            return _require_non_empty_str(value, field_name="center_original_row_id")
+        raise ValueError(
+            "center_original_row_id must be int or str, "
+            f"got {type(value).__name__}"
+        )
+
+    @field_validator("center_anomaly_score", mode="before")
+    @classmethod
+    def _validate_center_anomaly_score(cls, value: object) -> float:
+        return _require_finite_float(value, field_name="center_anomaly_score")
+
+    @field_validator("radius", mode="before")
+    @classmethod
+    def _validate_radius(cls, value: object) -> int:
+        number = _require_strict_int_ge(value, field_name="radius", minimum=0)
+        if number != ANOMALY_CONTEXT_RADIUS:
+            raise ValueError(
+                f"radius must equal ANOMALY_CONTEXT_RADIUS "
+                f"({ANOMALY_CONTEXT_RADIUS}), got {number}"
+            )
+        return number
+
+    @field_validator("order_basis", mode="before")
+    @classmethod
+    def _validate_order_basis(cls, value: object) -> AnomalyContextOrderBasis:
+        if isinstance(value, AnomalyContextOrderBasis):
+            return value
+        if isinstance(value, str):
+            try:
+                return AnomalyContextOrderBasis(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid AnomalyContextOrderBasis: {value!r}"
+                ) from exc
+        raise ValueError(
+            "order_basis must be AnomalyContextOrderBasis, "
+            f"got {type(value).__name__}"
+        )
+
+    @field_validator("feature_names", mode="before")
+    @classmethod
+    def _validate_feature_names_before(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, tuple):
+            value = list(value)
+        if not isinstance(value, list):
+            raise ValueError(
+                f"feature_names must be a list[str], got {type(value).__name__}"
+            )
+        return list(value)
+
+    @field_validator("feature_names", mode="after")
+    @classmethod
+    def _validate_feature_names(cls, value: list[str]) -> list[str]:
+        cleaned = _validate_unique_non_empty_strings(value, field_name="feature_names")
+        if len(cleaned) > ANOMALY_CONTEXT_MAX_FEATURES:
+            raise ValueError(
+                "feature_names must contain at most "
+                f"{ANOMALY_CONTEXT_MAX_FEATURES} features, got {len(cleaned)}"
+            )
+        return cleaned
+
+    @field_validator("rows", mode="before")
+    @classmethod
+    def _validate_rows_before(cls, value: object) -> list[AnomalyContextRow]:
+        if value is None:
+            return []
+        if isinstance(value, tuple):
+            value = list(value)
+        if not isinstance(value, list):
+            raise ValueError(
+                f"rows must be a list[AnomalyContextRow], got {type(value).__name__}"
+            )
+        return list(value)
+
+    @field_validator("rows", mode="after")
+    @classmethod
+    def _validate_rows(cls, value: list[AnomalyContextRow]) -> list[AnomalyContextRow]:
+        max_rows = (2 * ANOMALY_CONTEXT_RADIUS) + 1
+        if len(value) > max_rows:
+            raise ValueError(
+                f"rows must contain at most {max_rows} entries, got {len(value)}"
+            )
+        copied: list[AnomalyContextRow] = []
+        for item in value:
+            if not isinstance(item, AnomalyContextRow):
+                raise ValueError(
+                    "rows entries must be AnomalyContextRow, "
+                    f"got {type(item).__name__}"
+                )
+            copied.append(item.model_copy(deep=True))
+        return copied
+
+    @model_validator(mode="after")
+    def _validate_window_consistency(self) -> Self:
+        center_rows = [row for row in self.rows if row.is_center_event]
+        if self.rows and len(center_rows) != 1:
+            raise ValueError(
+                "rows must contain exactly one center event when non-empty, "
+                f"got {len(center_rows)}"
+            )
+        if center_rows:
+            center = center_rows[0]
+            if center.original_row_id != self.center_original_row_id:
+                raise ValueError(
+                    "center row original_row_id must equal center_original_row_id"
+                )
+            if center.relative_offset != 0:
+                raise ValueError("center row relative_offset must be 0")
+        for row in self.rows:
+            if abs(row.relative_offset) > self.radius:
+                raise ValueError(
+                    "row relative_offset must be within "
+                    f"[{-self.radius}, {self.radius}], got {row.relative_offset}"
+                )
+            row_feature_names = [item.feature_name for item in row.feature_values]
+            if row_feature_names != self.feature_names:
+                raise ValueError(
+                    "each row feature_values order must match window feature_names"
+                )
         return self
 
 
@@ -780,20 +1442,29 @@ class AnalysisWorkflowReport(BaseModel):
     status: AnalysisWorkflowStatus
     terminal_stage: AnalysisWorkflowStage
     stage_records: list[AnalysisWorkflowStageRecord]
+    analysis_mode: AnalysisExecutionMode = AnalysisExecutionMode.SUPERVISED
     model_performance_assessment: ModelPerformanceAcceptanceReport | None = None
     final_recommendation: RecommendationResult | None = None
     selected_industry: str | None = None
     selected_task: AnalysisTask | None = None
+    inferred_task: AnalysisTask | None = None
+    task_selection_source: TaskSelectionSource | None = None
+    task_override_applied: bool = False
     selected_supervised_model_key: str | None = None
     selected_anomaly_model_key: str | None = None
     selected_operating_row_id: int | str | None = None
     anomaly_event_count: int
     diagnosis_factor_count: int
+    anomaly_events: list[AnomalyEvent] = Field(default_factory=list)
+    diagnosis_factors: list[RootCauseFactor] = Field(default_factory=list)
+    anomaly_context_windows: list[AnomalyContextWindow] = Field(default_factory=list)
     raw_row_count: int
     processed_row_count: int
+    cohort_row_count: int
     train_row_count: int
     validation_row_count: int
     test_row_count: int
+    cohort_filter_summary: CohortFilterSummary
     started_at: datetime
     completed_at: datetime
     total_seconds: float
@@ -814,6 +1485,21 @@ class AnalysisWorkflowReport(BaseModel):
                 ) from exc
         raise ValueError(
             f"status must be AnalysisWorkflowStatus, got {type(value).__name__}"
+        )
+
+    @field_validator("analysis_mode", mode="before")
+    @classmethod
+    def _validate_analysis_mode(cls, value: object) -> AnalysisExecutionMode:
+        if isinstance(value, AnalysisExecutionMode):
+            return value
+        if isinstance(value, str):
+            try:
+                return AnalysisExecutionMode(value)
+            except ValueError as exc:
+                raise ValueError(f"invalid AnalysisExecutionMode: {value!r}") from exc
+        raise ValueError(
+            "analysis_mode must be AnalysisExecutionMode, "
+            f"got {type(value).__name__}"
         )
 
     @field_validator("terminal_stage", mode="before")
@@ -879,13 +1565,17 @@ class AnalysisWorkflowReport(BaseModel):
         executed = [record for record in copied if record.executed]
         if not executed:
             raise ValueError("at least one stage_records entry must be executed")
-        for index, record in enumerate(executed):
-            expected = _CANONICAL_STAGES[index]
-            if record.stage is not expected:
+
+        # Executed stages may have explicit skipped (executed=False) records
+        # between them. Every canonical stage from LOAD through the last
+        # executed stage must appear in the records.
+        last_executed_index = stage_order[executed[-1].stage]
+        present = {record.stage for record in copied}
+        for stage in _CANONICAL_STAGES[: last_executed_index + 1]:
+            if stage not in present:
                 raise ValueError(
-                    "executed stages must form a contiguous prefix of the "
-                    f"canonical order starting at LOAD (expected {expected!r}, "
-                    f"got {record.stage!r})"
+                    "stage_records must include every canonical stage from LOAD "
+                    f"through the last executed stage (missing {stage!r})"
                 )
         return copied
 
@@ -946,6 +1636,47 @@ class AnalysisWorkflowReport(BaseModel):
             f"selected_task must be AnalysisTask or None, got {type(value).__name__}"
         )
 
+    @field_validator("inferred_task", mode="before")
+    @classmethod
+    def _validate_inferred_task(cls, value: object) -> AnalysisTask | None:
+        if value is None:
+            return None
+        if isinstance(value, AnalysisTask):
+            return value
+        if isinstance(value, str):
+            try:
+                return AnalysisTask(value)
+            except ValueError as exc:
+                raise ValueError(f"invalid AnalysisTask: {value!r}") from exc
+        raise ValueError(
+            f"inferred_task must be AnalysisTask or None, got {type(value).__name__}"
+        )
+
+    @field_validator("task_selection_source", mode="before")
+    @classmethod
+    def _validate_task_selection_source(
+        cls,
+        value: object,
+    ) -> TaskSelectionSource | None:
+        if value is None:
+            return None
+        if isinstance(value, TaskSelectionSource):
+            return value
+        if isinstance(value, str):
+            try:
+                return TaskSelectionSource(value)
+            except ValueError as exc:
+                raise ValueError(f"invalid TaskSelectionSource: {value!r}") from exc
+        raise ValueError(
+            "task_selection_source must be TaskSelectionSource or None, "
+            f"got {type(value).__name__}"
+        )
+
+    @field_validator("task_override_applied", mode="before")
+    @classmethod
+    def _validate_task_override_applied(cls, value: object) -> bool:
+        return _require_strict_bool(value, field_name="task_override_applied")
+
     @field_validator("selected_operating_row_id", mode="before")
     @classmethod
     def _validate_operating_row_id(cls, value: object) -> int | str | None:
@@ -967,6 +1698,7 @@ class AnalysisWorkflowReport(BaseModel):
         "diagnosis_factor_count",
         "raw_row_count",
         "processed_row_count",
+        "cohort_row_count",
         "train_row_count",
         "validation_row_count",
         "test_row_count",
@@ -975,6 +1707,126 @@ class AnalysisWorkflowReport(BaseModel):
     @classmethod
     def _validate_counts(cls, value: object) -> int:
         return _require_strict_int_ge0(value, field_name="count field")
+
+    @field_validator("cohort_filter_summary", mode="before")
+    @classmethod
+    def _validate_cohort_filter_summary(cls, value: object) -> CohortFilterSummary:
+        if isinstance(value, CohortFilterSummary):
+            return value.model_copy(deep=True)
+        if isinstance(value, dict):
+            return CohortFilterSummary.model_validate(value)
+        raise ValueError(
+            "cohort_filter_summary must be CohortFilterSummary, "
+            f"got {type(value).__name__}"
+        )
+
+    @field_validator("anomaly_events", mode="before")
+    @classmethod
+    def _validate_anomaly_events_before(cls, value: object) -> list[AnomalyEvent]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError(
+                f"anomaly_events must be a list[AnomalyEvent], "
+                f"got {type(value).__name__}"
+            )
+        return list(value)
+
+    @field_validator("anomaly_events", mode="after")
+    @classmethod
+    def _validate_anomaly_events(cls, value: list[AnomalyEvent]) -> list[AnomalyEvent]:
+        seen_ids: set[str] = set()
+        copied: list[AnomalyEvent] = []
+        for event in value:
+            if not isinstance(event, AnomalyEvent):
+                raise ValueError(
+                    "anomaly_events entries must be AnomalyEvent, "
+                    f"got {type(event).__name__}"
+                )
+            if event.anomaly_id in seen_ids:
+                raise ValueError(
+                    "anomaly_events must not contain duplicate anomaly_id values: "
+                    f"{event.anomaly_id!r}"
+                )
+            seen_ids.add(event.anomaly_id)
+            copied.append(event.model_copy(deep=True))
+        return copied
+
+    @field_validator("diagnosis_factors", mode="before")
+    @classmethod
+    def _validate_diagnosis_factors_before(
+        cls,
+        value: object,
+    ) -> list[RootCauseFactor]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError(
+                f"diagnosis_factors must be a list[RootCauseFactor], "
+                f"got {type(value).__name__}"
+            )
+        return list(value)
+
+    @field_validator("diagnosis_factors", mode="after")
+    @classmethod
+    def _validate_diagnosis_factors(
+        cls,
+        value: list[RootCauseFactor],
+    ) -> list[RootCauseFactor]:
+        seen_variables: set[str] = set()
+        copied: list[RootCauseFactor] = []
+        for factor in value:
+            if not isinstance(factor, RootCauseFactor):
+                raise ValueError(
+                    "diagnosis_factors entries must be RootCauseFactor, "
+                    f"got {type(factor).__name__}"
+                )
+            if factor.variable in seen_variables:
+                raise ValueError(
+                    "diagnosis_factors must not contain duplicate variables: "
+                    f"{factor.variable!r}"
+                )
+            seen_variables.add(factor.variable)
+            copied.append(factor.model_copy(deep=True))
+        return copied
+
+    @field_validator("anomaly_context_windows", mode="before")
+    @classmethod
+    def _validate_anomaly_context_windows_before(
+        cls,
+        value: object,
+    ) -> list[AnomalyContextWindow]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError(
+                "anomaly_context_windows must be a list[AnomalyContextWindow], "
+                f"got {type(value).__name__}"
+            )
+        return list(value)
+
+    @field_validator("anomaly_context_windows", mode="after")
+    @classmethod
+    def _validate_anomaly_context_windows(
+        cls,
+        value: list[AnomalyContextWindow],
+    ) -> list[AnomalyContextWindow]:
+        seen_ranks: set[int] = set()
+        copied: list[AnomalyContextWindow] = []
+        for window in value:
+            if not isinstance(window, AnomalyContextWindow):
+                raise ValueError(
+                    "anomaly_context_windows entries must be AnomalyContextWindow, "
+                    f"got {type(window).__name__}"
+                )
+            if window.event_rank in seen_ranks:
+                raise ValueError(
+                    "anomaly_context_windows must not contain duplicate event_rank: "
+                    f"{window.event_rank!r}"
+                )
+            seen_ranks.add(window.event_rank)
+            copied.append(window.model_copy(deep=True))
+        return copied
 
     @field_validator("started_at", "completed_at", mode="before")
     @classmethod
@@ -1026,6 +1878,18 @@ class AnalysisWorkflowReport(BaseModel):
                 "processed_row_count must be <= raw_row_count "
                 f"(got {self.processed_row_count} > {self.raw_row_count})"
             )
+        if self.cohort_row_count > self.processed_row_count:
+            raise ValueError(
+                "cohort_row_count must be <= processed_row_count "
+                f"(got {self.cohort_row_count} > {self.processed_row_count})"
+            )
+        if self.cohort_filter_summary.retained_row_count != self.cohort_row_count:
+            raise ValueError(
+                "cohort_filter_summary.retained_row_count must equal "
+                "cohort_row_count "
+                f"(got {self.cohort_filter_summary.retained_row_count} != "
+                f"{self.cohort_row_count})"
+            )
 
         split_executed = any(
             record.stage is AnalysisWorkflowStage.SPLIT and record.executed
@@ -1037,11 +1901,11 @@ class AnalysisWorkflowReport(BaseModel):
                 + self.validation_row_count
                 + self.test_row_count
             )
-            if split_total != self.processed_row_count:
+            if split_total != self.cohort_row_count:
                 raise ValueError(
                     "train_row_count + validation_row_count + test_row_count "
-                    "must equal processed_row_count when SPLIT executed "
-                    f"(got {split_total} != {self.processed_row_count})"
+                    "must equal cohort_row_count when SPLIT executed "
+                    f"(got {split_total} != {self.cohort_row_count})"
                 )
 
         if self.completed_at < self.started_at:

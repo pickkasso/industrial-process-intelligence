@@ -32,6 +32,7 @@ def _suggestion(**overrides: Any) -> UiColumnSuggestion:
         "unique_count": 3,
         "unique_ratio": 1.0,
         "constant": False,
+        "suitable_as_target": True,
         "monotonic_non_decreasing": False,
     }
     payload.update(overrides)
@@ -364,9 +365,23 @@ def test_target_candidate_not_overwritten_by_excluded_category() -> None:
     soh = next(item for item in report.suggestions if item.column == "SOH")
     assert soh.category is UiColumnSuggestionCategory.TARGET_CANDIDATE
     assert soh.constant is True
+    assert soh.suitable_as_target is False
     assert "SOH" in report.target_candidates
     assert "SOH" not in report.excluded_candidates
     assert "notes" in report.excluded_candidates
+
+
+def test_suitable_as_target_true_for_varying_soh() -> None:
+    frame = pl.DataFrame(
+        {
+            "SOH": [0.9, 0.8, 0.7],
+            "sensor": [1.0, 2.0, 3.0],
+        }
+    )
+    report = AutomaticColumnConfigurator().analyze(frame)
+    soh = next(item for item in report.suggestions if item.column == "SOH")
+    assert soh.suitable_as_target is True
+    assert soh.constant is False
 
 
 def test_target_candidate_excluded_from_recommended_features() -> None:
@@ -622,3 +637,73 @@ def test_report_has_no_dataframe_series_ndarray() -> None:
     _walk(dumped)
     cloned = copy.deepcopy(dumped)
     assert cloned == dumped
+
+
+def test_constant_serial_number_not_identifier_candidate() -> None:
+    frame = pl.DataFrame(
+        {
+            "SerialNumber": [42, 42, 42],
+            "sensor": [1.0, 2.0, 3.0],
+        }
+    )
+    before = frame.to_dicts()
+    report = AutomaticColumnConfigurator().analyze(frame)
+    assert frame.to_dicts() == before
+    assert "SerialNumber" not in report.identifier_candidates
+    assert "SerialNumber" not in report.recommended_feature_columns
+    suggestion = next(
+        item for item in report.suggestions if item.column == "SerialNumber"
+    )
+    assert suggestion.category is UiColumnSuggestionCategory.REVIEW_REQUIRED
+    assert suggestion.constant is True
+    assert any(
+        "resembles an identifier but is constant" in warning
+        for warning in report.warnings
+    )
+    assert any("not selected as identifier" in reason for reason in suggestion.reasons)
+
+
+def test_all_null_identifier_like_not_candidate() -> None:
+    frame = pl.DataFrame(
+        {
+            "SerialNumber": pl.Series(
+                "SerialNumber",
+                [None, None, None],
+                dtype=pl.Int64,
+            ),
+            "sensor": [1.0, 2.0, 3.0],
+        }
+    )
+    report = AutomaticColumnConfigurator().analyze(frame)
+    assert "SerialNumber" not in report.identifier_candidates
+    assert "SerialNumber" not in report.recommended_feature_columns
+    suggestion = next(
+        item for item in report.suggestions if item.column == "SerialNumber"
+    )
+    assert suggestion.category is UiColumnSuggestionCategory.REVIEW_REQUIRED
+
+
+def test_repeated_two_value_lot_id_is_identifier_candidate() -> None:
+    frame = pl.DataFrame(
+        {
+            "lot_id": ["A", "A", "B", "B"],
+            "sensor": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+    report = AutomaticColumnConfigurator().analyze(frame)
+    assert "lot_id" in report.identifier_candidates
+    assert "lot_id" not in report.recommended_feature_columns
+
+
+def test_unique_serial_number_identifier_candidate_regression() -> None:
+    frame = pl.DataFrame(
+        {
+            "SerialNumber": [1, 2, 3],
+            "sensor": [1.0, 2.0, 3.0],
+        }
+    )
+    first = AutomaticColumnConfigurator().analyze(frame)
+    second = AutomaticColumnConfigurator().analyze(frame)
+    assert first.identifier_candidates == second.identifier_candidates
+    assert "SerialNumber" in first.identifier_candidates
+    assert "SerialNumber" not in first.recommended_feature_columns
