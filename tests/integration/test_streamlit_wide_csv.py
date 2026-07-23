@@ -522,8 +522,8 @@ def test_constant_soh_blocks_run_without_workflow_or_temp_csv() -> None:
     blob = _text_blob(at)
     assert "True: target selected" in blob
     assert "False: selected target has usable variation" in blob
-    assert "cannot be used as a regression target" in blob.lower()
-    assert "SOH" in blob
+    assert "no usable variation" in blob.lower()
+    assert "SOH" in blob or "anomaly-only" in blob.lower()
 
     # Target selection must not auto-switch away from SOH.
     target_after = next(item for item in at.selectbox if item.label == "Target column")

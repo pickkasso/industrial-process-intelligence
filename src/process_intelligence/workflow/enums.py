@@ -8,7 +8,8 @@ class AnalysisExecutionMode(StrEnum):
 
     SUPERVISED runs the target-based regression path with residual diagnosis and
     recommendation. ANOMALY_ONLY runs label-free anomaly detection and robust
-    group comparison without a target or recommendation generation.
+    group comparison without a target. Recommendation generation remains
+    skipped unless explicitly enabled with REDUCE_ANOMALY_SCORE safety inputs.
     """
 
     SUPERVISED = "SUPERVISED"
@@ -44,15 +45,18 @@ class AnalysisWorkflowStage(StrEnum):
     ANOMALY_EVENT_SELECTION = "ANOMALY_EVENT_SELECTION"
     DIAGNOSIS = "DIAGNOSIS"
     RECOMMENDATION = "RECOMMENDATION"
+    WHAT_IF_VERIFICATION = "WHAT_IF_VERIFICATION"
 
 
 class AnalysisWorkflowStatus(StrEnum):
     """Terminal business status for a single analysis workflow run.
 
-    COMPLETED means recommendation finished with a generated result.
-    PARTIAL means analysis progressed but ended in a structured partial state
-    such as READY_FOR_OPTIMIZATION. REFUSED means the run stopped safely due
-    to validation, leakage, unsupported task, or safety refusal.
+    COMPLETED means recommendation finished with a generated result and any
+    subsequent local what-if verification stage completed or became unavailable
+    without changing the recommendation. PARTIAL means analysis progressed but
+    ended in a structured partial state such as READY_FOR_OPTIMIZATION. REFUSED
+    means the run stopped safely due to validation, leakage, unsupported task,
+    or safety refusal.
     """
 
     COMPLETED = "COMPLETED"

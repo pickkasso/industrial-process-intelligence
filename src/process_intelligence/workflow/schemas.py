@@ -32,6 +32,12 @@ from process_intelligence.recommendation.scenario_ranking import (
     QualityOptimizationDirection,
 )
 from process_intelligence.recommendation.schemas import RecommendationResult
+from process_intelligence.recommendation.what_if_verification import (
+    RecommendationWhatIfVerificationResult,
+)
+from process_intelligence.workflow.dataset_fingerprint import (
+    normalize_optional_dataset_fingerprint,
+)
 from process_intelligence.workflow.enums import (
     AnalysisExecutionMode,
     AnalysisWorkflowStage,
@@ -474,6 +480,24 @@ class AnalysisWorkflowPolicy(BaseModel):
         return self
 
 
+class AnomalyRecommendationConfig(BaseModel):
+    """Explicit opt-in for anomaly-only recommendation generation.
+
+    When ``enabled`` is False, ANOMALY_ONLY keeps the recommendation stage
+    skipped. When True, the workflow may run the existing recommendation
+    pipeline with ``REDUCE_ANOMALY_SCORE`` only. Simultaneous-change limits and
+    stage-output retention reuse the request/policy fields already present on
+    ``AnalysisWorkflowRequest`` / ``AnalysisWorkflowPolicy``.
+    """
+
+    enabled: bool = False
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def _validate_enabled(cls, value: object) -> bool:
+        return _require_strict_bool(value, field_name="enabled")
+
+
 class AnalysisWorkflowRequest(BaseModel):
     """Caller inputs for a single raw-CSV industrial analysis workflow run.
 
@@ -482,7 +506,8 @@ class AnalysisWorkflowRequest(BaseModel):
     policy. Does not load data or fit models.
 
     SUPERVISED mode requires a target, objective, and performance policy.
-    ANOMALY_ONLY mode requires those supervised fields to be absent.
+    ANOMALY_ONLY mode requires those supervised fields to be absent unless
+    anomaly-only recommendation is explicitly enabled.
     """
 
     csv_path: Path
@@ -509,6 +534,9 @@ class AnalysisWorkflowRequest(BaseModel):
     )
     explicit_operating_row_id: int | str | None = None
     cohort_filter: NumericCohortFilter | None = None
+    anomaly_recommendation: AnomalyRecommendationConfig = Field(
+        default_factory=AnomalyRecommendationConfig
+    )
     metadata: dict[str, ScalarMetadataValue] = Field(default_factory=dict)
 
     @field_validator("csv_path", mode="before")
@@ -842,6 +870,23 @@ class AnalysisWorkflowRequest(BaseModel):
             f"got {type(value).__name__}"
         )
 
+    @field_validator("anomaly_recommendation", mode="before")
+    @classmethod
+    def _validate_anomaly_recommendation(
+        cls,
+        value: object,
+    ) -> AnomalyRecommendationConfig:
+        if value is None:
+            return AnomalyRecommendationConfig()
+        if isinstance(value, AnomalyRecommendationConfig):
+            return value.model_copy(deep=True)
+        if isinstance(value, dict):
+            return AnomalyRecommendationConfig.model_validate(value)
+        raise ValueError(
+            "anomaly_recommendation must be AnomalyRecommendationConfig, "
+            f"got {type(value).__name__}"
+        )
+
     @field_validator("metadata", mode="before")
     @classmethod
     def _validate_metadata(cls, value: object) -> dict[str, ScalarMetadataValue]:
@@ -854,6 +899,7 @@ class AnalysisWorkflowRequest(BaseModel):
         feature_set = set(self.feature_columns)
         identifier_set = set(self.identifier_columns)
         excluded_set = set(self.excluded_columns)
+        anomaly_recommendation_enabled = self.anomaly_recommendation.enabled
 
         if self.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY:
             if self.target_column is not None:
@@ -869,10 +915,6 @@ class AnalysisWorkflowRequest(BaseModel):
                     "model_performance_policy must be None when analysis_mode "
                     "is ANOMALY_ONLY"
                 )
-            if self.objective is not None:
-                raise ValueError(
-                    "objective must be None when analysis_mode is ANOMALY_ONLY"
-                )
             if self.quality_direction is not None:
                 raise ValueError(
                     "quality_direction must be None when analysis_mode "
@@ -882,7 +924,23 @@ class AnalysisWorkflowRequest(BaseModel):
                 raise ValueError(
                     "quality_target must be None when analysis_mode is ANOMALY_ONLY"
                 )
+            if anomaly_recommendation_enabled:
+                if self.objective is not RecommendationObjective.REDUCE_ANOMALY_SCORE:
+                    raise ValueError(
+                        "objective must be REDUCE_ANOMALY_SCORE when "
+                        "anomaly_recommendation.enabled is True"
+                    )
+            elif self.objective is not None:
+                raise ValueError(
+                    "objective must be None when analysis_mode is ANOMALY_ONLY "
+                    "and anomaly_recommendation.enabled is False"
+                )
         else:
+            if anomaly_recommendation_enabled:
+                raise ValueError(
+                    "anomaly_recommendation.enabled must be False when "
+                    "analysis_mode is SUPERVISED"
+                )
             if self.cohort_filter is not None:
                 raise ValueError(
                     "cohort_filter is only supported when analysis_mode is "
@@ -1445,6 +1503,7 @@ class AnalysisWorkflowReport(BaseModel):
     analysis_mode: AnalysisExecutionMode = AnalysisExecutionMode.SUPERVISED
     model_performance_assessment: ModelPerformanceAcceptanceReport | None = None
     final_recommendation: RecommendationResult | None = None
+    recommendation_verification: RecommendationWhatIfVerificationResult | None = None
     selected_industry: str | None = None
     selected_task: AnalysisTask | None = None
     inferred_task: AnalysisTask | None = None
@@ -1465,6 +1524,7 @@ class AnalysisWorkflowReport(BaseModel):
     validation_row_count: int
     test_row_count: int
     cohort_filter_summary: CohortFilterSummary
+    dataset_fingerprint: str | None = None
     started_at: datetime
     completed_at: datetime
     total_seconds: float
@@ -1614,6 +1674,24 @@ class AnalysisWorkflowReport(BaseModel):
             f"got {type(value).__name__}"
         )
 
+    @field_validator("recommendation_verification", mode="before")
+    @classmethod
+    def _validate_recommendation_verification(
+        cls,
+        value: object,
+    ) -> RecommendationWhatIfVerificationResult | None:
+        if value is None:
+            return None
+        if isinstance(value, RecommendationWhatIfVerificationResult):
+            return value.model_copy(deep=True)
+        if isinstance(value, dict):
+            return RecommendationWhatIfVerificationResult.model_validate(value)
+        raise ValueError(
+            "recommendation_verification must be "
+            "RecommendationWhatIfVerificationResult or None, "
+            f"got {type(value).__name__}"
+        )
+
     @field_validator("selected_industry", "selected_supervised_model_key",
                      "selected_anomaly_model_key", mode="before")
     @classmethod
@@ -1719,6 +1797,11 @@ class AnalysisWorkflowReport(BaseModel):
             "cohort_filter_summary must be CohortFilterSummary, "
             f"got {type(value).__name__}"
         )
+
+    @field_validator("dataset_fingerprint", mode="before")
+    @classmethod
+    def _validate_dataset_fingerprint(cls, value: object) -> str | None:
+        return normalize_optional_dataset_fingerprint(value)
 
     @field_validator("anomaly_events", mode="before")
     @classmethod
@@ -1929,9 +2012,13 @@ class AnalysisWorkflowReport(BaseModel):
             )
 
         if self.status is AnalysisWorkflowStatus.COMPLETED:
-            if self.terminal_stage is not AnalysisWorkflowStage.RECOMMENDATION:
+            if self.terminal_stage not in {
+                AnalysisWorkflowStage.RECOMMENDATION,
+                AnalysisWorkflowStage.WHAT_IF_VERIFICATION,
+            }:
                 raise ValueError(
-                    "COMPLETED status requires terminal_stage RECOMMENDATION"
+                    "COMPLETED status requires terminal_stage RECOMMENDATION "
+                    "or WHAT_IF_VERIFICATION"
                 )
             if self.final_recommendation is None:
                 raise ValueError(
@@ -1955,6 +2042,11 @@ class AnalysisWorkflowReport(BaseModel):
                 raise ValueError(
                     "PARTIAL without final_recommendation cannot terminate at "
                     "RECOMMENDATION"
+                )
+            elif self.terminal_stage is AnalysisWorkflowStage.WHAT_IF_VERIFICATION:
+                raise ValueError(
+                    "PARTIAL without final_recommendation cannot terminate at "
+                    "WHAT_IF_VERIFICATION"
                 )
         elif self.status is AnalysisWorkflowStatus.REFUSED:
             if self.final_recommendation is not None:

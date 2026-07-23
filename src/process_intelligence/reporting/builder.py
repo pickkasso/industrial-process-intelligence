@@ -19,6 +19,10 @@ from process_intelligence.recommendation.schemas import (
     RecommendationChange,
     RecommendationResult,
 )
+from process_intelligence.recommendation.what_if_verification import (
+    RecommendationWhatIfVerificationResult,
+    WhatIfVerificationScenario,
+)
 from process_intelligence.reporting.schemas import (
     AnomalyContextIdentifierValueView,
     AnomalyContextRowView,
@@ -30,6 +34,8 @@ from process_intelligence.reporting.schemas import (
     PerformanceMetricView,
     RecommendationChangeView,
     RecommendationView,
+    RecommendationWhatIfVerificationView,
+    WhatIfVerificationScenarioView,
     WorkflowCohortFilterSummaryView,
     WorkflowDataSummaryView,
     WorkflowModelSummaryView,
@@ -38,6 +44,7 @@ from process_intelligence.reporting.schemas import (
     WorkflowPresentationReport,
     WorkflowRoutingSummaryView,
     WorkflowStageView,
+    stability_classification_message,
     stage_status_label,
 )
 from process_intelligence.workflow.enums import AnalysisExecutionMode, AnalysisWorkflowStatus
@@ -732,6 +739,7 @@ def _build_recommendation_view(
 ) -> RecommendationView:
     return RecommendationView(
         status=recommendation.status,
+        objective=recommendation.objective,
         changes=[_build_change_view(change) for change in recommendation.changes],
         confidence=recommendation.confidence,
         baseline_prediction=recommendation.baseline_prediction,
@@ -745,6 +753,55 @@ def _build_recommendation_view(
         warnings=list(recommendation.warnings),
         safety_status=recommendation.safety_decision.status,
         safety_messages=list(recommendation.safety_decision.messages),
+    )
+
+
+def _build_what_if_scenario_view(
+    scenario: WhatIfVerificationScenario,
+) -> WhatIfVerificationScenarioView:
+    perturbed_value = None
+    if scenario.perturbed_variable is not None:
+        perturbed_value = scenario.variable_values.get(scenario.perturbed_variable)
+    return WhatIfVerificationScenarioView(
+        scenario_id=scenario.scenario_id,
+        scenario_type=scenario.scenario_type,
+        perturbed_variable=scenario.perturbed_variable,
+        perturbation_direction=scenario.perturbation_direction,
+        perturbed_value=perturbed_value,
+        variable_values=dict(scenario.variable_values),
+        predicted_quality=scenario.predicted_quality,
+        anomaly_score=scenario.anomaly_score,
+        objective_value=scenario.objective_value,
+        improves_over_baseline=scenario.improves_over_baseline,
+        improves_or_matches_proposed=scenario.improves_or_matches_proposed,
+        extrapolated=scenario.extrapolated,
+        warnings=list(scenario.warnings),
+    )
+
+
+def _build_recommendation_verification_view(
+    verification: RecommendationWhatIfVerificationResult,
+) -> RecommendationWhatIfVerificationView:
+    return RecommendationWhatIfVerificationView(
+        status=verification.status,
+        objective=verification.objective,
+        baseline_objective_value=verification.baseline_objective_value,
+        proposed_objective_value=verification.proposed_objective_value,
+        scenario_count=verification.scenario_count,
+        neighbor_scenario_count=verification.neighbor_scenario_count,
+        improving_neighbor_count=verification.improving_neighbor_count,
+        non_improving_neighbor_count=verification.non_improving_neighbor_count,
+        extrapolated_scenario_count=verification.extrapolated_scenario_count,
+        stability_classification=verification.stability_classification,
+        stability_message=stability_classification_message(
+            verification.stability_classification
+        ),
+        scenarios=[
+            _build_what_if_scenario_view(scenario)
+            for scenario in verification.scenarios
+        ],
+        warnings=list(verification.warnings),
+        rationale=verification.rationale,
     )
 
 
@@ -1099,6 +1156,12 @@ class AnalysisWorkflowReportBuilder:
                 workflow_report.final_recommendation
             )
 
+        recommendation_verification: RecommendationWhatIfVerificationView | None = None
+        if workflow_report.recommendation_verification is not None:
+            recommendation_verification = _build_recommendation_verification_view(
+                workflow_report.recommendation_verification
+            )
+
         warnings = _aggregate_warnings(
             workflow_report,
             model_performance=model_performance,
@@ -1123,9 +1186,11 @@ class AnalysisWorkflowReportBuilder:
             diagnosis_factors=diagnosis_factors,
             anomaly_context_windows=anomaly_context_windows,
             recommendation=recommendation,
+            recommendation_verification=recommendation_verification,
             warnings=warnings,
             disclaimers=disclaimers,
             metadata=metadata,
+            dataset_fingerprint=workflow_report.dataset_fingerprint,
         )
         return WorkflowPresentationOutcome(report=presentation)
 

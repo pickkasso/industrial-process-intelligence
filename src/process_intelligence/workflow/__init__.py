@@ -14,6 +14,12 @@ from process_intelligence.workflow.cohort_filter import (
     observed_numeric_range,
     preview_numeric_cohort_filter_row_count,
 )
+from process_intelligence.workflow.dataset_fingerprint import (
+    compute_dataset_content_fingerprint,
+    compute_dataset_content_fingerprint_from_bytes,
+    is_valid_dataset_fingerprint,
+    normalize_optional_dataset_fingerprint,
+)
 from process_intelligence.workflow.enums import (
     AnalysisExecutionMode,
     AnalysisWorkflowStage,
@@ -37,6 +43,7 @@ from process_intelligence.workflow.schemas import (
     AnomalyContextRow,
     AnomalyContextValue,
     AnomalyContextWindow,
+    AnomalyRecommendationConfig,
     CohortFilterSummary,
     NumericCohortFilter,
 )
@@ -57,6 +64,7 @@ __all__ = [
     "AnomalyContextRow",
     "AnomalyContextValue",
     "AnomalyContextWindow",
+    "AnomalyRecommendationConfig",
     "CohortFilterSummary",
     "IndustrialProcessAnalysisWorkflow",
     "NumericCohortFilter",
@@ -64,7 +72,11 @@ __all__ = [
     "OperatingPointSelectionMode",
     "TaskSelectionSource",
     "apply_numeric_cohort_filter",
+    "compute_dataset_content_fingerprint",
+    "compute_dataset_content_fingerprint_from_bytes",
+    "is_valid_dataset_fingerprint",
     "list_numeric_cohort_filter_candidates",
+    "normalize_optional_dataset_fingerprint",
     "observed_numeric_range",
     "preview_numeric_cohort_filter_row_count",
 ]

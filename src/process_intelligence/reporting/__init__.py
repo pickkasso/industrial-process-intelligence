@@ -1,21 +1,32 @@
-"""Public API for workflow presentation reporting (Step 11A).
+"""Public API for workflow presentation reporting (Step 11A / 11B.11).
 
-Exposes JSON-safe presentation DTOs and ``AnalysisWorkflowReportBuilder``.
-Does not expose Streamlit, REST, CLI, persistence, or rendering helpers.
+Exposes JSON-safe presentation DTOs, ``AnalysisWorkflowReportBuilder``, and
+anomaly-run comparison helpers. Does not expose Streamlit, REST, CLI,
+persistence, or rendering helpers.
 """
 
 from process_intelligence.reporting.builder import AnalysisWorkflowReportBuilder
+from process_intelligence.reporting.comparison import build_anomaly_run_comparison
 from process_intelligence.reporting.schemas import (
     AnomalyContextIdentifierValueView,
     AnomalyContextRowView,
     AnomalyContextValueView,
     AnomalyContextWindowView,
     AnomalyEventView,
+    AnomalyRunComparisonView,
+    DiagnosisFactorComparisonView,
+    DiagnosisFactorPresenceStatus,
     DiagnosisFactorView,
+    EventOverlapEntryView,
+    EventOverlapPresenceStatus,
+    EventOverlapView,
     ModelPerformanceView,
     PerformanceMetricView,
     RecommendationChangeView,
     RecommendationView,
+    RecommendationWhatIfVerificationView,
+    RunConfigurationComparisonView,
+    WhatIfVerificationScenarioView,
     WorkflowCohortFilterSummaryView,
     WorkflowDataSummaryView,
     WorkflowModelSummaryView,
@@ -24,6 +35,7 @@ from process_intelligence.reporting.schemas import (
     WorkflowPresentationReport,
     WorkflowRoutingSummaryView,
     WorkflowStageView,
+    stability_classification_message,
 )
 
 __all__ = [
@@ -33,11 +45,20 @@ __all__ = [
     "AnomalyContextValueView",
     "AnomalyContextWindowView",
     "AnomalyEventView",
+    "AnomalyRunComparisonView",
+    "DiagnosisFactorComparisonView",
+    "DiagnosisFactorPresenceStatus",
     "DiagnosisFactorView",
+    "EventOverlapEntryView",
+    "EventOverlapPresenceStatus",
+    "EventOverlapView",
     "ModelPerformanceView",
     "PerformanceMetricView",
     "RecommendationChangeView",
+    "RecommendationWhatIfVerificationView",
     "RecommendationView",
+    "RunConfigurationComparisonView",
+    "WhatIfVerificationScenarioView",
     "WorkflowCohortFilterSummaryView",
     "WorkflowDataSummaryView",
     "WorkflowModelSummaryView",
@@ -46,4 +67,6 @@ __all__ = [
     "WorkflowPresentationReport",
     "WorkflowRoutingSummaryView",
     "WorkflowStageView",
+    "build_anomaly_run_comparison",
+    "stability_classification_message",
 ]

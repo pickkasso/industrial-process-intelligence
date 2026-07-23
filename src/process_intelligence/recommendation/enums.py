@@ -66,3 +66,53 @@ class RecommendationReasonCode(StrEnum):
     CANDIDATE_LIMIT_EXCEEDED = "CANDIDATE_LIMIT_EXCEEDED"
     NO_ELIGIBLE_VARIABLES = "NO_ELIGIBLE_VARIABLES"
     PARTIAL_ELIGIBILITY = "PARTIAL_ELIGIBILITY"
+
+
+class WhatIfVerificationScenarioType(StrEnum):
+    """Scenario role inside local recommendation what-if verification.
+
+    ``BASELINE`` is the unchanged operating point. ``PROPOSED_CENTER`` is the
+    generated recommendation. Neighbor types are one-factor-at-a-time adjacent
+    constraint-grid points around the proposed center.
+    """
+
+    BASELINE = "BASELINE"
+    PROPOSED_CENTER = "PROPOSED_CENTER"
+    LOWER_NEIGHBOR = "LOWER_NEIGHBOR"
+    UPPER_NEIGHBOR = "UPPER_NEIGHBOR"
+
+
+class WhatIfPerturbationDirection(StrEnum):
+    """Direction of an adjacent-grid neighbor relative to the proposed value."""
+
+    LOWER = "LOWER"
+    UPPER = "UPPER"
+
+
+class WhatIfVerificationStatus(StrEnum):
+    """Outcome status for recommendation local what-if verification.
+
+    ``COMPLETED`` means local neighbor scenarios were scored. ``NOT_APPLICABLE``
+    means verification was intentionally skipped because no generated
+    recommendation was available. ``UNAVAILABLE`` means required inputs could
+    not be assembled or scoring failed structurally.
+    """
+
+    COMPLETED = "COMPLETED"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class WhatIfStabilityClassification(StrEnum):
+    """Deterministic local stability label for a generated recommendation.
+
+    Labels describe model-local adjacent-grid behavior only. They do not assert
+    physical robustness, process safety, causation, or deployment readiness.
+    """
+
+    STABLE = "STABLE"
+    MIXED = "MIXED"
+    ISOLATED = "ISOLATED"
+    NOT_IMPROVING = "NOT_IMPROVING"
+    NO_NEIGHBORS = "NO_NEIGHBORS"
+    UNAVAILABLE = "UNAVAILABLE"

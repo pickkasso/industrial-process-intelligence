@@ -29,10 +29,11 @@ from typing import NoReturn, TypeVar
 
 import polars as pl
 
-from process_intelligence.core.enums import AnalysisTask, AnomalyType
+from process_intelligence.core.enums import AnalysisTask, AnomalyType, ColumnRole
 from process_intelligence.core.exceptions import (
     DataValidationError,
     InsufficientDataError,
+    ProcessIntelligenceError,
 )
 from process_intelligence.core.protocols import BaseIndustryProfile
 from process_intelligence.core.schemas import (
@@ -95,14 +96,27 @@ from process_intelligence.models import (
 )
 from process_intelligence.recommendation import (
     CandidateScenarioScorer,
+    QualityOptimizationDirection,
     RecommendationObjective,
     RecommendationPipeline,
     RecommendationPipelineRequest,
+    RecommendationReasonCode,
     RecommendationRequest,
     RecommendationResult,
     RecommendationSafetyContext,
+    RecommendationSafetyDecision,
     RecommendationSafetyGate,
+    RecommendationSafetyPolicy,
+    RecommendationSafetyStatus,
     RecommendationStatus,
+    RecommendationWhatIfVerifier,
+    WhatIfVerificationStatus,
+    recommendation_warnings_for_stability,
+)
+from process_intelligence.recommendation.candidate_grid import CandidateGridReport
+from process_intelligence.recommendation.schemas import DEFAULT_RECOMMENDATION_DISCLAIMER
+from process_intelligence.recommendation.what_if_verification import (
+    RecommendationWhatIfVerificationResult,
 )
 from process_intelligence.routing import (
     AnalysisTaskRouter,
@@ -113,6 +127,9 @@ from process_intelligence.routing import (
 )
 from process_intelligence.workflow.anomaly_context import build_anomaly_context_windows
 from process_intelligence.workflow.cohort_filter import apply_numeric_cohort_filter
+from process_intelligence.workflow.dataset_fingerprint import (
+    compute_dataset_content_fingerprint,
+)
 from process_intelligence.workflow.enums import (
     AnalysisExecutionMode,
     AnalysisWorkflowStage,
@@ -144,6 +161,20 @@ _ANOMALY_ONLY_OVERVIEW = (
     "Anomaly-only analysis completed. Recommendation generation is not "
     "enabled for this analysis mode."
 )
+_ANOMALY_ONLY_RECOMMENDATION_DISABLED = (
+    "Recommendation generation is not enabled for anomaly-only analysis."
+)
+_ANOMALY_ONLY_NO_ELIGIBLE = (
+    "No eligible verified controllable variable was available for "
+    "anomaly-score reduction recommendation."
+)
+_ANOMALY_RECOMMENDATION_ASSOCIATION_NOTE = (
+    "Diagnosis factors are associations, not established causes; "
+    "recommendation candidates are limited to the intersection of diagnosis "
+    "factors with explicitly confirmed, verified, and constrained controllable "
+    "process inputs."
+)
+_CONTROLLABLE_PROCESS_ROLES = frozenset({ColumnRole.CONTROLLABLE_PROCESS})
 _SELECTION_SOURCE_UNSUPERVISED = "UNSUPERVISED_ANOMALY_SCORE"
 _DIAGNOSIS_SOURCE_ROBUST = "ROBUST_GROUP_COMPARISON"
 
@@ -196,6 +227,7 @@ class _RunState:
     anomaly_context_windows: list[AnomalyContextWindow] = field(default_factory=list)
     context_warnings: list[str] = field(default_factory=list)
     raw_csv_loaded: bool = False
+    dataset_fingerprint: str | None = None
     supervised_model_available: bool = False
     anomaly_model_available: bool = False
     residual_calibration_performed: bool = False
@@ -206,6 +238,7 @@ class _RunState:
     row_identity_preserved: bool = False
     model_performance_assessment: ModelPerformanceAcceptanceReport | None = None
     final_recommendation: RecommendationResult | None = None
+    recommendation_verification: RecommendationWhatIfVerificationResult | None = None
     analysis_mode: AnalysisExecutionMode = AnalysisExecutionMode.SUPERVISED
     recommendation_applicable: bool = True
     diagnosis_source: str | None = None
@@ -466,7 +499,9 @@ class IndustrialProcessAnalysisWorkflow:
         state.feature_count = len(feature_columns)
         anomaly_only = request.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
         if anomaly_only:
-            state.recommendation_applicable = False
+            state.recommendation_applicable = bool(
+                request.anomaly_recommendation.enabled
+            )
             state.target_suitable = None
             state.target_suitability_message = "NOT_APPLICABLE"
         else:
@@ -479,6 +514,15 @@ class IndustrialProcessAnalysisWorkflow:
                 state,
                 AnalysisWorkflowStage.LOAD,
                 "The requested CSV file does not exist or is not a regular file.",
+            )
+        load_warnings: list[str] = []
+        try:
+            state.dataset_fingerprint = compute_dataset_content_fingerprint(csv_path)
+        except (OSError, ValueError, TypeError) as exc:
+            state.dataset_fingerprint = None
+            load_warnings.append(
+                "Dataset content fingerprint could not be computed "
+                f"({type(exc).__name__}); run comparison will be unavailable."
             )
         loaded = self._loader.load(csv_path)
         loaded_frame = loaded.frame
@@ -499,6 +543,7 @@ class IndustrialProcessAnalysisWorkflow:
             f"Loaded raw CSV dataset '{metadata.file_name}' with "
             f"{loaded_frame.height} rows.",
             row_count=loaded_frame.height,
+            warnings=load_warnings,
             metadata={"column_count": len(loaded_frame.columns)},
         )
 
@@ -1452,38 +1497,57 @@ class IndustrialProcessAnalysisWorkflow:
 
         # --- RECOMMENDATION ---
         if anomaly_only:
-            operating_request = request
-            if (
-                request.operating_point_selection
-                is OperatingPointSelectionMode.TOP_RESIDUAL_ANOMALY
-            ):
-                operating_request = request.model_copy(
-                    update={
-                        "operating_point_selection": (
-                            OperatingPointSelectionMode.TOP_UNSUPERVISED_ANOMALY
-                        )
-                    }
+            if not request.anomaly_recommendation.enabled:
+                operating_request = request
+                if (
+                    request.operating_point_selection
+                    is OperatingPointSelectionMode.TOP_RESIDUAL_ANOMALY
+                ):
+                    operating_request = request.model_copy(
+                        update={
+                            "operating_point_selection": (
+                                OperatingPointSelectionMode.TOP_UNSUPERVISED_ANOMALY
+                            )
+                        }
+                    )
+                selected_row_id, _baseline, operating_warnings = _select_operating_point(
+                    request=operating_request,
+                    residual_test=anomaly_final.test_scored,
+                    anomaly_test=anomaly_final.test_scored,
+                    test_frame=anomaly_final.test_scored,
+                    feature_columns=feature_columns,
                 )
-            selected_row_id, _baseline, operating_warnings = _select_operating_point(
-                request=operating_request,
-                residual_test=anomaly_final.test_scored,
-                anomaly_test=anomaly_final.test_scored,
-                test_frame=anomaly_final.test_scored,
-                feature_columns=feature_columns,
-            )
-            state.selected_operating_row_id = selected_row_id
-            self._skip(
-                state,
-                AnalysisWorkflowStage.RECOMMENDATION,
-                _SKIPPED_NOT_APPLICABLE,
-                warnings=operating_warnings,
-                metadata={
-                    "recommendation_applicable": False,
-                    "operating_row_id": _scalar_row_id(selected_row_id),
-                    "overview_message": _ANOMALY_ONLY_OVERVIEW,
-                },
-            )
-            state.status = AnalysisWorkflowStatus.PARTIAL
+                state.selected_operating_row_id = selected_row_id
+                self._skip(
+                    state,
+                    AnalysisWorkflowStage.RECOMMENDATION,
+                    _ANOMALY_ONLY_RECOMMENDATION_DISABLED,
+                    warnings=operating_warnings,
+                    metadata={
+                        "recommendation_applicable": False,
+                        "operating_row_id": _scalar_row_id(selected_row_id),
+                        "overview_message": _ANOMALY_ONLY_OVERVIEW,
+                    },
+                )
+                self._skip(
+                    state,
+                    AnalysisWorkflowStage.WHAT_IF_VERIFICATION,
+                    "What-if verification was not applicable because no "
+                    "recommendation was generated.",
+                    metadata={"recommendation_applicable": False},
+                )
+                state.status = AnalysisWorkflowStatus.PARTIAL
+            else:
+                self._run_anomaly_recommendation(
+                    request,
+                    policy=policy,
+                    state=state,
+                    feature_columns=feature_columns,
+                    industry_profile=industry_profile,
+                    leakage_report=leakage_report,
+                    anomaly_final=anomaly_final,
+                    diagnosis_result=diagnosis_result,
+                )
         else:
             assert supervised_final is not None
             assert residual_final is not None
@@ -1498,6 +1562,398 @@ class IndustrialProcessAnalysisWorkflow:
                 anomaly_final=anomaly_final,
                 residual_final=residual_final,
                 diagnosis_result=diagnosis_result,
+            )
+
+    def _run_anomaly_recommendation(
+        self,
+        request: AnalysisWorkflowRequest,
+        *,
+        policy: AnalysisWorkflowPolicy,
+        state: _RunState,
+        feature_columns: list[str],
+        industry_profile: BaseIndustryProfile,
+        leakage_report: LeakageReport,
+        anomaly_final: AnomalyFinalEvaluationOutcome,
+        diagnosis_result: DiagnosisResult,
+    ) -> None:
+        """Run REDUCE_ANOMALY_SCORE recommendation for ANOMALY_ONLY mode.
+
+        Uses the already-fitted selected anomaly model. Does not refit or
+        reselect models and does not require supervised performance acceptance.
+        """
+        del policy  # stage-output retention remains on RecommendationPipelinePolicy
+
+        operating_request = request
+        if (
+            request.operating_point_selection
+            is OperatingPointSelectionMode.TOP_RESIDUAL_ANOMALY
+        ):
+            operating_request = request.model_copy(
+                update={
+                    "operating_point_selection": (
+                        OperatingPointSelectionMode.TOP_UNSUPERVISED_ANOMALY
+                    )
+                }
+            )
+        selected_row_id, baseline, operating_warnings = _select_operating_point(
+            request=operating_request,
+            residual_test=anomaly_final.test_scored,
+            anomaly_test=anomaly_final.test_scored,
+            test_frame=anomaly_final.test_scored,
+            feature_columns=feature_columns,
+        )
+        state.selected_operating_row_id = selected_row_id
+
+        fitted_model = anomaly_final.final_model
+        if fitted_model is None:
+            self._refuse(
+                state,
+                AnalysisWorkflowStage.RECOMMENDATION,
+                "A fitted selected anomaly model is required before anomaly-only "
+                "recommendation generation.",
+                warnings=operating_warnings,
+                metadata={"operating_row_id": _scalar_row_id(selected_row_id)},
+            )
+
+        eligible_variables = _select_anomaly_recommendation_candidates(
+            request=request,
+            feature_columns=feature_columns,
+            diagnosis_result=diagnosis_result,
+            baseline=baseline,
+        )
+        association_warnings = list(operating_warnings)
+        _append_unique_warning(
+            association_warnings,
+            _ANOMALY_RECOMMENDATION_ASSOCIATION_NOTE,
+        )
+
+        factors_for_request = _apply_role_overrides_to_diagnosis_factors(
+            diagnosis_result.factors,
+            role_overrides=request.column_role_overrides,
+        )
+        diagnosis_for_request = DiagnosisResult(
+            anomaly_id=diagnosis_result.anomaly_id,
+            task=AnalysisTask.UNSUPERVISED_ANOMALY,
+            method_used=list(diagnosis_result.method_used),
+            scope=diagnosis_result.scope,
+            factors=factors_for_request,
+            confidence=float(diagnosis_result.confidence),
+            analyzed_row_count=diagnosis_result.analyzed_row_count,
+            reference_row_count=max(diagnosis_result.reference_row_count, 5),
+            caveats=list(diagnosis_result.caveats),
+            generated_at=datetime.now(tz=UTC),
+            metadata=dict(diagnosis_result.metadata),
+        )
+
+        if not eligible_variables:
+            safety_context = RecommendationSafetyContext(
+                leakage_report=leakage_report,
+                final_evaluation_available=True,
+                model_performance_acceptable=False,
+                model_performance_reason=(
+                    "Model performance acceptance: NOT_APPLICABLE for "
+                    "anomaly-only recommendation."
+                ),
+                extrapolation_detected=False,
+                uncertainty_available=False,
+                uncertainty_acceptable=None,
+                metadata={
+                    "workflow_stage": AnalysisWorkflowStage.RECOMMENDATION.value,
+                    "model_performance_status": "NOT_APPLICABLE",
+                    "model_performance_gate_bypassed": True,
+                    "anomaly_model_selected_label_free": True,
+                    "recommendation_safety_depends_on_user_constraints": True,
+                },
+            )
+            placeholder_values = {
+                name: baseline[name]
+                for name in feature_columns
+                if name in baseline
+            }
+            if not placeholder_values:
+                self._refuse(
+                    state,
+                    AnalysisWorkflowStage.RECOMMENDATION,
+                    "No operating-point feature values were available for "
+                    "anomaly-only recommendation eligibility evaluation.",
+                    warnings=association_warnings,
+                    metadata={"operating_row_id": _scalar_row_id(selected_row_id)},
+                )
+            recommendation_request = RecommendationRequest(
+                task=AnalysisTask.UNSUPERVISED_ANOMALY,
+                diagnosis=diagnosis_for_request,
+                objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+                current_values=placeholder_values,
+                constraints=[],
+                user_confirmed_controllable_variables=[],
+                user_verified_variables=[],
+                max_simultaneous_changes=1,
+                metadata={
+                    "workflow_stage": AnalysisWorkflowStage.RECOMMENDATION.value,
+                    "anomaly_recommendation_enabled": True,
+                },
+            )
+            safety_gate = RecommendationSafetyGate(
+                policy=RecommendationSafetyPolicy(
+                    require_acceptable_model_performance=False,
+                )
+            )
+            safety_decision = safety_gate.evaluate(
+                recommendation_request,
+                context=safety_context,
+            )
+            if safety_decision.status is not RecommendationSafetyStatus.REFUSED:
+                reason_codes = list(safety_decision.global_reason_codes)
+                if RecommendationReasonCode.NO_ELIGIBLE_VARIABLES not in reason_codes:
+                    reason_codes.append(RecommendationReasonCode.NO_ELIGIBLE_VARIABLES)
+                safety_decision = RecommendationSafetyDecision(
+                    status=RecommendationSafetyStatus.REFUSED,
+                    objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+                    eligible_variables=[],
+                    blocked_variables=list(safety_decision.blocked_variables),
+                    variable_assessments=[
+                        item.model_copy(deep=True)
+                        for item in safety_decision.variable_assessments
+                    ],
+                    global_reason_codes=reason_codes,
+                    messages=[
+                        *list(safety_decision.messages),
+                        _ANOMALY_ONLY_NO_ELIGIBLE,
+                    ],
+                    disclaimer=DEFAULT_RECOMMENDATION_DISCLAIMER,
+                    evaluated_at=datetime.now(tz=UTC),
+                    metadata=dict(safety_decision.metadata),
+                )
+            final_result = RecommendationResult(
+                status=RecommendationStatus.REFUSED,
+                objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+                safety_decision=safety_decision,
+                changes=[],
+                baseline_prediction=None,
+                proposed_prediction=None,
+                baseline_anomaly_score=None,
+                proposed_anomaly_score=None,
+                confidence=0.0,
+                extrapolation_flag=False,
+                uncertainty_available=False,
+                disclaimer=DEFAULT_RECOMMENDATION_DISCLAIMER,
+                generated_at=datetime.now(tz=UTC),
+                warnings=list(association_warnings),
+                metadata={
+                    "recommendation_generated": False,
+                    "model_refit_performed": False,
+                    "anomaly_recommendation_enabled": True,
+                    "eligible_candidate_count": 0,
+                },
+            )
+            state.final_recommendation = final_result
+            state.recommendation_pipeline_executed = False
+            state.status = AnalysisWorkflowStatus.REFUSED
+            self._record(
+                state,
+                AnalysisWorkflowStage.RECOMMENDATION,
+                succeeded=False,
+                structured_refusal=True,
+                message=_ANOMALY_ONLY_NO_ELIGIBLE,
+                warnings=association_warnings,
+                metadata={
+                    "recommendation_status": final_result.status.value,
+                    "operating_row_id": _scalar_row_id(selected_row_id),
+                    "eligible_candidate_count": 0,
+                    "model_performance_status": "NOT_APPLICABLE",
+                },
+            )
+            self._skip_what_if_verification(
+                state,
+                reason=(
+                    "What-if verification was not applicable because "
+                    "recommendation was refused."
+                ),
+            )
+            return
+
+        current_values = {name: baseline[name] for name in eligible_variables}
+        recommendation_max_changes = min(
+            request.max_simultaneous_changes,
+            len(current_values),
+        )
+        constraints_for_request = [
+            constraint.model_copy(deep=True)
+            for constraint in request.request_constraints
+            if constraint.variable in current_values
+        ]
+        confirmed_controllable = [
+            name
+            for name in request.user_confirmed_controllable_variables
+            if name in current_values
+        ]
+        verified_variables = [
+            name
+            for name in request.user_verified_variables
+            if name in current_values
+        ]
+        recommendation_request = RecommendationRequest(
+            task=AnalysisTask.UNSUPERVISED_ANOMALY,
+            diagnosis=diagnosis_for_request,
+            objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+            current_values=current_values,
+            constraints=constraints_for_request,
+            user_confirmed_controllable_variables=confirmed_controllable,
+            user_verified_variables=verified_variables,
+            max_simultaneous_changes=recommendation_max_changes,
+            metadata={
+                "workflow_stage": AnalysisWorkflowStage.RECOMMENDATION.value,
+                "anomaly_recommendation_enabled": True,
+            },
+        )
+        safety_context = RecommendationSafetyContext(
+            leakage_report=leakage_report,
+            final_evaluation_available=True,
+            model_performance_acceptable=False,
+            model_performance_reason=(
+                "Model performance acceptance: NOT_APPLICABLE for "
+                "anomaly-only recommendation. Anomaly model was selected "
+                "through label-free validation screening. Recommendation "
+                "safety depends on explicit user constraints and "
+                "model-domain checks."
+            ),
+            extrapolation_detected=False,
+            uncertainty_available=False,
+            uncertainty_acceptable=None,
+            metadata={
+                "workflow_stage": AnalysisWorkflowStage.RECOMMENDATION.value,
+                "model_performance_status": "NOT_APPLICABLE",
+                "model_performance_gate_bypassed": True,
+                "anomaly_model_selected_label_free": True,
+                "recommendation_safety_depends_on_user_constraints": True,
+            },
+        )
+        industry_constraints = _resolve_industry_constraints(
+            request=request,
+            industry_profile=industry_profile,
+            feature_columns=feature_columns,
+        )
+        user_overrides = [
+            constraint.model_copy(deep=True) for constraint in request.user_overrides
+        ]
+        scorer = CandidateScenarioScorer(
+            quality_model=None,
+            anomaly_model=fitted_model,
+        )
+        safety_gate = RecommendationSafetyGate(
+            policy=RecommendationSafetyPolicy(
+                require_acceptable_model_performance=False,
+            )
+        )
+        pipeline = RecommendationPipeline(
+            scenario_scorer=scorer,
+            safety_gate=safety_gate,
+        )
+        pipeline_request = RecommendationPipelineRequest(
+            recommendation_request=recommendation_request,
+            safety_context=safety_context,
+            industry_constraints=industry_constraints,
+            user_overrides=user_overrides,
+            feature_columns=list(feature_columns),
+            baseline_features=dict(baseline),
+            target_column=None,
+            quality_direction=None,
+            quality_target=None,
+            extrapolation_evaluated=False,
+            extrapolation_flag=False,
+            uncertainty_available=False,
+            uncertainty_acceptable=None,
+            metadata={
+                "workflow_stage": AnalysisWorkflowStage.RECOMMENDATION.value,
+                "anomaly_recommendation_enabled": True,
+            },
+        )
+        outcome = pipeline.run(pipeline_request)
+        final_result = outcome.report.final_result
+        state.recommendation_pipeline_executed = True
+        state.final_recommendation = final_result
+
+        pipeline_warnings = list(association_warnings)
+        pipeline_warnings.extend(outcome.report.warnings)
+
+        if final_result.status is RecommendationStatus.GENERATED:
+            state.status = AnalysisWorkflowStatus.COMPLETED
+            state.recommendation_generated = True
+            self._ok(
+                state,
+                AnalysisWorkflowStage.RECOMMENDATION,
+                "Generated anomaly-score reduction recommendations with the "
+                "fitted anomaly model.",
+                warnings=pipeline_warnings,
+                metadata={
+                    "recommendation_status": final_result.status.value,
+                    "operating_row_id": _scalar_row_id(selected_row_id),
+                    "change_count": len(final_result.changes),
+                    "eligible_candidate_count": len(eligible_variables),
+                    "model_performance_status": "NOT_APPLICABLE",
+                    "objective": RecommendationObjective.REDUCE_ANOMALY_SCORE.value,
+                },
+            )
+            self._run_what_if_verification(
+                state,
+                recommendation=final_result,
+                grid_report=outcome.report.grid_report,
+                scenario_scorer=scorer,
+                feature_columns=list(feature_columns),
+                baseline_features=dict(baseline),
+                quality_direction=None,
+                quality_target=None,
+                target_column=None,
+            )
+        elif final_result.status is RecommendationStatus.READY_FOR_OPTIMIZATION:
+            state.status = AnalysisWorkflowStatus.PARTIAL
+            self._ok(
+                state,
+                AnalysisWorkflowStage.RECOMMENDATION,
+                "The anomaly-only recommendation pipeline determined the case "
+                "is ready for optimization but did not emit concrete changes.",
+                warnings=pipeline_warnings,
+                metadata={
+                    "recommendation_status": final_result.status.value,
+                    "operating_row_id": _scalar_row_id(selected_row_id),
+                    "eligible_candidate_count": len(eligible_variables),
+                    "model_performance_status": "NOT_APPLICABLE",
+                    "objective": RecommendationObjective.REDUCE_ANOMALY_SCORE.value,
+                },
+            )
+            self._skip_what_if_verification(
+                state,
+                reason=(
+                    "What-if verification was not applicable because no "
+                    "recommendation was generated."
+                ),
+            )
+        else:
+            state.status = AnalysisWorkflowStatus.REFUSED
+            self._record(
+                state,
+                AnalysisWorkflowStage.RECOMMENDATION,
+                succeeded=False,
+                structured_refusal=True,
+                message=(
+                    "The anomaly-only recommendation pipeline refused to produce "
+                    "changes for safety reasons."
+                ),
+                warnings=pipeline_warnings,
+                metadata={
+                    "recommendation_status": final_result.status.value,
+                    "operating_row_id": _scalar_row_id(selected_row_id),
+                    "eligible_candidate_count": len(eligible_variables),
+                    "model_performance_status": "NOT_APPLICABLE",
+                    "objective": RecommendationObjective.REDUCE_ANOMALY_SCORE.value,
+                },
+            )
+            self._skip_what_if_verification(
+                state,
+                reason=(
+                    "What-if verification was not applicable because "
+                    "recommendation was refused."
+                ),
             )
 
     def _run_recommendation(
@@ -1710,6 +2166,17 @@ class IndustrialProcessAnalysisWorkflow:
                     "change_count": len(final_result.changes),
                 },
             )
+            self._run_what_if_verification(
+                state,
+                recommendation=final_result,
+                grid_report=outcome.report.grid_report,
+                scenario_scorer=scorer,
+                feature_columns=list(feature_columns),
+                baseline_features=dict(baseline),
+                quality_direction=quality_direction,
+                quality_target=request.quality_target,
+                target_column=target_column,
+            )
         elif final_result.status is RecommendationStatus.READY_FOR_OPTIMIZATION:
             state.status = AnalysisWorkflowStatus.PARTIAL
             self._ok(
@@ -1722,6 +2189,13 @@ class IndustrialProcessAnalysisWorkflow:
                     "recommendation_status": final_result.status.value,
                     "operating_row_id": _scalar_row_id(selected_row_id),
                 },
+            )
+            self._skip_what_if_verification(
+                state,
+                reason=(
+                    "What-if verification was not applicable because no "
+                    "recommendation was generated."
+                ),
             )
         else:
             state.status = AnalysisWorkflowStatus.REFUSED
@@ -1740,6 +2214,136 @@ class IndustrialProcessAnalysisWorkflow:
                     "operating_row_id": _scalar_row_id(selected_row_id),
                 },
             )
+            self._skip_what_if_verification(
+                state,
+                reason=(
+                    "What-if verification was not applicable because "
+                    "recommendation was refused."
+                ),
+            )
+
+    def _skip_what_if_verification(
+        self,
+        state: _RunState,
+        *,
+        reason: str,
+    ) -> None:
+        verifier = RecommendationWhatIfVerifier(
+            scenario_scorer=CandidateScenarioScorer(),
+        )
+        objective = (
+            state.final_recommendation.objective
+            if state.final_recommendation is not None
+            else RecommendationObjective.REDUCE_ANOMALY_SCORE
+        )
+        outcome = verifier.not_applicable(objective=objective, reason=reason)
+        state.recommendation_verification = outcome.result
+        self._skip(
+            state,
+            AnalysisWorkflowStage.WHAT_IF_VERIFICATION,
+            reason,
+            metadata={
+                "verification_status": outcome.result.status.value,
+                "stability_classification": (
+                    outcome.result.stability_classification.value
+                ),
+            },
+        )
+
+    def _run_what_if_verification(
+        self,
+        state: _RunState,
+        *,
+        recommendation: RecommendationResult,
+        grid_report: CandidateGridReport | None,
+        scenario_scorer: CandidateScenarioScorer,
+        feature_columns: list[str],
+        baseline_features: dict[str, float],
+        quality_direction: QualityOptimizationDirection | None,
+        quality_target: float | None,
+        target_column: str | None,
+    ) -> None:
+        verifier = RecommendationWhatIfVerifier(scenario_scorer=scenario_scorer)
+        try:
+            if grid_report is None:
+                outcome = verifier.unavailable(
+                    objective=recommendation.objective,
+                    reason=(
+                        "Candidate constraint grid is unavailable for local "
+                        "what-if verification."
+                    ),
+                )
+            else:
+                outcome = verifier.verify(
+                    recommendation=recommendation,
+                    grid_report=grid_report,
+                    feature_columns=feature_columns,
+                    baseline_features=baseline_features,
+                    quality_direction=quality_direction,
+                    quality_target=quality_target,
+                    target_column=target_column,
+                    extrapolation_flag=recommendation.extrapolation_flag,
+                )
+        except (
+            DataValidationError,
+            ProcessIntelligenceError,
+            TypeError,
+            ValueError,
+            ArithmeticError,
+        ) as exc:
+            outcome = verifier.unavailable(
+                objective=recommendation.objective,
+                reason=(
+                    "What-if verification raised a structured error "
+                    f"({type(exc).__name__}): {exc}"
+                ),
+            )
+
+        result = outcome.result
+        state.recommendation_verification = result
+
+        # Append MIXED/ISOLATED warnings onto the recommendation without mutating
+        # status, changes, or scores.
+        extra_warnings = recommendation_warnings_for_stability(
+            result.stability_classification
+        )
+        if extra_warnings and state.final_recommendation is not None:
+            merged = list(state.final_recommendation.warnings)
+            for warning in extra_warnings:
+                if warning not in merged:
+                    merged.append(warning)
+            state.final_recommendation = state.final_recommendation.model_copy(
+                update={"warnings": merged}
+            )
+
+        if result.status is WhatIfVerificationStatus.COMPLETED:
+            message = (
+                "Completed local what-if verification for the generated "
+                "recommendation using adjacent constraint-grid neighbors."
+            )
+        elif result.status is WhatIfVerificationStatus.UNAVAILABLE:
+            message = (
+                "Local what-if verification was unavailable for the generated "
+                "recommendation."
+            )
+        else:
+            message = (
+                "What-if verification was not applicable for the current "
+                "recommendation result."
+            )
+        self._ok(
+            state,
+            AnalysisWorkflowStage.WHAT_IF_VERIFICATION,
+            message,
+            warnings=list(result.warnings),
+            metadata={
+                "verification_status": result.status.value,
+                "stability_classification": result.stability_classification.value,
+                "scenario_count": result.scenario_count,
+                "neighbor_scenario_count": result.neighbor_scenario_count,
+                "model_refit_performed": False,
+            },
+        )
 
     def _resolve_diagnoser(
         self,
@@ -1892,6 +2496,7 @@ class IndustrialProcessAnalysisWorkflow:
             analysis_mode=state.analysis_mode,
             model_performance_assessment=state.model_performance_assessment,
             final_recommendation=state.final_recommendation,
+            recommendation_verification=state.recommendation_verification,
             selected_industry=state.selected_industry,
             selected_task=state.selected_task,
             inferred_task=state.inferred_task,
@@ -1929,6 +2534,7 @@ class IndustrialProcessAnalysisWorkflow:
                     null_excluded_count=0,
                 )
             ),
+            dataset_fingerprint=state.dataset_fingerprint,
             started_at=started_at,
             completed_at=completed_at,
             total_seconds=total_seconds,
@@ -2300,6 +2906,94 @@ def _build_diagnosis_frame(
         "highest residual-score row was marked as the diagnostic anomaly group."
     )
     return frame, warnings
+
+
+def _append_unique_warning(warnings: list[str], message: str) -> None:
+    if message not in warnings:
+        warnings.append(message)
+
+
+def _apply_role_overrides_to_diagnosis_factors(
+    factors: list[RootCauseFactor],
+    *,
+    role_overrides: dict[str, ColumnRole],
+) -> list[RootCauseFactor]:
+    """Return diagnosis factors with explicit role overrides applied.
+
+    Role override does not auto-confirm controllability or verification.
+    """
+    updated: list[RootCauseFactor] = []
+    for factor in factors:
+        override = role_overrides.get(factor.variable)
+        if override is None:
+            updated.append(factor.model_copy(deep=True))
+        else:
+            updated.append(factor.model_copy(update={"role": override}, deep=True))
+    return updated
+
+
+def _select_anomaly_recommendation_candidates(
+    *,
+    request: AnalysisWorkflowRequest,
+    feature_columns: list[str],
+    diagnosis_result: DiagnosisResult,
+    baseline: dict[str, float],
+) -> list[str]:
+    """Select ANOMALY_ONLY recommendation candidates by explicit intersection.
+
+    Candidates must appear in diagnosis factors and active features, use an
+    explicitly controllable process role, be confirmed/verified/constrained,
+    and must not be identifier, timestamp, excluded, or cohort-filter columns.
+    """
+    feature_set = set(feature_columns)
+    diagnosis_variables = {factor.variable for factor in diagnosis_result.factors}
+    confirmed = set(request.user_confirmed_controllable_variables)
+    verified = set(request.user_verified_variables)
+    constrained: dict[str, VariableConstraint] = {}
+    for constraint in request.request_constraints:
+        if (
+            constraint.variable in feature_set
+            and constraint.minimum is not None
+            and constraint.maximum is not None
+            and math.isfinite(float(constraint.minimum))
+            and math.isfinite(float(constraint.maximum))
+        ):
+            constrained[constraint.variable] = constraint
+
+    blocked_columns: set[str] = set(request.identifier_columns)
+    blocked_columns.update(request.excluded_columns)
+    if request.timestamp_column is not None:
+        blocked_columns.add(request.timestamp_column)
+    if request.cohort_filter is not None:
+        # Cohort conditioning columns are never anomaly-only recommendation
+        # candidates, regardless of exclude_filter_column_from_features.
+        blocked_columns.add(request.cohort_filter.column_name)
+
+    eligible: list[str] = []
+    for name in feature_columns:
+        if name not in diagnosis_variables:
+            continue
+        if name not in confirmed or name not in verified:
+            continue
+        if name not in constrained:
+            continue
+        if name in blocked_columns:
+            continue
+        role = request.column_role_overrides.get(name)
+        if role not in _CONTROLLABLE_PROCESS_ROLES:
+            continue
+        if name not in baseline:
+            continue
+        current_value = baseline[name]
+        constraint = constrained[name]
+        assert constraint.minimum is not None
+        assert constraint.maximum is not None
+        if current_value < float(constraint.minimum) or current_value > float(
+            constraint.maximum
+        ):
+            continue
+        eligible.append(name)
+    return eligible
 
 
 def _select_operating_point(

@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import csv
 import math
+import re
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from io import BytesIO, StringIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import altair as alt
 import pandas as pd  # type: ignore[import-untyped]
 import polars as pl
 import streamlit as st
@@ -35,18 +37,61 @@ from process_intelligence.recommendation import (
     QualityOptimizationDirection,
     RecommendationObjective,
     RecommendationStatus,
+    WhatIfVerificationStatus,
 )
 from process_intelligence.reporting import AnalysisWorkflowReportBuilder
+from process_intelligence.reporting.comparison import build_anomaly_run_comparison
 from process_intelligence.reporting.schemas import (
     AnomalyContextWindowView,
     AnomalyEventView,
+    AnomalyRunComparisonView,
+    DiagnosisFactorComparisonView,
+    DiagnosisFactorPresenceStatus,
     DiagnosisFactorView,
+    EventOverlapEntryView,
+    EventOverlapPresenceStatus,
+    EventOverlapView,
+    RecommendationWhatIfVerificationView,
     WorkflowPresentationReport,
 )
 from process_intelligence.ui.column_configuration import (
     AutomaticColumnConfigurator,
     UiColumnConfigurationReport,
     resolve_active_feature_columns,
+)
+from process_intelligence.ui.configuration_preset import (
+    CONFIGURATION_PRESET_FILENAME,
+    SESSION_ANOMALY_CONSTRAINT_VARIABLES_KEY,
+    SESSION_ANOMALY_RECOMMENDATION_ENABLED_KEY,
+    SESSION_CONFIRMED_CONTROLLABLE_KEY,
+    SESSION_CONSTRAINT_VARIABLES_KEY,
+    SESSION_EXPLICIT_FEATURES_KEY,
+    SESSION_EXPLICIT_ROW_ID_KEY,
+    SESSION_MAX_CHANGES_KEY,
+    SESSION_OBJECTIVE_KEY,
+    SESSION_OPERATING_MODE_KEY,
+    SESSION_PRESET_APPLY_SUMMARY_KEY,
+    SESSION_PRESET_MISSING_COLUMNS_KEY,
+    SESSION_PRESET_PARSED_KEY,
+    SESSION_PRESET_PENDING_APPLY_KEY,
+    SESSION_PRESET_VALIDATION_MESSAGE_KEY,
+    SESSION_PRESET_VALIDATION_OK_KEY,
+    SESSION_QUALITY_DIRECTION_KEY,
+    SESSION_QUALITY_TARGET_KEY,
+    SESSION_REQUESTED_TASK_KEY,
+    SESSION_ROLE_OVERRIDE_COLUMNS_KEY,
+    SESSION_RULE_COUNT_KEY,
+    SESSION_USE_RECOMMENDED_FEATURES_KEY,
+    SESSION_VERIFIED_VARIABLES_KEY,
+    ConfigurationPresetBuildResult,
+    WorkflowUiConfigurationPreset,
+    build_configuration_preset_session_updates,
+    build_configuration_preset_summary,
+    build_exportable_configuration_preset,
+    check_configuration_preset_column_compatibility,
+    clear_configuration_preset_widget_prefixes,
+    configuration_preset_to_json,
+    parse_configuration_preset_json,
 )
 from process_intelligence.ui.request_builder import WorkflowUiRequestBuilder
 from process_intelligence.ui.schemas import (
@@ -60,6 +105,7 @@ from process_intelligence.workflow import (
     ANOMALY_CONTEXT_RADIUS,
     AnalysisExecutionMode,
     AnalysisWorkflowOutcome,
+    AnalysisWorkflowStage,
     AnalysisWorkflowStatus,
     IndustrialProcessAnalysisWorkflow,
     NumericCohortFilter,
@@ -71,6 +117,8 @@ from process_intelligence.workflow import (
 
 _ORIGINAL_ROW_ID = "_original_row_id"
 _SESSION_REPORT_KEY = "last_presentation_report_json"
+_SESSION_BASELINE_REPORT_KEY = "comparison_baseline_report_json"
+_SESSION_BASELINE_LABEL_KEY = "comparison_baseline_label"
 _SESSION_COLUMNS_KEY = "ui_column_schema_fingerprint"
 _SESSION_ANALYSIS_MODE_KEY = "ui_analysis_mode"
 _SESSION_TARGET_KEY = "ui_target_column"
@@ -89,13 +137,86 @@ _TASK_HELP = (
     "AUTO uses the task router. "
     "REGRESSION predicts a continuous numeric target. "
     "CLASSIFICATION predicts discrete classes. "
-    "Classification modeling is not yet supported by this workflow."
+    "Unsupported tasks are refused by the current workflow."
+)
+_TARGET_CONSTANT_OPERATOR_MESSAGE = (
+    "The selected target has no usable variation. Choose a different target "
+    "or use anomaly-only analysis."
+)
+_TASK_UNSUPPORTED_OPERATOR_MESSAGE = (
+    "The selected analysis task is not supported by the current workflow."
+)
+_PERFORMANCE_RULE_INCOMPLETE_OPERATOR_MESSAGE = (
+    "Complete the metric name, direction, and finite threshold."
+)
+_CONSTRAINT_INCOMPLETE_OPERATOR_MESSAGE = (
+    "Complete or clear the selected process-variable constraint."
+)
+_COHORT_TOO_SMALL_OPERATOR_MESSAGE = (
+    "The selected operating cohort does not contain enough rows for train, "
+    "validation, and test partitions."
+)
+_RECOMMENDATION_REFUSED_AFTER_ANOMALY_MESSAGE = (
+    "Anomaly analysis completed, but recommendation generation was refused "
+    "by the safety gate."
+)
+_WINDOWS_ABS_PATH_PATTERN = re.compile(
+    r"[A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n]+\\)*[^\\/:*?\"<>|\r\n]*"
+)
+_UNIX_ABS_PATH_PATTERN = re.compile(
+    r"/(?:Users|home|tmp|var|opt|private|mnt)/[^\s\"']+"
+)
+_KNOWN_OPERATOR_ERROR_FRAGMENTS: tuple[tuple[str, str], ...] = (
+    (
+        "retained too few rows for the required train/validation/test",
+        _COHORT_TOO_SMALL_OPERATOR_MESSAGE,
+    ),
+    (
+        "Classification modeling is not yet supported",
+        _TASK_UNSUPPORTED_OPERATOR_MESSAGE,
+    ),
+    (
+        "Classification is not supported by",
+        _TASK_UNSUPPORTED_OPERATOR_MESSAGE,
+    ),
 )
 _QUALITY_DIRECTION_PLACEHOLDER = "(select quality direction)"
 _ANOMALY_ONLY_RECOMMENDATION_NOTE = (
     "Recommendation generation is not enabled for anomaly-only analysis."
 )
 _ANOMALY_ONLY_PERFORMANCE_NOTE = "Not applicable for anomaly-only analysis."
+_ANOMALY_RECOMMENDATION_SECTION_CAPTION = (
+    "Generate a constrained what-if suggestion for the selected operating row "
+    "using the fitted anomaly model. Recommendations are model-based scenarios, "
+    "not operational commands."
+)
+_ANOMALY_RECOMMENDATION_RESULT_CAPTION = (
+    "Lower anomaly score means the scenario is less unusual according to the "
+    "same fitted anomaly model. It does not prove improved quality or process "
+    "safety."
+)
+_ANOMALY_RECOMMENDATION_UNCERTAINTY_NOTE = (
+    "Uncertainty unavailable. Absence of uncertainty does not establish safety."
+)
+_WHAT_IF_SECTION_CAPTION = (
+    "Adjacent constraint-grid scenarios are scored with the same fitted model "
+    "to show whether the proposed improvement persists locally. This is "
+    "model-local stability evidence, not proof of physical safety or causation."
+)
+_WHAT_IF_NOT_APPLICABLE = (
+    "What-if verification was not applicable because no recommendation was generated."
+)
+_WHAT_IF_ANOMALY_CAPTION = (
+    "Objective value is the anomaly score; lower values are less anomalous "
+    "under REDUCE_ANOMALY_SCORE."
+)
+_WHAT_IF_QUALITY_CAPTION = (
+    "Objective value is the predicted quality under the configured quality "
+    "optimization direction."
+)
+_OBSERVED_RANGE_CAPTION_TEMPLATE = (
+    "Observed range: {low} to {high}. This is not an approved operating limit."
+)
 _COHORT_COLUMN_PLACEHOLDER = "(select cohort column)"
 _COHORT_FILTER_INTERPRETATION_NOTE = (
     "Anomaly scores are relative to the selected operating cohort and should "
@@ -123,6 +244,9 @@ _ANOMALY_CONTEXT_FILTERED_CAPTION = (
     "adjacent only within the filtered analysis-order cohort. Rows outside "
     "the selected operating range are not re-inserted into the context window."
 )
+_ANOMALY_CONTEXT_CHART_MISSING_CAPTION = (
+    "Selected context feature has no finite numeric values; chart is omitted."
+)
 _DIAGNOSIS_FACTORS_CAPTION = (
     "Features that differ most strongly between the selected anomaly group and "
     "the normal comparison group. These are associations, not proven causes. "
@@ -130,8 +254,116 @@ _DIAGNOSIS_FACTORS_CAPTION = (
     "z-scores are shown only as supporting statistics when the comparison-group "
     "scale is available."
 )
+_COMPARISON_SECTION_CAPTION = (
+    "This comparison shows configuration, selected-row overlap, and "
+    "diagnosis-factor rank changes. Anomaly score magnitudes are not compared "
+    "across separately trained runs."
+)
+_COMPARISON_INTERPRETATION_NOTES = (
+    "Different cohort runs use separately fitted anomaly models.\n"
+    "Anomaly score magnitudes are not directly comparable.\n"
+    "Shared events indicate row-selection stability, not confirmed defects.\n"
+    "Shared factors indicate repeated associations, not causation."
+)
 
 WorkflowFactory = Callable[[], IndustrialProcessAnalysisWorkflow]
+
+
+def _render_quick_start() -> None:
+    """Compact operator guidance shown before or above CSV upload."""
+    st.subheader("Quick start")
+    st.markdown(
+        "1. Upload a CSV file.\n"
+        "2. Select supervised or anomaly-only analysis.\n"
+        "3. Review the suggested columns and safety-critical settings.\n"
+        "4. Run the analysis and inspect the report.\n"
+        "5. Export reusable configuration when needed."
+    )
+    with st.expander("More operator guidance", expanded=False):
+        st.markdown(
+            "- Suggested columns are starting points; confirm roles before running.\n"
+            "- SUPERVISED needs a target, supported task, and performance rules.\n"
+            "- ANOMALY_ONLY does not need a target; statistical outliers are not "
+            "automatically defects.\n"
+            "- Recommendations use only confirmed controllable, verified, and "
+            "constrained variables.\n"
+            "- See `docs/USER_GUIDE.md` for a full walkthrough."
+        )
+
+
+def _render_analysis_mode_guidance(analysis_mode: AnalysisExecutionMode) -> None:
+    """Explain mode differences without auto-selecting UI values."""
+    if analysis_mode is AnalysisExecutionMode.SUPERVISED:
+        with st.expander("SUPERVISED mode details", expanded=False):
+            st.markdown(
+                "- Target column is required.\n"
+                "- Regression or another supported task is required.\n"
+                "- Independent test performance acceptance rules are required.\n"
+                "- Constant or all-null targets cannot be run.\n"
+                "- Recommendations use only actual controllable, verified, and "
+                "constrained variables."
+            )
+    else:
+        with st.expander("ANOMALY_ONLY mode details", expanded=False):
+            st.markdown(
+                "- Target column is not required.\n"
+                "- Runs unsupervised anomaly detection and related-variable "
+                "diagnosis.\n"
+                "- Statistical anomalies do not automatically mean defects.\n"
+                "- Cohort filter is optional.\n"
+                "- Anomaly recommendation is disabled by default.\n"
+                "- When recommendation is enabled, only truly controllable "
+                "variables are allowed."
+            )
+
+
+def _render_run_configuration_summary(
+    *,
+    analysis_mode: AnalysisExecutionMode,
+    selected_target: str | None,
+    feature_count: int,
+    selected_timestamp: str | None,
+    identifier_count: int,
+    cohort_filter: NumericCohortFilter | None,
+    restrict_operating_cohort: bool,
+    recommendation_enabled: bool,
+    constraint_variable_count: int,
+    performance_rule_count: int | None,
+) -> None:
+    """Compact summary of current UI selections before readiness checks."""
+    st.subheader("Current configuration summary")
+    if analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY:
+        target_display = "Not required"
+    elif selected_target is None:
+        target_display = "Not selected"
+    else:
+        target_display = selected_target
+    if not restrict_operating_cohort:
+        cohort_display = "Disabled"
+    elif cohort_filter is None:
+        cohort_display = "Enabled (incomplete)"
+    else:
+        cohort_display = (
+            f"{cohort_filter.column_name} "
+            f"[{cohort_filter.lower_bound}, {cohort_filter.upper_bound}]"
+        )
+    performance_display = (
+        "Not applicable"
+        if performance_rule_count is None
+        else str(performance_rule_count)
+    )
+    st.write(
+        f"- Analysis mode: `{analysis_mode.value}`\n"
+        f"- Target: `{target_display}`\n"
+        f"- Feature count: `{feature_count}`\n"
+        f"- Timestamp: `"
+        f"{'Not selected' if selected_timestamp is None else selected_timestamp}`\n"
+        f"- Identifier count: `{identifier_count}`\n"
+        f"- Cohort filter: `{cohort_display}`\n"
+        f"- Recommendation: `{'enabled' if recommendation_enabled else 'disabled'}`\n"
+        f"- Constraint variable count: `{constraint_variable_count}`\n"
+        f"- Performance rule count: `{performance_display}`"
+    )
 
 
 def _csv_bytes_from_rows(rows: list[dict[str, Any]]) -> bytes:
@@ -144,6 +376,483 @@ def _csv_bytes_from_rows(rows: list[dict[str, Any]]) -> bytes:
     writer.writeheader()
     writer.writerows(rows)
     return buffer.getvalue().encode("utf-8")
+
+
+def _render_what_if_verification_section(report: WorkflowPresentationReport) -> None:
+    """Render compact what-if verification under Recommendation when applicable."""
+    recommendation = report.recommendation
+    verification = report.recommendation_verification
+    show_full = (
+        recommendation is not None
+        and recommendation.status is RecommendationStatus.GENERATED
+        and verification is not None
+        and verification.status is not WhatIfVerificationStatus.NOT_APPLICABLE
+    )
+    if not show_full:
+        if recommendation is None or recommendation.status is not (
+            RecommendationStatus.GENERATED
+        ):
+            st.caption(_WHAT_IF_NOT_APPLICABLE)
+        return
+
+    assert verification is not None
+    st.subheader("What-if verification")
+    st.write(_WHAT_IF_SECTION_CAPTION)
+    st.write(
+        {
+            "Verification status": verification.status.value,
+            "Stability classification": verification.stability_classification.value,
+            "Baseline objective value": verification.baseline_objective_value,
+            "Proposed objective value": verification.proposed_objective_value,
+            "Neighbor scenarios": verification.neighbor_scenario_count,
+            "Improving neighbors": verification.improving_neighbor_count,
+            "Non-improving neighbors": verification.non_improving_neighbor_count,
+            "Extrapolated scenarios": verification.extrapolated_scenario_count,
+        }
+    )
+    st.info(verification.stability_message)
+    if verification.objective is RecommendationObjective.REDUCE_ANOMALY_SCORE:
+        st.caption(_WHAT_IF_ANOMALY_CAPTION)
+        objective_column = "Anomaly score"
+    else:
+        st.caption(_WHAT_IF_QUALITY_CAPTION)
+        objective_column = "Predicted quality"
+
+    table_rows: list[dict[str, Any]] = []
+    chart_labels: list[str] = []
+    chart_values: list[float] = []
+    for scenario in verification.scenarios:
+        label = scenario.scenario_type.value
+        if scenario.perturbed_variable is not None:
+            label = f"{scenario.scenario_type.value}:{scenario.perturbed_variable}"
+        table_rows.append(
+            {
+                "Scenario": scenario.scenario_id,
+                "Type": scenario.scenario_type.value,
+                "Perturbed variable": scenario.perturbed_variable,
+                "Direction": (
+                    None
+                    if scenario.perturbation_direction is None
+                    else scenario.perturbation_direction.value
+                ),
+                "Perturbed value": scenario.perturbed_value,
+                "Objective value": scenario.objective_value,
+                objective_column: (
+                    scenario.anomaly_score
+                    if verification.objective
+                    is RecommendationObjective.REDUCE_ANOMALY_SCORE
+                    else scenario.predicted_quality
+                ),
+                "Improved vs baseline": scenario.improves_over_baseline,
+                "Matched/improved proposed": scenario.improves_or_matches_proposed,
+                "Extrapolated": scenario.extrapolated,
+            }
+        )
+        chart_labels.append(label)
+        chart_values.append(scenario.objective_value)
+    if table_rows:
+        st.dataframe(table_rows, use_container_width=True)
+    if chart_labels:
+        chart_frame = pd.DataFrame(
+            {
+                "scenario": chart_labels,
+                "objective_value": chart_values,
+            }
+        )
+        st.bar_chart(chart_frame, x="scenario", y="objective_value")
+
+    download_rows = _what_if_verification_download_rows(verification)
+    st.download_button(
+        "Download what-if verification CSV",
+        data=_csv_bytes_from_rows(download_rows),
+        file_name="recommendation_what_if_verification.csv",
+        mime="text/csv",
+        key="download_what_if_verification_csv",
+    )
+    for warning in verification.warnings:
+        st.warning(warning)
+
+
+def _what_if_verification_download_rows(
+    verification: RecommendationWhatIfVerificationView,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not verification.scenarios:
+        rows.append(
+            {
+                "verification_status": verification.status.value,
+                "stability_classification": (
+                    verification.stability_classification.value
+                ),
+                "baseline_objective_value": verification.baseline_objective_value,
+                "proposed_objective_value": verification.proposed_objective_value,
+                "scenario_id": None,
+                "scenario_type": None,
+                "perturbed_variable": None,
+                "perturbation_direction": None,
+                "perturbed_value": None,
+                "objective_value": None,
+                "improves_over_baseline": None,
+                "improves_or_matches_proposed": None,
+                "extrapolated": None,
+                "warnings": (
+                    verification.warnings[0] if verification.warnings else None
+                ),
+            }
+        )
+        return rows
+    for scenario in verification.scenarios:
+        rows.append(
+            {
+                "verification_status": verification.status.value,
+                "stability_classification": (
+                    verification.stability_classification.value
+                ),
+                "baseline_objective_value": verification.baseline_objective_value,
+                "proposed_objective_value": verification.proposed_objective_value,
+                "scenario_id": scenario.scenario_id,
+                "scenario_type": scenario.scenario_type.value,
+                "perturbed_variable": scenario.perturbed_variable,
+                "perturbation_direction": (
+                    None
+                    if scenario.perturbation_direction is None
+                    else scenario.perturbation_direction.value
+                ),
+                "perturbed_value": scenario.perturbed_value,
+                "objective_value": scenario.objective_value,
+                "improves_over_baseline": scenario.improves_over_baseline,
+                "improves_or_matches_proposed": scenario.improves_or_matches_proposed,
+                "extrapolated": scenario.extrapolated,
+                "warnings": (
+                    scenario.warnings[0]
+                    if scenario.warnings
+                    else (
+                        verification.warnings[0] if verification.warnings else None
+                    )
+                ),
+            }
+        )
+    return rows
+
+
+def _is_anomaly_only_report(report: WorkflowPresentationReport) -> bool:
+    return report.metadata.get("analysis_mode") == AnalysisExecutionMode.ANOMALY_ONLY.value
+
+
+def _report_eligible_as_comparison_baseline(report: WorkflowPresentationReport) -> bool:
+    if not _is_anomaly_only_report(report):
+        return False
+    if report.overview.status is AnalysisWorkflowStatus.REFUSED:
+        return False
+    if report.dataset_fingerprint is None:
+        return False
+    return bool(report.anomaly_events)
+
+
+def _cohort_filter_display(report: WorkflowPresentationReport) -> str:
+    summary = report.cohort_filter_summary
+    if not summary.configured:
+        return "Not configured"
+    column_name = summary.column_name
+    if column_name is None:
+        return summary.range_display
+    return f"{column_name}: {summary.range_display}"
+
+
+def _load_baseline_report_from_session() -> WorkflowPresentationReport | None:
+    cached = st.session_state.get(_SESSION_BASELINE_REPORT_KEY)
+    if cached is None:
+        return None
+    if not isinstance(cached, dict):
+        st.session_state.pop(_SESSION_BASELINE_REPORT_KEY, None)
+        st.session_state.pop(_SESSION_BASELINE_LABEL_KEY, None)
+        return None
+    try:
+        return WorkflowPresentationReport.model_validate(cached)
+    except ValidationError:
+        st.session_state.pop(_SESSION_BASELINE_REPORT_KEY, None)
+        st.session_state.pop(_SESSION_BASELINE_LABEL_KEY, None)
+        return None
+
+
+def _save_comparison_baseline(report: WorkflowPresentationReport) -> None:
+    st.session_state[_SESSION_BASELINE_REPORT_KEY] = report.model_dump(mode="json")
+    st.session_state[_SESSION_BASELINE_LABEL_KEY] = (
+        f"{_analysis_mode_label(report)} | {_cohort_filter_display(report)}"
+    )
+
+
+def _clear_comparison_baseline() -> None:
+    st.session_state.pop(_SESSION_BASELINE_REPORT_KEY, None)
+    st.session_state.pop(_SESSION_BASELINE_LABEL_KEY, None)
+
+
+def _analysis_mode_label(report: WorkflowPresentationReport) -> str:
+    mode = report.metadata.get("analysis_mode")
+    if isinstance(mode, str) and mode.strip() != "":
+        return mode
+    return _NOT_AVAILABLE
+
+
+def _event_overlap_presence_label(status: EventOverlapPresenceStatus) -> str:
+    if status is EventOverlapPresenceStatus.SHARED:
+        return "Shared"
+    if status is EventOverlapPresenceStatus.BASELINE_ONLY:
+        return "Baseline only"
+    return "Current only"
+
+
+def _factor_presence_label(status: DiagnosisFactorPresenceStatus) -> str:
+    if status is DiagnosisFactorPresenceStatus.SHARED:
+        return "Shared"
+    if status is DiagnosisFactorPresenceStatus.BASELINE_ONLY:
+        return "Baseline only"
+    return "Current only"
+
+
+def _event_overlap_table_rows(
+    entries: Sequence[EventOverlapEntryView],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        rows.append(
+            {
+                "Status": _event_overlap_presence_label(entry.presence_status),
+                "Original row ID": str(entry.original_row_id),
+                "Baseline rank": (
+                    _NOT_AVAILABLE
+                    if entry.baseline_rank is None
+                    else str(entry.baseline_rank)
+                ),
+                "Current rank": (
+                    _NOT_AVAILABLE
+                    if entry.current_rank is None
+                    else str(entry.current_rank)
+                ),
+            }
+        )
+    return rows
+
+
+def _event_overlap_download_rows(overlap: EventOverlapView) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for entry in overlap.entries:
+        rows.append(
+            {
+                "status": entry.presence_status.value,
+                "original_row_id": entry.original_row_id,
+                "baseline_rank": entry.baseline_rank,
+                "current_rank": entry.current_rank,
+            }
+        )
+    return rows
+
+
+def _factor_comparison_table_rows(
+    factors: Sequence[DiagnosisFactorComparisonView],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for factor in factors:
+        rows.append(
+            {
+                "Feature": factor.feature_name,
+                "Presence": _factor_presence_label(factor.presence_status),
+                "Baseline rank": (
+                    _NOT_AVAILABLE
+                    if factor.baseline_rank is None
+                    else str(factor.baseline_rank)
+                ),
+                "Current rank": (
+                    _NOT_AVAILABLE
+                    if factor.current_rank is None
+                    else str(factor.current_rank)
+                ),
+                "Baseline direction": _display_optional(factor.baseline_direction),
+                "Current direction": _display_optional(factor.current_direction),
+            }
+        )
+    return rows
+
+
+def _factor_comparison_download_rows(
+    factors: Sequence[DiagnosisFactorComparisonView],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for factor in factors:
+        rows.append(
+            {
+                "feature_name": factor.feature_name,
+                "presence_status": factor.presence_status.value,
+                "baseline_rank": factor.baseline_rank,
+                "current_rank": factor.current_rank,
+                "baseline_direction": factor.baseline_direction,
+                "current_direction": factor.current_direction,
+            }
+        )
+    return rows
+
+
+def _configuration_comparison_table_rows(
+    comparison: AnomalyRunComparisonView,
+) -> list[dict[str, Any]]:
+    config = comparison.configuration
+    return [
+        {
+            "Metric": "Cohort filter",
+            "Baseline": config.baseline_cohort_description,
+            "Current": config.current_cohort_description,
+        },
+        {
+            "Metric": "Analysis rows",
+            "Baseline": str(config.baseline_analysis_rows),
+            "Current": str(config.current_analysis_rows),
+        },
+        {
+            "Metric": "Feature count",
+            "Baseline": _display_optional(config.baseline_feature_count),
+            "Current": _display_optional(config.current_feature_count),
+        },
+        {
+            "Metric": "Train rows",
+            "Baseline": str(config.baseline_train_row_count),
+            "Current": str(config.current_train_row_count),
+        },
+        {
+            "Metric": "Validation rows",
+            "Baseline": str(config.baseline_validation_row_count),
+            "Current": str(config.current_validation_row_count),
+        },
+        {
+            "Metric": "Test rows",
+            "Baseline": str(config.baseline_test_row_count),
+            "Current": str(config.current_test_row_count),
+        },
+        {
+            "Metric": "Anomaly model",
+            "Baseline": _display_optional(config.baseline_anomaly_model),
+            "Current": _display_optional(config.current_anomaly_model),
+        },
+        {
+            "Metric": "Anomaly event count",
+            "Baseline": str(config.baseline_anomaly_event_count),
+            "Current": str(config.current_anomaly_event_count),
+        },
+        {
+            "Metric": "Diagnosis factor count",
+            "Baseline": str(config.baseline_diagnosis_factor_count),
+            "Current": str(config.current_diagnosis_factor_count),
+        },
+        {
+            "Metric": "Operating row ID",
+            "Baseline": _display_optional(config.baseline_operating_row_id),
+            "Current": _display_optional(config.current_operating_row_id),
+        },
+    ]
+
+
+def _render_baseline_summary(baseline: WorkflowPresentationReport) -> None:
+    st.write("Baseline available")
+    st.markdown(
+        f"- Analysis mode: `{_analysis_mode_label(baseline)}`\n"
+        f"- Cohort filter: `{_cohort_filter_display(baseline)}`\n"
+        f"- Analysis rows: `{baseline.data_summary.cohort_row_count}`\n"
+        f"- Anomaly events: `{baseline.data_summary.anomaly_event_count}`\n"
+        f"- Anomaly model: `"
+        f"{_display_optional(baseline.model_summary.anomaly_model_key)}`"
+    )
+    fingerprint = baseline.dataset_fingerprint
+    if fingerprint is not None:
+        with st.expander("Baseline debugging details", expanded=False):
+            st.caption(f"Dataset fingerprint prefix: `{fingerprint[:12]}`")
+
+
+def _render_run_comparison_section(report: WorkflowPresentationReport) -> None:
+    st.header("Run comparison")
+    baseline = _load_baseline_report_from_session()
+    eligible = _report_eligible_as_comparison_baseline(report)
+
+    if eligible:
+        save_label = (
+            "Replace comparison baseline"
+            if baseline is not None
+            else "Save current report as comparison baseline"
+        )
+        if st.button(save_label, key="save_comparison_baseline"):
+            _save_comparison_baseline(report)
+            st.success("Current presentation report saved as comparison baseline.")
+            baseline = report
+
+    if baseline is not None:
+        _render_baseline_summary(baseline)
+        if st.button(
+            "Clear comparison baseline",
+            key="clear_comparison_baseline",
+        ):
+            _clear_comparison_baseline()
+            st.success("Comparison baseline cleared. The current report is unchanged.")
+            return
+
+    if baseline is None:
+        return
+
+    comparison = build_anomaly_run_comparison(baseline, report)
+    if not comparison.compatible:
+        st.warning(comparison.compatibility_message)
+        return
+
+    st.header("Baseline vs current anomaly analysis")
+    st.caption(_COMPARISON_SECTION_CAPTION)
+
+    st.subheader("Configuration comparison")
+    st.dataframe(
+        _configuration_comparison_table_rows(comparison),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    overlap = comparison.event_overlap
+    st.subheader("Event overlap")
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("Shared events", overlap.shared_event_count)
+    metric_cols[1].metric(
+        "Baseline-only events",
+        len(overlap.baseline_only_original_row_ids),
+    )
+    metric_cols[2].metric(
+        "Current-only events",
+        len(overlap.current_only_original_row_ids),
+    )
+    st.dataframe(
+        _event_overlap_table_rows(overlap.entries),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.download_button(
+        label="Download event overlap CSV",
+        data=_csv_bytes_from_rows(_event_overlap_download_rows(overlap)),
+        file_name="anomaly_event_overlap.csv",
+        mime="text/csv",
+        key="download_anomaly_event_overlap_csv",
+    )
+
+    st.subheader("Diagnosis factor comparison")
+    st.dataframe(
+        _factor_comparison_table_rows(comparison.factor_comparison),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.download_button(
+        label="Download factor comparison CSV",
+        data=_csv_bytes_from_rows(
+            _factor_comparison_download_rows(comparison.factor_comparison)
+        ),
+        file_name="diagnosis_factor_comparison.csv",
+        mime="text/csv",
+        key="download_diagnosis_factor_comparison_csv",
+    )
+
+    st.subheader("Interpretation note")
+    st.info(_COMPARISON_INTERPRETATION_NOTES)
 
 
 def _anomaly_event_table_rows(
@@ -341,13 +1050,67 @@ def _context_chart_rows(
         )
         if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
             continue
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            continue
         chart_rows.append(
             {
                 "relative_offset": row.relative_offset,
-                feature_name: float(value),
+                "value": numeric,
             }
         )
     return chart_rows
+
+
+def _context_chart_y_domain(values: Sequence[float]) -> tuple[float, float] | None:
+    """Return an explicit Y-axis domain that keeps constant and narrow series visible.
+
+    Does not force zero into the domain. Padding is deterministic.
+    """
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite:
+        return None
+    lower = min(finite)
+    upper = max(finite)
+    if lower == upper:
+        padding = max(abs(lower) * 0.02, 1e-6)
+        return lower - padding, upper + padding
+    padding = max((upper - lower) * 0.05, 1e-6)
+    return lower - padding, upper + padding
+
+
+def _build_anomaly_context_feature_chart(
+    chart_rows: Sequence[Mapping[str, Any]],
+    feature_name: str,
+) -> alt.Chart | None:
+    """Build an Altair line chart with an explicit Y domain for context values."""
+    values = [float(row["value"]) for row in chart_rows]
+    domain = _context_chart_y_domain(values)
+    if domain is None:
+        return None
+    frame = pd.DataFrame(
+        [
+            {
+                "relative_offset": int(row["relative_offset"]),
+                "value": float(row["value"]),
+            }
+            for row in chart_rows
+        ]
+    ).sort_values("relative_offset", kind="mergesort")
+    chart = cast(
+        alt.Chart,
+        alt.Chart(frame)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("relative_offset:Q", title="Relative offset"),
+            y=alt.Y(
+                "value:Q",
+                title=feature_name,
+                scale=alt.Scale(domain=list(domain), zero=False, nice=False),
+            ),
+        ),
+    )
+    return chart
 
 
 def render_app(
@@ -401,6 +1164,7 @@ def render_app(
         "Model-based decision support only. These outputs do not guarantee "
         "real-process improvement and are not operational commands."
     )
+    _render_quick_start()
 
     uploaded = st.file_uploader(
         "CSV upload",
@@ -460,6 +1224,7 @@ def render_app(
         return
 
     _reset_column_widget_state_if_schema_changed(columns)
+    _consume_pending_configuration_preset_apply()
 
     st.subheader("Analysis mode")
     if _SESSION_ANALYSIS_MODE_KEY not in st.session_state:
@@ -481,6 +1246,7 @@ def render_app(
             ),
         )
     )
+    _render_analysis_mode_guidance(analysis_mode)
     if (
         previous_mode == AnalysisExecutionMode.SUPERVISED.value
         and analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
@@ -523,11 +1289,8 @@ def render_app(
             )
             target_has_usable_variation = target_assessment.suitable
             if not target_has_usable_variation:
-                if target_assessment.is_constant:
-                    st.error(
-                        f"{selected_target} cannot be used as a regression target "
-                        "because it contains only one distinct non-null value."
-                    )
+                if target_assessment.is_constant or target_assessment.is_all_null:
+                    st.error(_TARGET_CONSTANT_OPERATOR_MESSAGE)
                 else:
                     st.error(target_assessment.message)
 
@@ -599,6 +1362,7 @@ def render_app(
     use_recommended_features = st.checkbox(
         "Use recommended numeric feature set",
         value=True,
+        key=SESSION_USE_RECOMMENDED_FEATURES_KEY,
         help=(
             "When enabled, the compact recommended feature set is used and feature "
             "tags are not expanded on the main form."
@@ -630,14 +1394,17 @@ def render_app(
                 key="manual_select_all_recommended",
             )
             manual_default = list(active_features) if select_all else []
+            if SESSION_EXPLICIT_FEATURES_KEY not in st.session_state:
+                st.session_state[SESSION_EXPLICIT_FEATURES_KEY] = manual_default
             feature_columns = st.multiselect(
                 "Feature columns",
                 options=columns,
-                default=manual_default,
+                key=SESSION_EXPLICIT_FEATURES_KEY,
             )
 
     cohort_filter: NumericCohortFilter | None = None
     cohort_filter_ready = True
+    restrict_operating_cohort = False
     modeling_feature_columns = list(feature_columns)
     if anomaly_only:
         st.subheader("Operating cohort filter")
@@ -646,12 +1413,12 @@ def render_app(
             "range. This can reduce false positives caused by comparing "
             "different operating regimes."
         )
-        restrict_cohort = st.checkbox(
+        restrict_operating_cohort = st.checkbox(
             "Restrict analysis to an operating range",
             value=False,
             key="ui_restrict_operating_cohort",
         )
-        if restrict_cohort:
+        if restrict_operating_cohort:
             cohort_candidates = (
                 list_numeric_cohort_filter_candidates(
                     analysis_frame,
@@ -755,7 +1522,7 @@ def render_app(
                     cohort_filter = preview_filter
                 except (DataValidationError, ValidationError, ValueError) as exc:
                     cohort_filter_ready = False
-                    st.warning(str(exc))
+                    st.warning(_operator_facing_error_message(exc, area="cohort filter"))
             else:
                 cohort_filter_ready = False
 
@@ -798,10 +1565,12 @@ def render_app(
         "per feature."
     )
     override_candidates = list(feature_columns)
+    if SESSION_ROLE_OVERRIDE_COLUMNS_KEY not in st.session_state:
+        st.session_state[SESSION_ROLE_OVERRIDE_COLUMNS_KEY] = []
     override_selected = st.multiselect(
         "Columns with explicit role overrides",
         options=override_candidates,
-        default=[],
+        key=SESSION_ROLE_OVERRIDE_COLUMNS_KEY,
     )
     role_options = [_ROLE_NONE, *[role.value for role in ColumnRole]]
     column_role_overrides: dict[str, ColumnRole] = {}
@@ -822,18 +1591,186 @@ def render_app(
     quality_target: float | None = None
     quality_direction_selected = True
     performance_rule_rows: list[dict[str, Any]] = []
+    performance_rule_drafts: list[dict[str, Any]] = []
     complete_rule_count = 0
     constraint_rows: list[dict[str, float | str]] = []
+    recommendation_constraint_drafts: list[dict[str, Any]] = []
     confirmed_controllable: list[str] = []
     verified_variables: list[str] = []
+    anomaly_recommendation_enabled = False
+    anomaly_recommendation_ready = True
 
     if anomaly_only:
         st.subheader("Analysis task")
         st.info("Analysis task: not applicable for anomaly-only analysis.")
-        st.subheader("Recommendation objective")
-        st.info(_ANOMALY_ONLY_RECOMMENDATION_NOTE)
         st.subheader("Model performance acceptance rules")
         st.info(_ANOMALY_ONLY_PERFORMANCE_NOTE)
+
+        st.subheader("Anomaly-score reduction recommendation")
+        st.caption(_ANOMALY_RECOMMENDATION_SECTION_CAPTION)
+        anomaly_recommendation_enabled = bool(
+            st.checkbox(
+                "Enable anomaly-score reduction recommendation",
+                value=False,
+                key=SESSION_ANOMALY_RECOMMENDATION_ENABLED_KEY,
+            )
+        )
+        if anomaly_recommendation_enabled:
+            selected_objective = RecommendationObjective.REDUCE_ANOMALY_SCORE
+            st.write(
+                f"Objective (fixed): {RecommendationObjective.REDUCE_ANOMALY_SCORE.value}"
+            )
+            st.caption(
+                "Diagnosis factors are associations, not proven causes. "
+                "Candidate variables must be selected from active anomaly features."
+            )
+            recommendation_feature_options = list(modeling_feature_columns)
+            cohort_filter_column = (
+                None if cohort_filter is None else cohort_filter.column_name
+            )
+            if cohort_filter_column is not None:
+                recommendation_feature_options = [
+                    name
+                    for name in recommendation_feature_options
+                    if name != cohort_filter_column
+                ]
+                st.caption(
+                    "Cohort filter columns are excluded from recommendation "
+                    "candidate options."
+                )
+
+            review_variables = st.multiselect(
+                "Candidate variables with explicit role overrides",
+                options=recommendation_feature_options,
+                default=[],
+                key="anomaly_recommendation_review_variables",
+            )
+            role_options = [_ROLE_NONE, *[role.value for role in ColumnRole]]
+            for feature_name in review_variables:
+                selected_role = st.selectbox(
+                    f"Recommendation role override for {feature_name}",
+                    options=role_options,
+                    index=0,
+                    key=f"anomaly_rec_role_{feature_name}",
+                )
+                if selected_role != _ROLE_NONE:
+                    column_role_overrides[feature_name] = ColumnRole(selected_role)
+
+            confirmed_controllable = st.multiselect(
+                "Confirmed controllable variables",
+                options=review_variables,
+                default=[],
+                key="anomaly_rec_confirmed_controllable",
+            )
+            verified_variables = st.multiselect(
+                "Verified variables",
+                options=review_variables,
+                default=[],
+                key="anomaly_rec_verified_variables",
+            )
+            constrained_variables = st.multiselect(
+                "Variables with recommendation constraints",
+                options=review_variables,
+                default=[],
+                key=SESSION_ANOMALY_CONSTRAINT_VARIABLES_KEY,
+            )
+            constraint_incomplete = False
+            for variable in constrained_variables:
+                observed_caption = None
+                if analysis_frame is not None and variable in analysis_frame.columns:
+                    series = analysis_frame.get_column(variable)
+                    if series.dtype.is_numeric():
+                        low = series.min()
+                        high = series.max()
+                        if low is not None and high is not None:
+                            observed_caption = _OBSERVED_RANGE_CAPTION_TEMPLATE.format(
+                                low=low,
+                                high=high,
+                            )
+                if observed_caption is not None:
+                    st.caption(observed_caption)
+                minimum_text = st.text_input(
+                    f"Lower bound for {variable}",
+                    value="",
+                    key=f"anomaly_rec_constraint_min_{variable}",
+                )
+                maximum_text = st.text_input(
+                    f"Upper bound for {variable}",
+                    value="",
+                    key=f"anomaly_rec_constraint_max_{variable}",
+                )
+                min_stripped = str(minimum_text).strip()
+                max_stripped = str(maximum_text).strip()
+                draft_minimum: float | str | None = (
+                    None if min_stripped == "" else min_stripped
+                )
+                draft_maximum: float | str | None = (
+                    None if max_stripped == "" else max_stripped
+                )
+                # Record every selected constraint for preset export validation.
+                recommendation_constraint_drafts.append(
+                    {
+                        "variable": variable,
+                        "minimum": draft_minimum,
+                        "maximum": draft_maximum,
+                    }
+                )
+                if min_stripped == "" or max_stripped == "":
+                    constraint_incomplete = True
+                    st.warning(_CONSTRAINT_INCOMPLETE_OPERATOR_MESSAGE)
+                    continue
+                try:
+                    minimum_value = float(min_stripped)
+                    maximum_value = float(max_stripped)
+                except ValueError:
+                    constraint_incomplete = True
+                    st.warning(_CONSTRAINT_INCOMPLETE_OPERATOR_MESSAGE)
+                    continue
+                if not math.isfinite(minimum_value) or not math.isfinite(maximum_value):
+                    constraint_incomplete = True
+                    st.warning(_CONSTRAINT_INCOMPLETE_OPERATOR_MESSAGE)
+                    continue
+                if minimum_value >= maximum_value:
+                    constraint_incomplete = True
+                    st.warning(_CONSTRAINT_INCOMPLETE_OPERATOR_MESSAGE)
+                    continue
+                constraint_rows.append(
+                    {
+                        "variable": variable,
+                        "minimum": minimum_value,
+                        "maximum": maximum_value,
+                    }
+                )
+
+            role_overrides_complete = all(
+                name in column_role_overrides for name in review_variables
+            )
+            eligible_intersection = [
+                name
+                for name in review_variables
+                if name in confirmed_controllable
+                and name in verified_variables
+                and any(row["variable"] == name for row in constraint_rows)
+                and column_role_overrides.get(name) is ColumnRole.CONTROLLABLE_PROCESS
+                and (cohort_filter_column is None or name != cohort_filter_column)
+            ]
+            anomaly_recommendation_ready = (
+                len(review_variables) >= 1
+                and role_overrides_complete
+                and len(confirmed_controllable) >= 1
+                and len(verified_variables) >= 1
+                and len(constraint_rows) >= 1
+                and not constraint_incomplete
+                and len(eligible_intersection) >= 1
+            )
+            if not anomaly_recommendation_ready:
+                st.warning(
+                    "Complete recommendation review variables, CONTROLLABLE_PROCESS "
+                    "role overrides, confirmed controllable, verified, and finite "
+                    "constraint bounds before running."
+                )
+        else:
+            st.info(_ANOMALY_ONLY_RECOMMENDATION_NOTE)
     else:
         st.subheader("Analysis task")
         task_options = [
@@ -841,20 +1778,19 @@ def render_app(
             AnalysisTask.REGRESSION.value,
             AnalysisTask.CLASSIFICATION.value,
         ]
+        if SESSION_REQUESTED_TASK_KEY not in st.session_state:
+            st.session_state[SESSION_REQUESTED_TASK_KEY] = _TASK_AUTO
         task_selection = st.selectbox(
             "Analysis task",
             options=task_options,
-            index=0,
+            key=SESSION_REQUESTED_TASK_KEY,
             help=_TASK_HELP,
         )
         if task_selection == AnalysisTask.REGRESSION.value:
             requested_task = AnalysisTask.REGRESSION
         elif task_selection == AnalysisTask.CLASSIFICATION.value:
             requested_task = AnalysisTask.CLASSIFICATION
-            st.info(
-                "Classification modeling is not yet supported by this workflow. "
-                "Selecting CLASSIFICATION will produce a structured refusal."
-            )
+            st.info(_TASK_UNSUPPORTED_OPERATOR_MESSAGE)
         analysis_task_selection_valid = task_selection in task_options
         if (
             requested_task is AnalysisTask.REGRESSION
@@ -869,7 +1805,12 @@ def render_app(
             )
             if not regression_target_assessment.suitable:
                 target_has_usable_variation = False
-                if not regression_target_assessment.is_constant:
+                if (
+                    regression_target_assessment.is_constant
+                    or regression_target_assessment.is_all_null
+                ):
+                    st.error(_TARGET_CONSTANT_OPERATOR_MESSAGE)
+                else:
                     st.error(regression_target_assessment.message)
 
         st.subheader("Recommendation objective")
@@ -880,10 +1821,12 @@ def render_app(
             _OBJECTIVE_PLACEHOLDER,
             *[item.value for item in RecommendationObjective],
         ]
+        if SESSION_OBJECTIVE_KEY not in st.session_state:
+            st.session_state[SESSION_OBJECTIVE_KEY] = _OBJECTIVE_PLACEHOLDER
         objective_selection = st.selectbox(
             "Objective",
             options=objective_options,
-            index=0,
+            key=SESSION_OBJECTIVE_KEY,
         )
         if objective_selection != _OBJECTIVE_PLACEHOLDER:
             selected_objective = RecommendationObjective(objective_selection)
@@ -899,10 +1842,14 @@ def render_app(
                 _QUALITY_DIRECTION_PLACEHOLDER,
                 *[item.value for item in QualityOptimizationDirection],
             ]
+            if SESSION_QUALITY_DIRECTION_KEY not in st.session_state:
+                st.session_state[SESSION_QUALITY_DIRECTION_KEY] = (
+                    _QUALITY_DIRECTION_PLACEHOLDER
+                )
             quality_selection = st.selectbox(
                 "Quality direction",
                 options=quality_options,
-                index=0,
+                key=SESSION_QUALITY_DIRECTION_KEY,
             )
             if quality_selection == _QUALITY_DIRECTION_PLACEHOLDER:
                 quality_direction_selected = False
@@ -910,8 +1857,14 @@ def render_app(
             else:
                 quality_direction = QualityOptimizationDirection(quality_selection)
                 if quality_direction is QualityOptimizationDirection.TARGET:
+                    if SESSION_QUALITY_TARGET_KEY not in st.session_state:
+                        st.session_state[SESSION_QUALITY_TARGET_KEY] = 0.0
                     quality_target = float(
-                        st.number_input("Quality target", value=0.0, format="%.6f")
+                        st.number_input(
+                            "Quality target",
+                            format="%.6f",
+                            key=SESSION_QUALITY_TARGET_KEY,
+                        )
                     )
 
         st.subheader("Model performance acceptance rules")
@@ -924,13 +1877,15 @@ def render_app(
             "- RMSE and MAE generally use LOWER_IS_BETTER.\n"
             "- The user must confirm the metric direction and threshold."
         )
+        if SESSION_RULE_COUNT_KEY not in st.session_state:
+            st.session_state[SESSION_RULE_COUNT_KEY] = 1
         rule_count = int(
             st.number_input(
                 "Number of performance rules",
                 min_value=1,
                 max_value=20,
-                value=1,
                 step=1,
+                key=SESSION_RULE_COUNT_KEY,
             )
         )
         rule_issues: list[str] = []
@@ -967,8 +1922,20 @@ def render_app(
                 direction_selection=direction_selection,
                 threshold_text=threshold_text,
             )
+            performance_rule_drafts.append(
+                {
+                    "metric_name": metric_name,
+                    "direction": (
+                        None
+                        if direction_selection == _DIRECTION_PLACEHOLDER
+                        else direction_selection
+                    ),
+                    "threshold": threshold_text,
+                    "required": bool(required),
+                }
+            )
             if missing:
-                rule_issues.append(f"Rule {index + 1} missing: {', '.join(missing)}")
+                rule_issues.append(_PERFORMANCE_RULE_INCOMPLETE_OPERATOR_MESSAGE)
                 continue
             threshold_value = float(str(threshold_text).strip())
             performance_rule_rows.append(
@@ -981,12 +1948,9 @@ def render_app(
             )
             complete_rule_count += 1
 
-        if complete_rule_count < 1:
-            st.warning(
-                "Configure at least one complete performance rule "
-                "(metric name, direction, and finite threshold)."
-            )
-        for issue in rule_issues:
+        if complete_rule_count < 1 and not rule_issues:
+            st.warning(_PERFORMANCE_RULE_INCOMPLETE_OPERATOR_MESSAGE)
+        for issue in dict.fromkeys(rule_issues):
             st.warning(issue)
 
         st.subheader("Process variable constraints")
@@ -994,10 +1958,12 @@ def render_app(
             "Constraints are not inferred from dataset min/max. Variables without "
             "constraints may be excluded from recommendation candidates."
         )
+        if SESSION_CONSTRAINT_VARIABLES_KEY not in st.session_state:
+            st.session_state[SESSION_CONSTRAINT_VARIABLES_KEY] = []
         constrained_variables = st.multiselect(
             "Variables with recommendation constraints",
             options=feature_columns,
-            default=[],
+            key=SESSION_CONSTRAINT_VARIABLES_KEY,
         )
         for variable in constrained_variables:
             minimum = st.number_input(
@@ -1012,6 +1978,15 @@ def render_app(
                 format="%.6f",
                 key=f"constraint_max_{variable}",
             )
+            recommendation_constraint_drafts.append(
+                {
+                    "variable": variable,
+                    "minimum": float(minimum),
+                    "maximum": float(maximum),
+                }
+            )
+            if float(minimum) >= float(maximum):
+                st.warning(_CONSTRAINT_INCOMPLETE_OPERATOR_MESSAGE)
             constraint_rows.append(
                 {
                     "variable": variable,
@@ -1026,26 +2001,37 @@ def render_app(
             "independent inputs and are not auto-aligned. Recommended features are "
             "not auto-selected as controllable or verified."
         )
+        if SESSION_CONFIRMED_CONTROLLABLE_KEY not in st.session_state:
+            st.session_state[SESSION_CONFIRMED_CONTROLLABLE_KEY] = []
         confirmed_controllable = st.multiselect(
             "Confirmed controllable variables",
             options=feature_columns,
-            default=[],
+            key=SESSION_CONFIRMED_CONTROLLABLE_KEY,
         )
+        if SESSION_VERIFIED_VARIABLES_KEY not in st.session_state:
+            st.session_state[SESSION_VERIFIED_VARIABLES_KEY] = []
         verified_variables = st.multiselect(
             "Verified variables",
             options=feature_columns,
-            default=[],
+            key=SESSION_VERIFIED_VARIABLES_KEY,
         )
 
     st.subheader("Operating point and change limits")
     max_feature_count = max(1, len(feature_columns) or 1)
+    if SESSION_MAX_CHANGES_KEY not in st.session_state:
+        st.session_state[SESSION_MAX_CHANGES_KEY] = min(3, max_feature_count)
+    elif (
+        isinstance(st.session_state[SESSION_MAX_CHANGES_KEY], int)
+        and st.session_state[SESSION_MAX_CHANGES_KEY] > max_feature_count
+    ):
+        st.session_state[SESSION_MAX_CHANGES_KEY] = max_feature_count
     max_simultaneous_changes = int(
         st.number_input(
             "Maximum simultaneous changes",
             min_value=1,
             max_value=max_feature_count,
-            value=min(3, max_feature_count),
             step=1,
+            key=SESSION_MAX_CHANGES_KEY,
         )
     )
     default_operating = (
@@ -1053,17 +2039,24 @@ def render_app(
         if anomaly_only
         else OperatingPointSelectionMode.TOP_RESIDUAL_ANOMALY
     )
+    if SESSION_OPERATING_MODE_KEY not in st.session_state:
+        st.session_state[SESSION_OPERATING_MODE_KEY] = default_operating.value
     operating_mode = OperatingPointSelectionMode(
         st.selectbox(
             "Operating-point selection mode",
             options=[item.value for item in OperatingPointSelectionMode],
-            index=list(OperatingPointSelectionMode).index(default_operating),
+            key=SESSION_OPERATING_MODE_KEY,
         )
     )
     explicit_operating_row_id: int | str | None = None
     explicit_row_id_ok = True
     if operating_mode is OperatingPointSelectionMode.EXPLICIT_ROW_ID:
-        row_id_text = st.text_input("Explicit operating row ID", value="")
+        if SESSION_EXPLICIT_ROW_ID_KEY not in st.session_state:
+            st.session_state[SESSION_EXPLICIT_ROW_ID_KEY] = ""
+        row_id_text = st.text_input(
+            "Explicit operating row ID",
+            key=SESSION_EXPLICIT_ROW_ID_KEY,
+        )
         explicit_operating_row_id = row_id_text
         if str(row_id_text).strip() == "":
             explicit_row_id_ok = False
@@ -1073,6 +2066,43 @@ def render_app(
         len(feature_columns) >= 1
         and 1 <= max_simultaneous_changes <= len(feature_columns)
     )
+
+    preset_export_result = build_exportable_configuration_preset(
+        analysis_mode=analysis_mode,
+        requested_task=requested_task,
+        target_column=selected_target,
+        use_recommended_numeric_feature_set=bool(use_recommended_features),
+        explicit_feature_columns=(
+            [] if use_recommended_features else list(feature_columns)
+        ),
+        timestamp_column=selected_timestamp,
+        identifier_columns=list(identifier_columns),
+        excluded_columns=list(excluded_columns),
+        role_overrides=dict(column_role_overrides),
+        recommendation_objective=selected_objective,
+        quality_direction=quality_direction,
+        quality_target=quality_target,
+        performance_rule_drafts=performance_rule_drafts,
+        cohort_filter=cohort_filter,
+        operating_cohort_restricted=bool(restrict_operating_cohort),
+        anomaly_recommendation_enabled=bool(anomaly_recommendation_enabled),
+        recommendation_constraint_drafts=recommendation_constraint_drafts,
+        confirmed_controllable_variables=list(confirmed_controllable),
+        verified_variables=list(verified_variables),
+        maximum_simultaneous_changes=int(max_simultaneous_changes),
+        operating_point_selection_mode=operating_mode,
+        explicit_operating_row_id=(
+            None
+            if explicit_operating_row_id is None
+            or str(explicit_operating_row_id).strip() == ""
+            else explicit_operating_row_id
+        ),
+    )
+    _render_configuration_preset_section(
+        columns=columns,
+        export_result=preset_export_result,
+    )
+
     if anomaly_only:
         readiness = {
             "CSV parsed": True,
@@ -1090,6 +2120,10 @@ def render_app(
             "operating-point selection valid": explicit_row_id_ok,
             "max simultaneous changes valid": max_changes_valid,
         }
+        if anomaly_recommendation_enabled:
+            readiness["anomaly recommendation inputs complete"] = (
+                anomaly_recommendation_ready
+            )
     else:
         readiness = {
             "CSV parsed": True,
@@ -1105,11 +2139,38 @@ def render_app(
             "max simultaneous changes valid": max_changes_valid,
             "explicit row ID supplied when required": explicit_row_id_ok,
         }
+
+    recommendation_enabled_summary = (
+        bool(anomaly_recommendation_enabled)
+        if anomaly_only
+        else selected_objective is not None
+    )
+    _render_run_configuration_summary(
+        analysis_mode=analysis_mode,
+        selected_target=selected_target,
+        feature_count=(
+            len(modeling_feature_columns) if anomaly_only else len(feature_columns)
+        ),
+        selected_timestamp=selected_timestamp,
+        identifier_count=len(identifier_columns),
+        cohort_filter=cohort_filter,
+        restrict_operating_cohort=bool(restrict_operating_cohort),
+        recommendation_enabled=recommendation_enabled_summary,
+        constraint_variable_count=len(recommendation_constraint_drafts),
+        performance_rule_count=None if anomaly_only else complete_rule_count,
+    )
+
     st.subheader("Run readiness")
     for label, ready in readiness.items():
         st.write(f"{'True' if ready else 'False'}: {label}")
-    if anomaly_only:
+    if anomaly_only and not anomaly_recommendation_enabled:
         st.caption(_ANOMALY_ONLY_RECOMMENDATION_NOTE)
+    elif anomaly_only:
+        st.caption(
+            "Incomplete recommendation fields disable Run analysis. Complete "
+            "safety inputs are required when anomaly-score reduction "
+            "recommendation is enabled."
+        )
     else:
         st.caption(
             "Empty constraints, controllability, or verification inputs can still allow "
@@ -1141,17 +2202,30 @@ def render_app(
                 excluded_columns=list(excluded_columns),
                 column_role_overrides=dict(column_role_overrides),
                 requested_task=None,
-                objective=None,
+                objective=(
+                    RecommendationObjective.REDUCE_ANOMALY_SCORE
+                    if anomaly_recommendation_enabled
+                    else None
+                ),
                 quality_direction=None,
                 quality_target=None,
                 performance_rule_rows=[],
-                constraint_rows=[],
-                confirmed_controllable=[],
-                verified_variables=[],
+                constraint_rows=(
+                    list(constraint_rows) if anomaly_recommendation_enabled else []
+                ),
+                confirmed_controllable=(
+                    list(confirmed_controllable)
+                    if anomaly_recommendation_enabled
+                    else []
+                ),
+                verified_variables=(
+                    list(verified_variables) if anomaly_recommendation_enabled else []
+                ),
                 max_simultaneous_changes=max_simultaneous_changes,
                 operating_mode=operating_mode,
                 explicit_operating_row_id=explicit_operating_row_id,
                 cohort_filter=cohort_filter,
+                anomaly_recommendation_enabled=anomaly_recommendation_enabled,
                 workflow_factory=workflow_factory,
                 request_builder=active_request_builder,
                 report_builder=active_report_builder,
@@ -1159,14 +2233,11 @@ def render_app(
         elif selected_target is None:
             st.error("Select a target column before running the workflow.")
         elif not target_has_usable_variation:
-            st.error(
-                f"{selected_target} cannot be used as a regression target because "
-                "it lacks usable target variation."
-            )
+            st.error(_TARGET_CONSTANT_OPERATOR_MESSAGE)
         elif selected_objective is None:
             st.error("Select a recommendation objective before running the workflow.")
         elif complete_rule_count < 1:
-            st.error("Configure at least one complete performance rule.")
+            st.error(_PERFORMANCE_RULE_INCOMPLETE_OPERATOR_MESSAGE)
         else:
             _run_workflow_from_upload(
                 upload_bytes=upload_bytes,
@@ -1193,6 +2264,7 @@ def render_app(
                 operating_mode=operating_mode,
                 explicit_operating_row_id=explicit_operating_row_id,
                 cohort_filter=None,
+                anomaly_recommendation_enabled=False,
                 workflow_factory=workflow_factory,
                 request_builder=active_request_builder,
                 report_builder=active_report_builder,
@@ -1216,15 +2288,34 @@ def render_presentation_report(report: WorkflowPresentationReport) -> None:
             f"got {type(report).__name__}"
         )
 
+    _render_run_comparison_section(report)
+
     overview = report.overview
     st.header("Overview")
+    operator_headline = _operator_overview_headline(report)
     if overview.status is AnalysisWorkflowStatus.COMPLETED:
-        st.success(overview.headline)
-    elif overview.status is AnalysisWorkflowStatus.PARTIAL:
-        st.warning(overview.headline)
+        st.success(operator_headline)
+    elif (
+        overview.status is AnalysisWorkflowStatus.PARTIAL
+        or operator_headline == _RECOMMENDATION_REFUSED_AFTER_ANOMALY_MESSAGE
+    ):
+        st.warning(operator_headline)
     else:
-        st.error(overview.headline)
+        st.error(operator_headline)
     st.write(overview.summary)
+    refused_stage = next(
+        (
+            stage
+            for stage in report.stages
+            if stage.structured_refusal and stage.executed
+        ),
+        None,
+    )
+    if refused_stage is not None:
+        st.caption(
+            f"Refused stage: `{refused_stage.stage.value}`. "
+            f"Cause: {_sanitize_operator_text(refused_stage.message)}"
+        )
     st.caption(
         f"Terminal stage: {overview.terminal_stage.value} | "
         f"Duration: {overview.total_seconds:.3f}s"
@@ -1430,9 +2521,15 @@ def render_presentation_report(report: WorkflowPresentationReport) -> None:
             )
             if _feature_values_are_numeric(selected_window, feature_name):
                 chart_rows = _context_chart_rows(selected_window, feature_name)
-                if chart_rows:
-                    chart_frame = pd.DataFrame(chart_rows).set_index("relative_offset")
-                    st.line_chart(chart_frame, use_container_width=True)
+                chart = (
+                    _build_anomaly_context_feature_chart(chart_rows, feature_name)
+                    if chart_rows
+                    else None
+                )
+                if chart is None:
+                    st.caption(_ANOMALY_CONTEXT_CHART_MISSING_CAPTION)
+                else:
+                    st.altair_chart(chart, use_container_width=True)
                     st.caption(
                         "Center event is at relative offset 0 on the analysis-order "
                         "axis."
@@ -1536,8 +2633,164 @@ def render_presentation_report(report: WorkflowPresentationReport) -> None:
         st.write(_ANOMALY_ONLY_RECOMMENDATION_NOTE)
     elif recommendation is None:
         st.write(_NOT_AVAILABLE)
+    elif anomaly_only_report:
+        st.subheader("Anomaly-score reduction recommendation")
+        st.write(f"Status: {recommendation.status.value}")
+        st.write(f"Objective: {recommendation.objective.value}")
+        operating_row_display = (
+            _NOT_AVAILABLE
+            if report.data_summary.selected_operating_row_id is None
+            else str(report.data_summary.selected_operating_row_id)
+        )
+        baseline_score = recommendation.baseline_anomaly_score
+        proposed_score = recommendation.proposed_anomaly_score
+        score_change: float | None = None
+        if baseline_score is not None and proposed_score is not None:
+            score_change = proposed_score - baseline_score
+        if recommendation.status is RecommendationStatus.GENERATED:
+            st.success(f"Status: {recommendation.status.value}")
+            st.write(
+                {
+                    "Operating row ID": operating_row_display,
+                    "Baseline anomaly score": baseline_score,
+                    "Proposed anomaly score": proposed_score,
+                    "Score change": score_change,
+                    "Number of proposed changes": len(recommendation.changes),
+                    "Extrapolation status": recommendation.extrapolation_flag,
+                    "Uncertainty status": (
+                        "available"
+                        if recommendation.uncertainty_available
+                        else "unavailable"
+                    ),
+                    "Safety status": recommendation.safety_status.value,
+                }
+            )
+            if baseline_score is not None and proposed_score is not None:
+                chart_frame = pd.DataFrame(
+                    {
+                        "scenario": ["Baseline", "Proposed"],
+                        "anomaly_score": [baseline_score, proposed_score],
+                    }
+                )
+                st.bar_chart(chart_frame, x="scenario", y="anomaly_score")
+            constraint_lookup = {
+                change.variable: change for change in recommendation.changes
+            }
+            st.dataframe(
+                [
+                    {
+                        "Variable": change.variable,
+                        "Current value": change.current_value,
+                        "Proposed value": change.proposed_value,
+                        "Absolute change": change.delta,
+                        "Relative change": change.relative_delta,
+                        "Verification status": (
+                            "required" if change.requires_verification else "recorded"
+                        ),
+                        "Confidence": change.confidence,
+                        "Rationale": change.rationale,
+                    }
+                    for change in constraint_lookup.values()
+                ],
+                use_container_width=True,
+            )
+            st.caption(_ANOMALY_RECOMMENDATION_RESULT_CAPTION)
+            if not recommendation.uncertainty_available:
+                st.caption(_ANOMALY_RECOMMENDATION_UNCERTAINTY_NOTE)
+            download_rows: list[dict[str, Any]] = []
+            if recommendation.changes:
+                for change in recommendation.changes:
+                    download_rows.append(
+                        {
+                            "recommendation_status": recommendation.status.value,
+                            "operating_row_id": (
+                                report.data_summary.selected_operating_row_id
+                            ),
+                            "objective": recommendation.objective.value,
+                            "baseline_anomaly_score": baseline_score,
+                            "proposed_anomaly_score": proposed_score,
+                            "score_change": score_change,
+                            "variable": change.variable,
+                            "current_value": change.current_value,
+                            "proposed_value": change.proposed_value,
+                            "absolute_change": change.delta,
+                            "relative_change": change.relative_delta,
+                            "extrapolation_flag": recommendation.extrapolation_flag,
+                            "uncertainty_available": (
+                                recommendation.uncertainty_available
+                            ),
+                            "safety_status": recommendation.safety_status.value,
+                            "warning": (
+                                recommendation.warnings[0]
+                                if recommendation.warnings
+                                else None
+                            ),
+                        }
+                    )
+            else:
+                download_rows.append(
+                    {
+                        "recommendation_status": recommendation.status.value,
+                        "operating_row_id": (
+                            report.data_summary.selected_operating_row_id
+                        ),
+                        "objective": recommendation.objective.value,
+                        "baseline_anomaly_score": baseline_score,
+                        "proposed_anomaly_score": proposed_score,
+                        "score_change": score_change,
+                        "variable": None,
+                        "current_value": None,
+                        "proposed_value": None,
+                        "absolute_change": None,
+                        "relative_change": None,
+                        "extrapolation_flag": recommendation.extrapolation_flag,
+                        "uncertainty_available": recommendation.uncertainty_available,
+                        "safety_status": recommendation.safety_status.value,
+                        "warning": (
+                            recommendation.warnings[0]
+                            if recommendation.warnings
+                            else None
+                        ),
+                    }
+                )
+            st.download_button(
+                "Download anomaly recommendation CSV",
+                data=_csv_bytes_from_rows(download_rows),
+                file_name="anomaly_recommendation.csv",
+                mime="text/csv",
+                key="download_anomaly_recommendation_csv",
+            )
+        elif recommendation.status is RecommendationStatus.READY_FOR_OPTIMIZATION:
+            st.warning(f"Status: {recommendation.status.value}")
+            st.write(
+                {
+                    "Operating row ID": operating_row_display,
+                    "Baseline anomaly score": baseline_score,
+                    "Proposed anomaly score": proposed_score,
+                    "Extrapolation status": recommendation.extrapolation_flag,
+                    "Uncertainty status": (
+                        "available"
+                        if recommendation.uncertainty_available
+                        else "unavailable"
+                    ),
+                    "Safety status": recommendation.safety_status.value,
+                }
+            )
+            for warning in recommendation.warnings:
+                st.warning(warning)
+            for message in recommendation.safety_messages:
+                st.info(message)
+            if not recommendation.uncertainty_available:
+                st.caption(_ANOMALY_RECOMMENDATION_UNCERTAINTY_NOTE)
+        else:
+            st.error(f"Status: {recommendation.status.value}")
+            for message in recommendation.safety_messages:
+                st.error(message)
+            for warning in recommendation.warnings:
+                st.warning(warning)
     elif recommendation.status is RecommendationStatus.GENERATED:
         st.success(f"Status: {recommendation.status.value}")
+        st.write(f"Objective: {recommendation.objective.value}")
         st.dataframe(
             [
                 {
@@ -1597,6 +2850,8 @@ def render_presentation_report(report: WorkflowPresentationReport) -> None:
         for message in recommendation.safety_messages:
             st.error(message)
 
+    _render_what_if_verification_section(report)
+
     st.header("Warnings")
     if not report.warnings:
         st.write("No warnings.")
@@ -1635,6 +2890,7 @@ def _run_workflow_from_upload(
     operating_mode: OperatingPointSelectionMode,
     explicit_operating_row_id: int | str | None,
     cohort_filter: NumericCohortFilter | None,
+    anomaly_recommendation_enabled: bool,
     workflow_factory: WorkflowFactory,
     request_builder: WorkflowUiRequestBuilder,
     report_builder: AnalysisWorkflowReportBuilder,
@@ -1698,6 +2954,7 @@ def _run_workflow_from_upload(
             cohort_filter=(
                 None if cohort_filter is None else cohort_filter.model_copy(deep=True)
             ),
+            anomaly_recommendation_enabled=bool(anomaly_recommendation_enabled),
             metadata={"ui_entry": "streamlit_form"},
         )
     except (ValidationError, ValueError, TypeError) as exc:
@@ -1823,6 +3080,178 @@ def _render_configuration_summary(report: UiColumnConfigurationReport) -> None:
     cols2[2].metric("Review-required columns", len(report.review_required_columns))
 
 
+def _render_configuration_preset_section(
+    *,
+    columns: Sequence[str],
+    export_result: ConfigurationPresetBuildResult,
+) -> None:
+    """Render analysis configuration preset download / upload / apply controls."""
+    st.subheader("Analysis configuration preset")
+    st.caption(
+        "Download the current analysis settings as JSON, or upload a previously "
+        "saved configuration. Applying a preset restores UI inputs only and does "
+        "not run analysis."
+    )
+
+    if export_result.is_exportable and export_result.preset is not None:
+        summary = build_configuration_preset_summary(export_result.preset)
+        st.caption(
+            "Export summary: "
+            f"mode={summary['analysis_mode']}, "
+            f"target={summary['target']}, "
+            f"constraints={summary['constraint_variable_count']}."
+        )
+        try:
+            preset_json = configuration_preset_to_json(export_result.preset)
+        except (TypeError, ValueError, ValidationError):
+            st.warning(
+                "Configuration preset export is unavailable. "
+                "Review the current settings and try again."
+            )
+            preset_json = None
+        if preset_json is not None:
+            st.download_button(
+                "Download configuration JSON",
+                data=preset_json,
+                file_name=CONFIGURATION_PRESET_FILENAME,
+                mime="application/json",
+                key="download_configuration_preset_json",
+            )
+    else:
+        st.warning(
+            "Complete or clear the highlighted configuration rows before "
+            "exporting the preset."
+        )
+        for issue in export_result.issues:
+            st.warning(issue)
+
+    uploaded_preset = st.file_uploader(
+        "Upload configuration JSON",
+        type=["json"],
+        accept_multiple_files=False,
+        key="upload_configuration_preset_json",
+        help="Validate first. Apply configuration only after successful validation.",
+    )
+
+    if uploaded_preset is None:
+        st.session_state.pop(SESSION_PRESET_PARSED_KEY, None)
+        st.session_state.pop(SESSION_PRESET_VALIDATION_OK_KEY, None)
+        st.session_state.pop(SESSION_PRESET_VALIDATION_MESSAGE_KEY, None)
+        st.session_state.pop(SESSION_PRESET_MISSING_COLUMNS_KEY, None)
+    else:
+        try:
+            raw_text = uploaded_preset.getvalue().decode("utf-8")
+        except UnicodeDecodeError:
+            st.error("Configuration JSON must be UTF-8 text.")
+            st.session_state[SESSION_PRESET_VALIDATION_OK_KEY] = False
+            st.session_state[SESSION_PRESET_VALIDATION_MESSAGE_KEY] = (
+                "Configuration JSON must be UTF-8 text."
+            )
+            st.session_state.pop(SESSION_PRESET_PARSED_KEY, None)
+            raw_text = None
+
+        if raw_text is not None:
+            parse_result = parse_configuration_preset_json(raw_text)
+            if not parse_result.ok or parse_result.preset is None:
+                message = (
+                    parse_result.error_message or "Configuration validation failed."
+                )
+                st.error(message)
+                st.session_state[SESSION_PRESET_VALIDATION_OK_KEY] = False
+                st.session_state[SESSION_PRESET_VALIDATION_MESSAGE_KEY] = message
+                st.session_state.pop(SESSION_PRESET_PARSED_KEY, None)
+                st.session_state.pop(SESSION_PRESET_MISSING_COLUMNS_KEY, None)
+            else:
+                compatibility = check_configuration_preset_column_compatibility(
+                    parse_result.preset,
+                    available_columns=columns,
+                )
+                if not compatibility.compatible:
+                    st.error(compatibility.message)
+                    st.session_state[SESSION_PRESET_VALIDATION_OK_KEY] = False
+                    st.session_state[SESSION_PRESET_VALIDATION_MESSAGE_KEY] = (
+                        compatibility.message
+                    )
+                    st.session_state[SESSION_PRESET_MISSING_COLUMNS_KEY] = list(
+                        compatibility.missing_columns
+                    )
+                    st.session_state.pop(SESSION_PRESET_PARSED_KEY, None)
+                else:
+                    st.success("Validate configuration: succeeded.")
+                    st.session_state[SESSION_PRESET_VALIDATION_OK_KEY] = True
+                    st.session_state[SESSION_PRESET_VALIDATION_MESSAGE_KEY] = (
+                        compatibility.message
+                    )
+                    st.session_state[SESSION_PRESET_MISSING_COLUMNS_KEY] = []
+                    st.session_state[SESSION_PRESET_PARSED_KEY] = (
+                        parse_result.parsed_dict
+                    )
+
+    apply_enabled = bool(st.session_state.get(SESSION_PRESET_VALIDATION_OK_KEY))
+    if st.button(
+        "Apply configuration",
+        type="secondary",
+        disabled=not apply_enabled,
+        key="apply_configuration_preset",
+    ):
+        pending = st.session_state.get(SESSION_PRESET_PARSED_KEY)
+        if not isinstance(pending, dict):
+            st.error("No validated configuration is ready to apply.")
+        else:
+            try:
+                pending_preset = WorkflowUiConfigurationPreset.model_validate(pending)
+            except ValidationError:
+                st.error(
+                    "Validated configuration could not be reloaded. "
+                    "Re-upload the configuration JSON and validate again."
+                )
+            else:
+                compatibility = check_configuration_preset_column_compatibility(
+                    pending_preset,
+                    available_columns=columns,
+                )
+                if not compatibility.compatible:
+                    st.error(compatibility.message)
+                    st.session_state[SESSION_PRESET_MISSING_COLUMNS_KEY] = list(
+                        compatibility.missing_columns
+                    )
+                else:
+                    # Stage updates for the next run before widgets instantiate.
+                    st.session_state[SESSION_PRESET_PENDING_APPLY_KEY] = (
+                        build_configuration_preset_session_updates(pending_preset)
+                    )
+                    st.rerun()
+
+    apply_summary_raw = st.session_state.get(SESSION_PRESET_APPLY_SUMMARY_KEY)
+    if isinstance(apply_summary_raw, dict):
+        apply_summary = dict(apply_summary_raw)
+        st.success("Configuration applied.")
+        st.write(
+            f"schema version: {apply_summary.get('schema_version')}; "
+            f"analysis mode: {apply_summary.get('analysis_mode')}; "
+            f"target: {apply_summary.get('target')}; "
+            f"feature configuration: {apply_summary.get('feature_configuration')}; "
+            f"cohort filter: "
+            f"{'yes' if apply_summary.get('cohort_filter_configured') else 'no'}; "
+            f"anomaly recommendation: "
+            f"{'yes' if apply_summary.get('anomaly_recommendation_enabled') else 'no'}; "
+            f"constraint variables: {apply_summary.get('constraint_variable_count')}"
+        )
+
+
+def _consume_pending_configuration_preset_apply() -> None:
+    """Apply a staged configuration preset before widgets are created."""
+    pending = st.session_state.pop(SESSION_PRESET_PENDING_APPLY_KEY, None)
+    if not isinstance(pending, dict):
+        return
+    # SessionStateProxy is MutableMapping[str | int, Any]; helper keys are str.
+    clear_configuration_preset_widget_prefixes(
+        cast(MutableMapping[str, Any], st.session_state)
+    )
+    for key, value in pending.items():
+        st.session_state[key] = value
+
+
 def _reset_column_widget_state_if_schema_changed(columns: Sequence[str]) -> None:
     fingerprint = "\0".join(columns)
     previous = st.session_state.get(_SESSION_COLUMNS_KEY)
@@ -1919,7 +3348,64 @@ def _display_optional(value: object) -> str:
     return str(value)
 
 
-def _display_user_error(exc: BaseException, *, area: str) -> None:
-    st.error(
-        f"{type(exc).__name__}: {exc}. Review the {area} inputs and try again."
+def _sanitize_operator_text(text: str) -> str:
+    cleaned = _WINDOWS_ABS_PATH_PATTERN.sub("<path>", text)
+    cleaned = _UNIX_ABS_PATH_PATTERN.sub("<path>", cleaned)
+    return cleaned
+
+
+def _operator_facing_error_message(exc: BaseException, *, area: str) -> str:
+    """Build an operator-facing error without exception types or absolute paths."""
+    raw = _sanitize_operator_text(str(exc).strip())
+    for fragment, message in _KNOWN_OPERATOR_ERROR_FRAGMENTS:
+        if fragment in raw:
+            return message
+    if isinstance(exc, ValidationError):
+        return (
+            f"One or more inputs are invalid in {area}. "
+            "Review the highlighted fields and try again."
+        )
+    if isinstance(exc, (pl.exceptions.PolarsError, UnicodeDecodeError)):
+        return (
+            "The CSV could not be parsed. Confirm the file is a valid UTF-8 CSV "
+            "and try again."
+        )
+    if isinstance(exc, FileNotFoundError):
+        return "A required input file was not found. Re-upload the CSV and try again."
+    if raw:
+        return f"{raw} Review the {area} settings and try again."
+    return f"Something went wrong in {area}. Review the inputs and try again."
+
+
+def _operator_overview_headline(report: WorkflowPresentationReport) -> str:
+    """Choose an operator headline from structured presentation status fields."""
+    overview = report.overview
+    analysis_mode = report.metadata.get("analysis_mode")
+    recommendation_refused = (
+        overview.recommendation_status is RecommendationStatus.REFUSED
+        or (
+            report.recommendation is not None
+            and report.recommendation.status is RecommendationStatus.REFUSED
+        )
     )
+    diagnosis_succeeded = any(
+        stage.stage is AnalysisWorkflowStage.DIAGNOSIS and stage.succeeded
+        for stage in report.stages
+    )
+    if (
+        analysis_mode == AnalysisExecutionMode.ANOMALY_ONLY.value
+        and overview.status is AnalysisWorkflowStatus.REFUSED
+        and overview.terminal_stage is AnalysisWorkflowStage.RECOMMENDATION
+        and recommendation_refused
+        and diagnosis_succeeded
+    ):
+        return _RECOMMENDATION_REFUSED_AFTER_ANOMALY_MESSAGE
+    if overview.terminal_stage is AnalysisWorkflowStage.TASK_ROUTING and (
+        overview.status is AnalysisWorkflowStatus.REFUSED
+    ):
+        return _TASK_UNSUPPORTED_OPERATOR_MESSAGE
+    return overview.headline
+
+
+def _display_user_error(exc: BaseException, *, area: str) -> None:
+    st.error(_operator_facing_error_message(exc, area=area))

@@ -24,7 +24,13 @@ from process_intelligence.recommendation import (
     RecommendationSafetyDecision,
     RecommendationSafetyStatus,
     RecommendationStatus,
+    RecommendationWhatIfVerificationResult,
     VariableEligibilityAssessment,
+    WhatIfPerturbationDirection,
+    WhatIfStabilityClassification,
+    WhatIfVerificationScenario,
+    WhatIfVerificationScenarioType,
+    WhatIfVerificationStatus,
 )
 from process_intelligence.recommendation.schemas import DEFAULT_RECOMMENDATION_DISCLAIMER
 from process_intelligence.reporting import (
@@ -63,9 +69,96 @@ _CSV_BYTES = (
 )
 
 
-def _completed_report() -> AnalysisWorkflowReport:
+def _wif_scenario(**overrides: object) -> WhatIfVerificationScenario:
+    payload: dict[str, object] = {
+        "scenario_id": "WIF-000000",
+        "scenario_type": WhatIfVerificationScenarioType.BASELINE,
+        "perturbed_variable": None,
+        "perturbation_direction": None,
+        "variable_values": {"pressure": 50.0},
+        "predicted_quality": None,
+        "anomaly_score": -0.35,
+        "objective_value": -0.35,
+        "improves_over_baseline": False,
+        "improves_or_matches_proposed": False,
+        "extrapolated": False,
+        "warnings": [],
+    }
+    payload.update(overrides)
+    return WhatIfVerificationScenario(**payload)
+
+
+def _wif_result(**overrides: object) -> RecommendationWhatIfVerificationResult:
+    scenarios = overrides.pop(
+        "scenarios",
+        [
+            _wif_scenario(),
+            _wif_scenario(
+                scenario_id="WIF-000001",
+                scenario_type=WhatIfVerificationScenarioType.PROPOSED_CENTER,
+                variable_values={"pressure": 48.0},
+                anomaly_score=-0.55,
+                objective_value=-0.55,
+                improves_over_baseline=True,
+                improves_or_matches_proposed=True,
+            ),
+            _wif_scenario(
+                scenario_id="WIF-000002",
+                scenario_type=WhatIfVerificationScenarioType.LOWER_NEIGHBOR,
+                perturbed_variable="pressure",
+                perturbation_direction=WhatIfPerturbationDirection.LOWER,
+                variable_values={"pressure": 44.0},
+                anomaly_score=-0.6,
+                objective_value=-0.6,
+                improves_over_baseline=True,
+                improves_or_matches_proposed=True,
+            ),
+            _wif_scenario(
+                scenario_id="WIF-000003",
+                scenario_type=WhatIfVerificationScenarioType.UPPER_NEIGHBOR,
+                perturbed_variable="pressure",
+                perturbation_direction=WhatIfPerturbationDirection.UPPER,
+                variable_values={"pressure": 52.0},
+                anomaly_score=-0.1,
+                objective_value=-0.1,
+                improves_over_baseline=False,
+                improves_or_matches_proposed=False,
+            ),
+        ],
+    )
+    payload: dict[str, object] = {
+        "status": WhatIfVerificationStatus.COMPLETED,
+        "objective": RecommendationObjective.REDUCE_ANOMALY_SCORE,
+        "baseline_objective_value": -0.35,
+        "proposed_objective_value": -0.55,
+        "scenario_count": len(scenarios),
+        "neighbor_scenario_count": 2,
+        "improving_neighbor_count": 1,
+        "non_improving_neighbor_count": 1,
+        "extrapolated_scenario_count": 0,
+        "stability_classification": WhatIfStabilityClassification.MIXED,
+        "scenarios": scenarios,
+        "warnings": [],
+        "rationale": (
+            "Local what-if verification scored adjacent constraint-grid "
+            "neighbors with the same fitted model."
+        ),
+        "evaluated_at": _GENERATED_AT,
+        "metadata": {
+            "verification_executed": True,
+            "model_refit_performed": False,
+        },
+    }
+    payload.update(overrides)
+    return RecommendationWhatIfVerificationResult(**payload)
+
+
+def _completed_report(
+    *,
+    terminal: AnalysisWorkflowStage = AnalysisWorkflowStage.RECOMMENDATION,
+    recommendation_verification: RecommendationWhatIfVerificationResult | None = None,
+) -> AnalysisWorkflowReport:
     stages = list(AnalysisWorkflowStage)
-    terminal = AnalysisWorkflowStage.RECOMMENDATION
     terminal_index = stages.index(terminal)
     records: list[AnalysisWorkflowStageRecord] = []
     for index, stage in enumerate(stages):
@@ -174,6 +267,7 @@ def _completed_report() -> AnalysisWorkflowReport:
         stage_records=records,
         model_performance_assessment=performance,
         final_recommendation=recommendation,
+        recommendation_verification=recommendation_verification,
         selected_industry="semiconductor",
         selected_task=AnalysisTask.REGRESSION,
         selected_supervised_model_key="ridge",
@@ -206,6 +300,9 @@ def _completed_report() -> AnalysisWorkflowReport:
             "anomaly_score_direction": "higher_is_more_anomalous",
             "row_identity_preserved": True,
         },
+        dataset_fingerprint=(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
     )
 
 
@@ -500,6 +597,9 @@ def _anomaly_only_report() -> AnalysisWorkflowReport:
             "anomaly_event_selection_source": "UNSUPERVISED_ANOMALY_SCORE",
             "diagnosis_source": "ROBUST_GROUP_COMPARISON",
         },
+        dataset_fingerprint=(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ),
     )
 
 
@@ -516,6 +616,18 @@ class _AnomalyOnlyWorkflow:
 
     def run(self, request: object) -> AnalysisWorkflowOutcome:
         assert request is not None
+        return AnalysisWorkflowOutcome(report=_anomaly_only_report())
+
+
+_ANOMALY_WORKFLOW_RUN_COUNT = {"count": 0}
+
+
+class _CountingAnomalyOnlyWorkflow:
+    """ANOMALY_ONLY workflow double that counts ``run`` invocations."""
+
+    def run(self, request: object) -> AnalysisWorkflowOutcome:
+        assert request is not None
+        _ANOMALY_WORKFLOW_RUN_COUNT["count"] += 1
         return AnalysisWorkflowOutcome(report=_anomaly_only_report())
 
 
@@ -601,6 +713,9 @@ def test_initial_header_and_uploader() -> None:
     blob = _text_blob(at)
     assert "Model-based decision support" in blob
     assert "guarantee" in blob.lower()
+    assert "Quick start" in blob
+    assert "Upload a CSV file." in blob
+    assert "Export reusable configuration when needed." in blob
 
 
 def test_run_without_upload_shows_guidance() -> None:
@@ -609,6 +724,22 @@ def test_run_without_upload_shows_guidance() -> None:
     assert len(at.button) == 0
     blob = _text_blob(at)
     assert "Upload a valid CSV" in blob
+    assert "Quick start" in blob
+
+
+def test_analysis_mode_guidance_and_configuration_summary() -> None:
+    at = _upload_csv(_make_app().run())
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "Current configuration summary" in blob
+    assert "Feature count:" in blob
+    assert "Performance rule count:" in blob
+    assert any(item.label == "SUPERVISED mode details" for item in at.expander)
+    at = _select_analysis_mode(at, "ANOMALY_ONLY")
+    blob_anomaly = _text_blob(at)
+    assert "Not required" in blob_anomaly
+    assert "Not applicable" in blob_anomaly
+    assert any(item.label == "ANOMALY_ONLY mode details" for item in at.expander)
 
 
 def _select_target(at: AppTest, target: str = "quality") -> AppTest:
@@ -742,8 +873,101 @@ def test_classification_task_selection_shows_unsupported_guidance() -> None:
     task_box = next(item for item in at.selectbox if item.label == "Analysis task")
     at = task_box.select("CLASSIFICATION").run()
     blob = _text_blob(at)
-    assert "not yet supported" in blob.lower()
+    assert "not supported by the current workflow" in blob.lower()
     assert "True: analysis task selection valid" in blob
+
+
+def test_operator_error_helpers_hide_exception_types_and_paths() -> None:
+    from process_intelligence.ui.streamlit_app import (
+        _operator_facing_error_message,
+        _sanitize_operator_text,
+    )
+
+    assert "C:\\Users\\" not in _sanitize_operator_text(
+        r"Failed at C:\Users\tangt\data.csv"
+    )
+    assert "/Users/" not in _sanitize_operator_text("Failed at /Users/tangt/data.csv")
+    message = _operator_facing_error_message(
+        ValueError(
+            "The configured cohort filter retained too few rows for the "
+            "required train/validation/test split."
+        ),
+        area="Workflow execution",
+    )
+    assert "ValueError" not in message
+    assert "enough rows for train, validation, and test partitions" in message
+    assert "Traceback" not in message
+
+
+def test_recommendation_refused_after_anomaly_uses_operator_headline() -> None:
+    from process_intelligence.ui.streamlit_app import _operator_overview_headline
+
+    source = _anomaly_only_report().model_copy(
+        update={
+            "status": AnalysisWorkflowStatus.REFUSED,
+            "terminal_stage": AnalysisWorkflowStage.RECOMMENDATION,
+            "final_recommendation": RecommendationResult(
+                status=RecommendationStatus.REFUSED,
+                objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+                safety_decision=RecommendationSafetyDecision(
+                    status=RecommendationSafetyStatus.REFUSED,
+                    objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+                    eligible_variables=[],
+                    blocked_variables=[],
+                    variable_assessments=[],
+                    global_reason_codes=[],
+                    messages=["Safety gate refused recommendation."],
+                    disclaimer=DEFAULT_RECOMMENDATION_DISCLAIMER,
+                    evaluated_at=_EVALUATED_AT,
+                ),
+                changes=[],
+                baseline_prediction=None,
+                proposed_prediction=None,
+                baseline_anomaly_score=None,
+                proposed_anomaly_score=None,
+                confidence=0.0,
+                extrapolation_flag=False,
+                uncertainty_available=False,
+                disclaimer=DEFAULT_RECOMMENDATION_DISCLAIMER,
+                generated_at=_GENERATED_AT,
+                warnings=[],
+            ),
+            "stage_records": [
+                *[
+                    record
+                    for record in _anomaly_only_report().stage_records
+                    if record.stage is not AnalysisWorkflowStage.RECOMMENDATION
+                ],
+                AnalysisWorkflowStageRecord(
+                    stage=AnalysisWorkflowStage.RECOMMENDATION,
+                    executed=True,
+                    succeeded=False,
+                    structured_refusal=True,
+                    row_count=None,
+                    message="Recommendation refused by safety gate.",
+                    warnings=[],
+                    metadata={},
+                ),
+            ],
+        }
+    )
+    report = AnalysisWorkflowReportBuilder().build(source).report
+    headline = _operator_overview_headline(report)
+    assert "recommendation generation was refused by the safety gate" in headline
+    assert "Analysis was stopped by a safety or validation gate" not in headline
+
+    at = AppTest.from_function(
+        _render_entry,
+        default_timeout=30,
+        kwargs={"report_json": report.model_dump(mode="json")},
+    ).run()
+    assert not at.exception
+    blob = _text_blob(at)
+    assert (
+        "Anomaly analysis completed, but recommendation generation was refused"
+        in blob
+    )
+    assert "Refused stage: `RECOMMENDATION`" in blob
 
 
 def test_performance_constraint_controllability_inputs_present() -> None:
@@ -843,6 +1067,103 @@ def test_presentation_rerender_is_deterministic() -> None:
     assert "Analysis completed with a generated recommendation" in blob
     again = WorkflowPresentationReport.model_validate(first).model_dump(mode="json")
     assert again == first
+
+
+# ---------------------------------------------------------------------------
+# What-if verification section (Step 11B.13)
+# ---------------------------------------------------------------------------
+
+
+def _verified_presentation_report_json() -> dict[str, object]:
+    source = _completed_report(
+        terminal=AnalysisWorkflowStage.WHAT_IF_VERIFICATION,
+        recommendation_verification=_wif_result(),
+    )
+    report = AnalysisWorkflowReportBuilder().build(source).report
+    return report.model_dump(mode="json")
+
+
+def test_what_if_verification_section_shown_for_generated_recommendation() -> None:
+    at = AppTest.from_function(
+        _render_entry,
+        default_timeout=30,
+        kwargs={"report_json": _verified_presentation_report_json()},
+    ).run()
+    assert not at.exception
+    headers = [item.value for item in at.subheader]
+    assert "What-if verification" in headers
+    blob = _text_blob(at)
+    assert "lower values are less anomalous" in blob
+    assert "not proof of physical safety or causation" in blob
+
+
+def test_what_if_verification_csv_download_key_present() -> None:
+    at = AppTest.from_function(
+        _render_entry,
+        default_timeout=30,
+        kwargs={"report_json": _verified_presentation_report_json()},
+    ).run()
+    assert not at.exception
+    download = next(
+        item
+        for item in at.download_button
+        if item.label == "Download what-if verification CSV"
+    )
+    assert download.key == "download_what_if_verification_csv"
+
+
+def test_what_if_verification_absent_when_no_verification_result() -> None:
+    # A GENERATED recommendation with no recommendation_verification (e.g. a
+    # workflow report generated before Step 11B.13 or with an unavailable
+    # constraint grid) renders neither the full section nor a compact
+    # not-applicable caption: the section is silently omitted.
+    source = _completed_report()  # default: no recommendation_verification
+    report = AnalysisWorkflowReportBuilder().build(source).report
+    at = AppTest.from_function(
+        _render_entry,
+        default_timeout=30,
+        kwargs={"report_json": report.model_dump(mode="json")},
+    ).run()
+    assert not at.exception
+    headers = [item.value for item in at.subheader]
+    assert "What-if verification" not in headers
+    blob = _text_blob(at)
+    assert "What-if verification was not applicable" not in blob
+
+
+def test_what_if_verification_compact_caption_when_recommendation_not_generated() -> (
+    None
+):
+    at = _upload_anomaly_csv(_make_anomaly_app().run())
+    at = _select_analysis_mode(at, "ANOMALY_ONLY")
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    assert not at.exception
+    blob = _text_blob(at)
+    # Recommendation generation is disabled for this ANOMALY_ONLY fixture, so
+    # final_recommendation is None and the compact not-applicable caption is
+    # shown instead of the full what-if verification section.
+    assert (
+        "What-if verification was not applicable because no recommendation "
+        "was generated." in blob
+    )
+    headers = [item.value for item in at.subheader]
+    assert "What-if verification" not in headers
+
+
+def test_what_if_verification_no_full_feature_dump() -> None:
+    at = AppTest.from_function(
+        _render_entry,
+        default_timeout=30,
+        kwargs={"report_json": _verified_presentation_report_json()},
+    ).run()
+    assert not at.exception
+    blob = _text_blob(at) + str(at)
+    # Only the compact controllable-variable mapping used by the fixture
+    # ("pressure") is present in the what-if scenarios; there is no raw
+    # feature-row dump of the full dataset's other columns.
+    assert "temperature" not in blob
+    assert "sensor" not in blob
+    assert "DataFrame" not in blob
 
 
 def test_default_factory_is_real_workflow() -> None:
@@ -1301,6 +1622,251 @@ def test_anomaly_context_does_not_break_event_or_diagnosis_sections() -> None:
     assert "Likely associated factors" in headers
 
 
+def _context_window_with_feature_values(
+    values_by_offset: list[tuple[int, object]],
+    *,
+    feature_name: str = "RSOCmin",
+) -> AnomalyContextWindow:
+    rows = [
+        AnomalyContextRow(
+            analysis_position=max(0, offset + 10),
+            original_row_id=max(0, offset + 10),
+            relative_offset=offset,
+            is_center_event=offset == 0,
+            is_selected_anomaly_event=offset == 0,
+            feature_values=[
+                AnomalyContextValue(feature_name=feature_name, value=value),
+            ],
+        )
+        for offset, value in values_by_offset
+    ]
+    return AnomalyContextWindow(
+        event_rank=1,
+        center_original_row_id=10,
+        center_anomaly_score=-0.4,
+        radius=3,
+        order_basis=AnomalyContextOrderBasis.LOADED_ROW_ORDER,
+        feature_names=[feature_name],
+        rows=rows,
+    )
+
+
+def _presentation_report_with_context(
+    window: AnomalyContextWindow,
+) -> WorkflowPresentationReport:
+    return AnalysisWorkflowReportBuilder().build(
+        _anomaly_only_report().model_copy(
+            update={"anomaly_context_windows": [window]}
+        )
+    ).report
+
+
+def test_context_chart_y_domain_constant_positive_includes_value() -> None:
+    from process_intelligence.ui.streamlit_app import (
+        _build_anomaly_context_feature_chart,
+        _context_chart_y_domain,
+    )
+
+    domain = _context_chart_y_domain([89.6, 89.6, 89.6])
+    assert domain is not None
+    lower, upper = domain
+    assert lower < 89.6 < upper
+    padding = max(abs(89.6) * 0.02, 1e-6)
+    assert lower == pytest.approx(89.6 - padding)
+    assert upper == pytest.approx(89.6 + padding)
+    chart = _build_anomaly_context_feature_chart(
+        [
+            {"relative_offset": -1, "value": 89.6},
+            {"relative_offset": 0, "value": 89.6},
+            {"relative_offset": 1, "value": 89.6},
+        ],
+        "RSOCmin",
+    )
+    assert chart is not None
+    encoded = chart.to_dict()["encoding"]["y"]["scale"]
+    assert encoded["domain"][0] < 89.6 < encoded["domain"][1]
+    assert encoded.get("zero") is False
+
+
+def test_context_chart_y_domain_constant_zero_visible() -> None:
+    from process_intelligence.ui.streamlit_app import _context_chart_y_domain
+
+    domain = _context_chart_y_domain([0.0, 0.0, 0.0])
+    assert domain is not None
+    lower, upper = domain
+    assert lower < 0.0 < upper
+    assert lower == pytest.approx(-1e-6)
+    assert upper == pytest.approx(1e-6)
+
+
+def test_context_chart_y_domain_constant_negative_visible() -> None:
+    from process_intelligence.ui.streamlit_app import _context_chart_y_domain
+
+    domain = _context_chart_y_domain([-12.5, -12.5])
+    assert domain is not None
+    lower, upper = domain
+    assert lower < -12.5 < upper
+    padding = max(abs(-12.5) * 0.02, 1e-6)
+    assert lower == pytest.approx(-12.5 - padding)
+    assert upper == pytest.approx(-12.5 + padding)
+
+
+def test_context_chart_y_domain_non_constant_keeps_range() -> None:
+    from process_intelligence.ui.streamlit_app import _context_chart_y_domain
+
+    domain = _context_chart_y_domain([50.0, 51.0, 52.0, 53.0])
+    assert domain is not None
+    lower, upper = domain
+    assert lower < 50.0
+    assert upper > 53.0
+    assert lower > 0.0
+
+
+def test_context_chart_y_domain_small_variation_excludes_forced_zero() -> None:
+    from process_intelligence.ui.streamlit_app import _context_chart_y_domain
+
+    domain = _context_chart_y_domain([89.5, 89.6, 89.7])
+    assert domain is not None
+    lower, upper = domain
+    assert lower < 89.5
+    assert upper > 89.7
+    assert lower > 80.0
+
+
+def test_context_chart_rows_preserve_relative_offset_order() -> None:
+    from process_intelligence.ui.streamlit_app import _context_chart_rows
+
+    report = _presentation_report_with_context(
+        _context_window_with_feature_values(
+            [(1, 91.0), (-2, 89.6), (0, 90.0), (-1, 89.8), (2, 91.2)],
+        )
+    )
+    window = report.anomaly_context_windows[0]
+    rows = _context_chart_rows(window, "RSOCmin")
+    assert [row["relative_offset"] for row in rows] == [1, -2, 0, -1, 2]
+    chart_rows = [
+        {"relative_offset": row["relative_offset"], "value": row["value"]}
+        for row in rows
+    ]
+    from process_intelligence.ui.streamlit_app import (
+        _build_anomaly_context_feature_chart,
+    )
+
+    chart = _build_anomaly_context_feature_chart(chart_rows, "RSOCmin")
+    assert chart is not None
+    frame = chart.data
+    assert list(frame["relative_offset"]) == [-2, -1, 0, 1, 2]
+
+
+def test_context_chart_empty_finite_values_safe_message() -> None:
+    from process_intelligence.reporting.schemas import (
+        AnomalyContextRowView,
+        AnomalyContextValueView,
+        AnomalyContextWindowView,
+    )
+    from process_intelligence.ui.streamlit_app import (
+        _ANOMALY_CONTEXT_CHART_MISSING_CAPTION,
+        _build_anomaly_context_feature_chart,
+        _context_chart_rows,
+        _context_chart_y_domain,
+        _feature_values_are_numeric,
+    )
+
+    assert _context_chart_y_domain([]) is None
+    assert _build_anomaly_context_feature_chart([], "RSOCmin") is None
+
+    window = AnomalyContextWindowView(
+        event_rank=1,
+        center_original_row_id=10,
+        center_anomaly_score=-0.4,
+        radius=3,
+        order_basis=AnomalyContextOrderBasis.LOADED_ROW_ORDER,
+        feature_names=["RSOCmin"],
+        rows=[
+            AnomalyContextRowView(
+                analysis_position=10,
+                original_row_id=10,
+                relative_offset=offset,
+                is_center_event=offset == 0,
+                is_selected_anomaly_event=offset == 0,
+                feature_values=[
+                    AnomalyContextValueView.model_construct(
+                        feature_name="RSOCmin",
+                        value=float("nan"),
+                    )
+                ],
+            )
+            for offset in (-1, 0, 1)
+        ],
+    )
+    assert _feature_values_are_numeric(window, "RSOCmin")
+    assert _context_chart_rows(window, "RSOCmin") == []
+
+    source = _anomaly_only_report().model_copy(
+        update={
+            "anomaly_context_windows": [
+                _context_window_with_feature_values(
+                    [(-1, None), (0, None), (1, None)],
+                )
+            ]
+        }
+    )
+    report = AnalysisWorkflowReportBuilder().build(source).report
+    at = AppTest.from_function(
+        _render_entry,
+        default_timeout=30,
+        kwargs={"report_json": report.model_dump(mode="json")},
+    ).run()
+    assert not at.exception
+    blob = _text_blob(at) + str(at)
+    assert "Traceback" not in blob
+    assert "C:\\Users\\" not in blob
+    assert (
+        "non-numeric; chart is omitted" in blob
+        or _ANOMALY_CONTEXT_CHART_MISSING_CAPTION in blob
+    )
+
+
+def test_anomaly_context_constant_series_chart_and_table_regression() -> None:
+    report = _presentation_report_with_context(
+        _context_window_with_feature_values(
+            [(-3, 89.6), (-2, 89.6), (-1, 89.6), (0, 89.6), (1, 89.6), (2, 89.6), (3, 89.6)],
+        )
+    )
+    at = AppTest.from_function(
+        _render_entry,
+        default_timeout=30,
+        kwargs={"report_json": report.model_dump(mode="json")},
+    ).run()
+    assert not at.exception
+    blob = _text_blob(at) + str(at)
+    assert "Anomaly context explorer" in blob
+    assert "relative offset 0" in blob.lower()
+    assert "Traceback" not in blob
+    assert "C:\\Users\\" not in blob
+    assert any(item.label == "Download selected context CSV" for item in at.download_button)
+    table_blob = str(at.dataframe)
+    assert "89.6" in table_blob or "RSOCmin" in blob
+    from process_intelligence.ui.streamlit_app import (
+        _context_chart_rows,
+        _context_chart_y_domain,
+        _context_download_rows,
+        _context_table_rows,
+    )
+
+    window = report.anomaly_context_windows[0]
+    chart_rows = _context_chart_rows(window, "RSOCmin")
+    domain = _context_chart_y_domain([float(row["value"]) for row in chart_rows])
+    assert domain is not None
+    assert domain[0] < 89.6 < domain[1]
+    table_rows = _context_table_rows(window)
+    assert [row["Relative offset"] for row in table_rows] == list(range(-3, 4))
+    assert all(row["RSOCmin"] == 89.6 for row in table_rows)
+    download_rows = _context_download_rows(window)
+    assert [row["relative_offset"] for row in download_rows] == list(range(-3, 4))
+    assert all(row["RSOCmin"] == 89.6 for row in download_rows)
+
+
 # ---------------------------------------------------------------------------
 # Step 11B.10 Operating cohort filter UI
 # ---------------------------------------------------------------------------
@@ -1495,3 +2061,614 @@ def test_filtered_result_shows_cohort_interpretation_note() -> None:
         in blob
     )
     assert "adjacent only within the filtered analysis-order cohort" in blob
+
+
+# ---------------------------------------------------------------------------
+# Anomaly run baseline comparison (Step 11B.11)
+# ---------------------------------------------------------------------------
+
+
+_COMPARISON_FINGERPRINT = (
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+)
+
+
+def _presentation_from_anomaly_report(
+    source: AnalysisWorkflowReport | None = None,
+) -> WorkflowPresentationReport:
+    report_source = _anomaly_only_report() if source is None else source
+    return AnalysisWorkflowReportBuilder().build(report_source).report
+
+
+def _render_with_optional_baseline(
+    *,
+    report_json: dict[str, object],
+    baseline_json: dict[str, object] | None = None,
+) -> None:
+    import streamlit as st
+
+    from process_intelligence.reporting.schemas import WorkflowPresentationReport
+    from process_intelligence.ui.streamlit_app import render_presentation_report
+
+    if baseline_json is not None:
+        st.session_state["comparison_baseline_report_json"] = baseline_json
+        st.session_state["comparison_baseline_label"] = "test-baseline"
+    render_presentation_report(
+        WorkflowPresentationReport.model_validate(report_json)
+    )
+
+
+def test_run_comparison_section_and_save_baseline_button() -> None:
+    report = _presentation_from_anomaly_report()
+    at = AppTest.from_function(
+        _render_with_optional_baseline,
+        default_timeout=30,
+        kwargs={"report_json": report.model_dump(mode="json")},
+    ).run()
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "Run comparison" in blob
+    save_button = next(
+        item
+        for item in at.button
+        if item.label == "Save current report as comparison baseline"
+    )
+    at = save_button.click().run()
+    assert not at.exception
+    state = at.session_state.filtered_state
+    assert "comparison_baseline_report_json" in state
+    baseline_json = state["comparison_baseline_report_json"]
+    assert isinstance(baseline_json, dict)
+    assert "anomaly_events" in baseline_json
+    for value in state.values():
+        assert not isinstance(value, (bytes, bytearray))
+        assert "DataFrame" not in type(value).__name__
+    assert "Baseline available" in _text_blob(at)
+
+
+def test_save_baseline_does_not_rerun_workflow() -> None:
+    _ANOMALY_WORKFLOW_RUN_COUNT["count"] = 0
+    at = AppTest.from_function(
+        _ui_entry,
+        default_timeout=30,
+        kwargs={"workflow_factory": lambda: _CountingAnomalyOnlyWorkflow()},
+    ).run()
+    at = _upload_anomaly_csv(at)
+    at = _select_analysis_mode(at, "ANOMALY_ONLY")
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    assert _ANOMALY_WORKFLOW_RUN_COUNT["count"] == 1
+    save_button = next(
+        item
+        for item in at.button
+        if item.label == "Save current report as comparison baseline"
+    )
+    at = save_button.click().run()
+    assert not at.exception
+    assert _ANOMALY_WORKFLOW_RUN_COUNT["count"] == 1
+
+
+def test_new_run_does_not_auto_replace_baseline() -> None:
+    report = _presentation_from_anomaly_report()
+    baseline_json = report.model_dump(mode="json")
+    at = AppTest.from_function(
+        _render_with_optional_baseline,
+        default_timeout=30,
+        kwargs={
+            "report_json": report.model_dump(mode="json"),
+            "baseline_json": baseline_json,
+        },
+    ).run()
+    assert not at.exception
+    labels = [item.label for item in at.button]
+    assert "Replace comparison baseline" in labels
+    assert "Clear comparison baseline" in labels
+    assert "Save current report as comparison baseline" not in labels
+
+
+def test_clear_comparison_baseline() -> None:
+    report = _presentation_from_anomaly_report()
+    at = AppTest.from_function(
+        _render_with_optional_baseline,
+        default_timeout=30,
+        kwargs={
+            "report_json": report.model_dump(mode="json"),
+            "baseline_json": report.model_dump(mode="json"),
+        },
+    ).run()
+    clear_button = next(
+        item for item in at.button if item.label == "Clear comparison baseline"
+    )
+    at = clear_button.click().run()
+    assert not at.exception
+    state = at.session_state.filtered_state
+    assert "comparison_baseline_report_json" not in state
+    blob = _text_blob(at)
+    assert "Baseline vs current anomaly analysis" not in blob
+    assert "Overview" in blob
+
+
+def test_same_dataset_comparison_sections_and_downloads() -> None:
+    baseline_source = _anomaly_only_report()
+    current_source = baseline_source.model_copy(
+        update={
+            "anomaly_event_count": 1,
+            "diagnosis_factor_count": 1,
+            "selected_operating_row_id": 5,
+            "anomaly_events": [
+                baseline_source.anomaly_events[1].model_copy(deep=True),
+            ],
+            "diagnosis_factors": [
+                baseline_source.diagnosis_factors[0].model_copy(deep=True),
+            ],
+        }
+    )
+    baseline = _presentation_from_anomaly_report(baseline_source)
+    current = _presentation_from_anomaly_report(current_source)
+    at = AppTest.from_function(
+        _render_with_optional_baseline,
+        default_timeout=30,
+        kwargs={
+            "report_json": current.model_dump(mode="json"),
+            "baseline_json": baseline.model_dump(mode="json"),
+        },
+    ).run()
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "Baseline vs current anomaly analysis" in blob
+    assert "Configuration comparison" in blob
+    assert "Event overlap" in blob
+    assert "Diagnosis factor comparison" in blob
+    assert "Interpretation note" in blob
+    assert "Anomaly score magnitudes are not directly comparable" in blob
+    assert "Shared events indicate row-selection stability" in blob
+    download_labels = [item.label for item in at.download_button]
+    assert "Download event overlap CSV" in download_labels
+    assert "Download factor comparison CSV" in download_labels
+    serialized = str(at)
+    assert "score_delta" not in serialized
+    assert "anomaly_score_delta" not in serialized
+
+
+def test_different_dataset_compatibility_warning() -> None:
+    baseline = _presentation_from_anomaly_report()
+    current = _presentation_from_anomaly_report(
+        _anomaly_only_report().model_copy(
+            update={"dataset_fingerprint": _COMPARISON_FINGERPRINT}
+        )
+    )
+    at = AppTest.from_function(
+        _render_with_optional_baseline,
+        default_timeout=30,
+        kwargs={
+            "report_json": current.model_dump(mode="json"),
+            "baseline_json": baseline.model_dump(mode="json"),
+        },
+    ).run()
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "different datasets" in blob.lower()
+    assert "Baseline vs current anomaly analysis" not in blob
+
+
+def test_supervised_anomaly_mismatch_warning() -> None:
+    anomaly = _presentation_from_anomaly_report()
+    shared_fingerprint = anomaly.dataset_fingerprint
+    assert shared_fingerprint is not None
+    supervised_source = _completed_report().model_copy(
+        update={
+            "dataset_fingerprint": shared_fingerprint,
+            "metadata": {
+                **_completed_report().metadata,
+                "analysis_mode": "SUPERVISED",
+            },
+        }
+    )
+    supervised = AnalysisWorkflowReportBuilder().build(supervised_source).report
+    at = AppTest.from_function(
+        _render_with_optional_baseline,
+        default_timeout=30,
+        kwargs={
+            "report_json": anomaly.model_dump(mode="json"),
+            "baseline_json": supervised.model_dump(mode="json"),
+        },
+    ).run()
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "ANOMALY_ONLY" in blob
+    assert "Baseline vs current anomaly analysis" not in blob
+
+
+def test_comparison_page_has_no_absolute_path_or_traceback() -> None:
+    report = _presentation_from_anomaly_report()
+    at = AppTest.from_function(
+        _render_with_optional_baseline,
+        default_timeout=30,
+        kwargs={
+            "report_json": report.model_dump(mode="json"),
+            "baseline_json": report.model_dump(mode="json"),
+        },
+    ).run()
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "Traceback" not in blob
+    assert "C:\\Users\\" not in blob
+    assert "/Users/" not in blob
+    assert report.dataset_fingerprint is not None
+    assert report.dataset_fingerprint not in blob
+
+
+def test_baseline_summary_without_full_fingerprint() -> None:
+    report = _presentation_from_anomaly_report()
+    at = AppTest.from_function(
+        _render_with_optional_baseline,
+        default_timeout=30,
+        kwargs={
+            "report_json": report.model_dump(mode="json"),
+            "baseline_json": report.model_dump(mode="json"),
+        },
+    ).run()
+    blob = _text_blob(at)
+    assert "Baseline available" in blob
+    assert "Analysis mode" in blob
+    assert "ANOMALY_ONLY" in blob
+    assert report.dataset_fingerprint is not None
+    assert report.dataset_fingerprint not in blob
+
+
+# ---------------------------------------------------------------------------
+# Analysis configuration preset import/export
+# ---------------------------------------------------------------------------
+
+
+def _compatible_supervised_preset_json() -> bytes:
+    from process_intelligence.ui.configuration_preset import (
+        build_configuration_preset,
+        configuration_preset_to_json,
+    )
+    from process_intelligence.ui.schemas import UiMetricRuleInput
+    from process_intelligence.workflow import AnalysisExecutionMode
+
+    preset = build_configuration_preset(
+        analysis_mode=AnalysisExecutionMode.SUPERVISED,
+        target_column="quality",
+        use_recommended_numeric_feature_set=True,
+        timestamp_column="timestamp",
+        identifier_columns=["lot_id"],
+        excluded_columns=["notes"],
+        recommendation_objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+        performance_rules=[
+            UiMetricRuleInput(
+                metric_name="rmse",
+                direction=MetricAcceptanceDirection.LOWER_IS_BETTER,
+                threshold=12.5,
+                required=True,
+            )
+        ],
+        maximum_simultaneous_changes=2,
+    )
+    return configuration_preset_to_json(preset).encode("utf-8")
+
+
+def _incompatible_preset_json() -> bytes:
+    from process_intelligence.ui.configuration_preset import (
+        build_configuration_preset,
+        configuration_preset_to_json,
+    )
+    from process_intelligence.workflow import AnalysisExecutionMode
+
+    preset = build_configuration_preset(
+        analysis_mode=AnalysisExecutionMode.SUPERVISED,
+        target_column="absent_target",
+        maximum_simultaneous_changes=1,
+    )
+    return configuration_preset_to_json(preset).encode("utf-8")
+
+
+def _upload_preset_json(
+    at: AppTest,
+    payload: bytes,
+    *,
+    name: str = "process_intelligence_configuration.json",
+) -> AppTest:
+    preset_uploader = next(
+        item for item in at.file_uploader if item.label == "Upload configuration JSON"
+    )
+    return preset_uploader.set_value([(name, payload, "application/json")]).run()
+
+
+def test_configuration_preset_section_rendering() -> None:
+    at = _upload_csv(_make_app().run())
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "Analysis configuration preset" in blob
+
+
+def test_configuration_preset_download_button_present() -> None:
+    at = _upload_csv(_make_app().run())
+    labels = [item.label for item in at.download_button]
+    assert "Download configuration JSON" in labels
+
+
+def test_configuration_preset_uploader_present() -> None:
+    at = _upload_csv(_make_app().run())
+    labels = [item.label for item in at.file_uploader]
+    assert "CSV upload" in labels
+    assert "Upload configuration JSON" in labels
+    assert len(at.file_uploader) == 2
+
+
+def test_configuration_preset_apply_before_click_does_not_change_ui_state() -> None:
+    at = _upload_csv(_make_app().run())
+    before_mode = next(
+        item for item in at.selectbox if item.label == "Analysis mode"
+    ).value
+    before_target = next(
+        item for item in at.selectbox if item.label == "Target column"
+    ).value
+    at = _upload_preset_json(at, _compatible_supervised_preset_json())
+    assert not at.exception
+    after_mode = next(
+        item for item in at.selectbox if item.label == "Analysis mode"
+    ).value
+    after_target = next(
+        item for item in at.selectbox if item.label == "Target column"
+    ).value
+    assert after_mode == before_mode
+    assert after_target == before_target
+    apply_button = next(
+        item for item in at.button if item.label == "Apply configuration"
+    )
+    assert apply_button.disabled is False
+
+
+def test_configuration_preset_invalid_shows_error() -> None:
+    at = _upload_csv(_make_app().run())
+    at = _upload_preset_json(at, b"{not-json", name="bad.json")
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "JSON parsing failed" in blob or "validation failed" in blob.lower()
+    apply_button = next(
+        item for item in at.button if item.label == "Apply configuration"
+    )
+    assert apply_button.disabled is True
+
+
+def test_configuration_preset_compatible_apply_success() -> None:
+    at = _upload_csv(_make_app().run())
+    at = _upload_preset_json(at, _compatible_supervised_preset_json())
+    apply_button = next(
+        item for item in at.button if item.label == "Apply configuration"
+    )
+    at = apply_button.click().run()
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "Configuration applied" in blob
+    target_box = next(item for item in at.selectbox if item.label == "Target column")
+    assert target_box.value == "quality"
+    objective_box = next(item for item in at.selectbox if item.label == "Objective")
+    assert objective_box.value == RecommendationObjective.REDUCE_ANOMALY_SCORE.value
+
+
+def test_configuration_preset_incompatible_columns_rejected() -> None:
+    at = _upload_csv(_make_app().run())
+    before_target = next(
+        item for item in at.selectbox if item.label == "Target column"
+    ).value
+    at = _upload_preset_json(at, _incompatible_preset_json(), name="bad_columns.json")
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "absent_target" in blob
+    apply_button = next(
+        item for item in at.button if item.label == "Apply configuration"
+    )
+    assert apply_button.disabled is True
+    after_target = next(
+        item for item in at.selectbox if item.label == "Target column"
+    ).value
+    assert after_target == before_target
+
+
+def test_configuration_preset_import_does_not_auto_run_workflow() -> None:
+    at = _upload_anomaly_csv(_make_anomaly_capturing_app().run())
+    from process_intelligence.ui.configuration_preset import (
+        build_configuration_preset,
+        configuration_preset_to_json,
+    )
+    from process_intelligence.workflow import AnalysisExecutionMode
+
+    assert _CountingCapturingWorkflow.run_count == 0
+    preset_bytes = configuration_preset_to_json(
+        build_configuration_preset(
+            analysis_mode=AnalysisExecutionMode.ANOMALY_ONLY,
+            use_recommended_numeric_feature_set=True,
+            maximum_simultaneous_changes=2,
+        )
+    ).encode("utf-8")
+    at = _upload_preset_json(at, preset_bytes)
+    apply_button = next(
+        item for item in at.button if item.label == "Apply configuration"
+    )
+    at = apply_button.click().run()
+    assert not at.exception
+    assert _CountingCapturingWorkflow.run_count == 0
+    blob = _text_blob(at)
+    assert "Run readiness" in blob
+
+
+def test_configuration_preset_session_state_has_no_forbidden_runtime_objects() -> None:
+    at = _upload_csv(_make_app().run())
+    at = _upload_preset_json(at, _compatible_supervised_preset_json())
+    apply_button = next(
+        item for item in at.button if item.label == "Apply configuration"
+    )
+    at = apply_button.click().run()
+    assert not at.exception
+    state = at.session_state.filtered_state
+    preset_keys = {
+        "ui_configuration_preset_parsed",
+        "ui_configuration_preset_validation_message",
+        "ui_configuration_preset_validation_ok",
+        "ui_configuration_preset_missing_columns",
+        "ui_configuration_preset_apply_summary",
+        "ui_configuration_preset_pending_apply",
+    }
+    for key, value in state.items():
+        assert not isinstance(value, (bytes, bytearray, memoryview)), key
+        type_name = type(value).__name__
+        assert "DataFrame" not in type_name, key
+        assert "Estimator" not in type_name, key
+        assert not hasattr(value, "predict"), key
+        if key in preset_keys:
+            assert type_name not in {
+                "UploadedFile",
+                "Path",
+                "WindowsPath",
+                "PosixPath",
+                "AnalysisWorkflowRequest",
+                "WorkflowPresentationReport",
+            }, key
+            if isinstance(value, dict):
+                json.dumps(value)
+
+
+def test_configuration_preset_download_present_when_valid() -> None:
+    at = _upload_csv(_make_app().run())
+    labels = [item.label for item in at.download_button]
+    assert "Download configuration JSON" in labels
+    blob = _text_blob(at)
+    assert "Complete or clear the highlighted configuration rows" not in blob
+
+
+def test_configuration_preset_download_blocked_for_incomplete_rule() -> None:
+    at = _upload_csv(_make_app().run())
+    metric_box = next(
+        item for item in at.text_input if item.label.startswith("Metric name #")
+    )
+    at = metric_box.set_value("rmse").run()
+    assert not at.exception
+    labels = [item.label for item in at.download_button]
+    assert "Download configuration JSON" not in labels
+    blob = _text_blob(at)
+    assert (
+        "Complete or clear the highlighted configuration rows before "
+        "exporting the preset."
+    ) in blob
+    assert "Performance rule 1 is incomplete" in blob
+
+
+def test_configuration_preset_download_blocked_for_incomplete_constraint() -> None:
+    at = _upload_csv(_make_app().run())
+    constraint_box = next(
+        item
+        for item in at.multiselect
+        if item.label == "Variables with recommendation constraints"
+    )
+    at = constraint_box.set_value(["pressure"]).run()
+    min_box = next(
+        item for item in at.number_input if item.label == "Minimum for pressure"
+    )
+    at = min_box.set_value(10.0).run()
+    max_box = next(
+        item for item in at.number_input if item.label == "Maximum for pressure"
+    )
+    at = max_box.set_value(1.0).run()
+    assert not at.exception
+    labels = [item.label for item in at.download_button]
+    assert "Download configuration JSON" not in labels
+    blob = _text_blob(at)
+    assert "Constraint for 'pressure' is invalid" in blob
+    assert "lower bound must not exceed upper bound" in blob
+
+
+def test_configuration_preset_export_issues_do_not_auto_correct_settings() -> None:
+    at = _upload_csv(_make_app().run())
+    metric_box = next(
+        item for item in at.text_input if item.label.startswith("Metric name #")
+    )
+    at = metric_box.set_value("rmse").run()
+    metric_after = next(
+        item for item in at.text_input if item.label.startswith("Metric name #")
+    )
+    assert metric_after.value == "rmse"
+    direction_box = next(
+        item for item in at.selectbox if item.label.startswith("Direction #")
+    )
+    assert direction_box.value == "(select direction)"
+    threshold_box = next(
+        item for item in at.text_input if item.label.startswith("Threshold #")
+    )
+    assert threshold_box.value == ""
+
+
+def test_configuration_preset_export_validation_does_not_auto_run_workflow() -> None:
+    at = _upload_anomaly_csv(_make_anomaly_capturing_app().run())
+    at = _select_analysis_mode(at, "ANOMALY_ONLY")
+    assert _CountingCapturingWorkflow.run_count == 0
+    enable_box = next(
+        item
+        for item in at.checkbox
+        if item.label == "Enable anomaly-score reduction recommendation"
+    )
+    at = enable_box.check().run()
+    review_box = next(
+        item
+        for item in at.multiselect
+        if item.label == "Candidate variables with explicit role overrides"
+    )
+    at = review_box.set_value(["pressure"]).run()
+    constraint_box = next(
+        item
+        for item in at.multiselect
+        if item.label == "Variables with recommendation constraints"
+    )
+    at = constraint_box.set_value(["pressure"]).run()
+    assert not at.exception
+    assert _CountingCapturingWorkflow.run_count == 0
+    labels = [item.label for item in at.download_button]
+    assert "Download configuration JSON" not in labels
+    blob = _text_blob(at)
+    assert "Constraint for 'pressure' is incomplete" in blob
+    assert "Run readiness" in blob
+
+
+def test_configuration_preset_import_still_works_with_export_validation() -> None:
+    at = _upload_csv(_make_app().run())
+    at = _upload_preset_json(at, _compatible_supervised_preset_json())
+    apply_button = next(
+        item for item in at.button if item.label == "Apply configuration"
+    )
+    at = apply_button.click().run()
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "Configuration applied" in blob
+    labels = [item.label for item in at.download_button]
+    assert "Download configuration JSON" in labels
+
+
+def test_configuration_preset_download_blocked_for_incomplete_cohort_filter() -> None:
+    at = _upload_anomaly_csv(_make_anomaly_app().run())
+    at = _select_analysis_mode(at, "ANOMALY_ONLY")
+    restrict = next(
+        item
+        for item in at.checkbox
+        if item.label == "Restrict analysis to an operating range"
+    )
+    at = restrict.check().run()
+    assert not at.exception
+    labels = [item.label for item in at.download_button]
+    assert "Download configuration JSON" not in labels
+    blob = _text_blob(at)
+    assert "Operating cohort filter is incomplete" in blob
+    assert "Current configuration summary" in blob
+    assert "Enabled (incomplete)" in blob
+
+
+def test_configuration_preset_export_keeps_wide_csv_ui() -> None:
+    at = _upload_csv(_make_app().run())
+    labels = [item.label for item in at.selectbox]
+    assert "Target column" in labels
+    assert "Analysis mode" in labels
+    assert "Objective" in labels
+    assert any(item.label == "CSV upload" for item in at.file_uploader)
+    assert "Analysis configuration preset" in _text_blob(at)
+

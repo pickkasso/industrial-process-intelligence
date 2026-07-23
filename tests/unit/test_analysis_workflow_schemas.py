@@ -46,6 +46,7 @@ from process_intelligence.workflow import (
     AnomalyContextRow,
     AnomalyContextValue,
     AnomalyContextWindow,
+    AnomalyRecommendationConfig,
     IndustrialProcessAnalysisWorkflow,
     NumericCohortFilter,
     OperatingPointSelectionMode,
@@ -77,6 +78,7 @@ _CANONICAL_STAGE_NAMES = [
     "ANOMALY_EVENT_SELECTION",
     "DIAGNOSIS",
     "RECOMMENDATION",
+    "WHAT_IF_VERIFICATION",
 ]
 
 
@@ -541,7 +543,7 @@ def test_stage_enum_values_and_canonical_order() -> None:
     assert list(AnalysisWorkflowStage) == [
         AnalysisWorkflowStage(name) for name in _CANONICAL_STAGE_NAMES
     ]
-    assert len(AnalysisWorkflowStage) == 21
+    assert len(AnalysisWorkflowStage) == 22
     assert AnalysisWorkflowStage.__doc__
 
 
@@ -583,7 +585,7 @@ def test_analysis_execution_mode_values() -> None:
 
 
 def test_enums_have_no_extra_members() -> None:
-    assert len(AnalysisWorkflowStage) == 21
+    assert len(AnalysisWorkflowStage) == 22
     assert len(AnalysisWorkflowStatus) == 3
     assert len(OperatingPointSelectionMode) == 4
     assert len(TaskSelectionSource) == 2
@@ -725,6 +727,101 @@ def test_request_anomaly_only_performance_policy_conflict_rejected() -> None:
 def test_request_anomaly_only_objective_conflict_rejected() -> None:
     with pytest.raises(ValidationError):
         _anomaly_request(objective=RecommendationObjective.REDUCE_ANOMALY_SCORE)
+
+
+def test_anomaly_recommendation_config_disabled_default() -> None:
+    config = AnomalyRecommendationConfig()
+    assert config.enabled is False
+    request = _anomaly_request()
+    assert request.anomaly_recommendation.enabled is False
+    assert request.objective is None
+
+
+def test_anomaly_recommendation_enabled_valid_config() -> None:
+    request = _anomaly_request(
+        objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+        anomaly_recommendation=AnomalyRecommendationConfig(enabled=True),
+        column_role_overrides={"temperature": ColumnRole.CONTROLLABLE_PROCESS},
+        request_constraints=[
+            VariableConstraint(
+                variable="temperature",
+                adjustable=True,
+                minimum=0.0,
+                maximum=100.0,
+                fixed=False,
+            )
+        ],
+        user_confirmed_controllable_variables=["temperature"],
+        user_verified_variables=["temperature"],
+        max_simultaneous_changes=2,
+    )
+    assert request.anomaly_recommendation.enabled is True
+    assert request.objective is RecommendationObjective.REDUCE_ANOMALY_SCORE
+    assert request.model_performance_policy is None
+
+
+def test_anomaly_recommendation_invalid_max_changes_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_request(
+            objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+            anomaly_recommendation=AnomalyRecommendationConfig(enabled=True),
+            max_simultaneous_changes=0,
+        )
+
+
+def test_supervised_rejects_anomaly_recommendation_enabled() -> None:
+    with pytest.raises(ValidationError):
+        _request(
+            anomaly_recommendation=AnomalyRecommendationConfig(enabled=True),
+        )
+
+
+def test_anomaly_recommendation_config_immutable_copy() -> None:
+    config = AnomalyRecommendationConfig(enabled=True)
+    copied = config.model_copy(deep=True)
+    assert copied.enabled is True
+    assert copied is not config
+
+
+def test_anomaly_recommendation_enabled_json_round_trip() -> None:
+    request = _anomaly_request(
+        objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+        anomaly_recommendation={"enabled": True},
+        max_simultaneous_changes=1,
+    )
+    restored = AnalysisWorkflowRequest.model_validate(request.model_dump(mode="json"))
+    assert restored.anomaly_recommendation.enabled is True
+    assert restored.objective is RecommendationObjective.REDUCE_ANOMALY_SCORE
+
+
+def test_anomaly_recommendation_backward_compatible_default() -> None:
+    payload = _anomaly_request_kwargs()
+    request = AnalysisWorkflowRequest(**payload)
+    assert request.anomaly_recommendation.enabled is False
+
+
+def test_anomaly_recommendation_stale_quality_objective_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_request(
+            objective=RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
+            anomaly_recommendation=AnomalyRecommendationConfig(enabled=True),
+        )
+
+
+def test_anomaly_recommendation_forces_reduce_anomaly_score() -> None:
+    request = _anomaly_request(
+        objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+        anomaly_recommendation=AnomalyRecommendationConfig(enabled=True),
+    )
+    assert request.objective is RecommendationObjective.REDUCE_ANOMALY_SCORE
+
+
+def test_anomaly_recommendation_performance_policy_not_required() -> None:
+    request = _anomaly_request(
+        objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+        anomaly_recommendation=AnomalyRecommendationConfig(enabled=True),
+    )
+    assert request.model_performance_policy is None
 
 
 def test_request_anomaly_only_quality_direction_conflict_rejected() -> None:
@@ -1385,6 +1482,7 @@ def test_public_package_exports() -> None:
         "AnomalyContextRow",
         "AnomalyContextValue",
         "AnomalyContextWindow",
+        "AnomalyRecommendationConfig",
         "CohortFilterSummary",
         "IndustrialProcessAnalysisWorkflow",
         "NumericCohortFilter",
@@ -1392,7 +1490,11 @@ def test_public_package_exports() -> None:
         "OperatingPointSelectionMode",
         "TaskSelectionSource",
         "apply_numeric_cohort_filter",
+        "compute_dataset_content_fingerprint",
+        "compute_dataset_content_fingerprint_from_bytes",
+        "is_valid_dataset_fingerprint",
         "list_numeric_cohort_filter_candidates",
+        "normalize_optional_dataset_fingerprint",
         "observed_numeric_range",
         "preview_numeric_cohort_filter_row_count",
     }

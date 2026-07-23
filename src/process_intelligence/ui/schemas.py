@@ -261,6 +261,7 @@ class WorkflowUiSubmission(BaseModel):
     )
     explicit_operating_row_id: int | str | None = None
     cohort_filter: NumericCohortFilter | None = None
+    anomaly_recommendation_enabled: bool = False
     metadata: dict[str, ScalarMetadataValue] = Field(default_factory=dict)
 
     @field_validator("analysis_mode", mode="before")
@@ -607,11 +608,20 @@ class WorkflowUiSubmission(BaseModel):
             f"got {type(value).__name__}"
         )
 
+    @field_validator("anomaly_recommendation_enabled", mode="before")
+    @classmethod
+    def _validate_anomaly_recommendation_enabled(cls, value: object) -> bool:
+        return _require_strict_bool(
+            value,
+            field_name="anomaly_recommendation_enabled",
+        )
+
     @model_validator(mode="after")
     def _validate_cross_fields(self) -> Self:
         feature_set = set(self.feature_columns)
         identifier_set = set(self.identifier_columns)
         excluded_set = set(self.excluded_columns)
+        anomaly_recommendation_enabled = self.anomaly_recommendation_enabled
 
         if self.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY:
             if self.target_column is not None:
@@ -627,10 +637,6 @@ class WorkflowUiSubmission(BaseModel):
                     "performance_rules must be empty when analysis_mode "
                     "is ANOMALY_ONLY"
                 )
-            if self.objective is not None:
-                raise ValueError(
-                    "objective must be None when analysis_mode is ANOMALY_ONLY"
-                )
             if self.quality_direction is not None:
                 raise ValueError(
                     "quality_direction must be None when analysis_mode "
@@ -640,7 +646,39 @@ class WorkflowUiSubmission(BaseModel):
                 raise ValueError(
                     "quality_target must be None when analysis_mode is ANOMALY_ONLY"
                 )
+            if anomaly_recommendation_enabled:
+                if self.objective is not RecommendationObjective.REDUCE_ANOMALY_SCORE:
+                    raise ValueError(
+                        "objective must be REDUCE_ANOMALY_SCORE when "
+                        "anomaly_recommendation_enabled is True"
+                    )
+            elif self.objective is not None:
+                raise ValueError(
+                    "objective must be None when analysis_mode is ANOMALY_ONLY "
+                    "and anomaly_recommendation_enabled is False"
+                )
+            if not anomaly_recommendation_enabled:
+                if self.constraints:
+                    raise ValueError(
+                        "constraints must be empty when "
+                        "anomaly_recommendation_enabled is False"
+                    )
+                if self.user_confirmed_controllable_variables:
+                    raise ValueError(
+                        "user_confirmed_controllable_variables must be empty when "
+                        "anomaly_recommendation_enabled is False"
+                    )
+                if self.user_verified_variables:
+                    raise ValueError(
+                        "user_verified_variables must be empty when "
+                        "anomaly_recommendation_enabled is False"
+                    )
         else:
+            if anomaly_recommendation_enabled:
+                raise ValueError(
+                    "anomaly_recommendation_enabled must be False when "
+                    "analysis_mode is SUPERVISED"
+                )
             if self.cohort_filter is not None:
                 raise ValueError(
                     "cohort_filter is only supported when analysis_mode is "

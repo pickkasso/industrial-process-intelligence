@@ -328,6 +328,48 @@ def test_anomaly_only_objective_conflict_rejected() -> None:
         _anomaly_submission(objective=RecommendationObjective.REDUCE_ANOMALY_SCORE)
 
 
+def test_anomaly_recommendation_enabled_default_false() -> None:
+    submission = _anomaly_submission()
+    assert submission.anomaly_recommendation_enabled is False
+
+
+def test_anomaly_recommendation_enabled_requires_reduce_objective() -> None:
+    submission = _anomaly_submission(
+        anomaly_recommendation_enabled=True,
+        objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+    )
+    assert submission.anomaly_recommendation_enabled is True
+    assert submission.objective is RecommendationObjective.REDUCE_ANOMALY_SCORE
+
+
+def test_anomaly_recommendation_enabled_rejects_quality_objective() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_submission(
+            anomaly_recommendation_enabled=True,
+            objective=RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
+            quality_direction=QualityOptimizationDirection.MAXIMIZE,
+        )
+
+
+def test_anomaly_recommendation_disabled_rejects_stale_constraints() -> None:
+    with pytest.raises(ValidationError):
+        _anomaly_submission(
+            anomaly_recommendation_enabled=False,
+            constraints=[
+                UiVariableConstraintInput(
+                    variable="temperature",
+                    minimum=1.0,
+                    maximum=2.0,
+                )
+            ],
+        )
+
+
+def test_supervised_rejects_anomaly_recommendation_enabled() -> None:
+    with pytest.raises(ValidationError):
+        _submission(anomaly_recommendation_enabled=True)
+
+
 def test_anomaly_only_quality_direction_conflict_rejected() -> None:
     with pytest.raises(ValidationError):
         _anomaly_submission(quality_direction=QualityOptimizationDirection.MAXIMIZE)

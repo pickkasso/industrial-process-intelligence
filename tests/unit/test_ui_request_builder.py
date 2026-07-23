@@ -467,3 +467,104 @@ def test_builder_forces_cohort_filter_none_for_supervised(tmp_path: Path) -> Non
         submission=_submission(),
     )
     assert request.cohort_filter is None
+
+def test_builder_anomaly_recommendation_disabled_default(tmp_path: Path) -> None:
+    csv_path = _write_csv(tmp_path / "sample.csv")
+    request = WorkflowUiRequestBuilder().build(
+        csv_path=csv_path,
+        submission=_anomaly_submission(),
+    )
+    assert request.anomaly_recommendation.enabled is False
+    assert request.objective is None
+    assert request.request_constraints == []
+
+
+def test_builder_anomaly_recommendation_enabled_fixed_objective(tmp_path: Path) -> None:
+    from process_intelligence.core.enums import ColumnRole
+    from process_intelligence.ui.schemas import UiVariableConstraintInput
+
+    csv_path = _write_csv(tmp_path / "sample.csv")
+    request = WorkflowUiRequestBuilder().build(
+        csv_path=csv_path,
+        submission=_anomaly_submission(
+            anomaly_recommendation_enabled=True,
+            objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+            column_role_overrides={"temperature": ColumnRole.CONTROLLABLE_PROCESS},
+            constraints=[
+                UiVariableConstraintInput(
+                    variable="temperature",
+                    minimum=60.0,
+                    maximum=160.0,
+                )
+            ],
+            user_confirmed_controllable_variables=["temperature"],
+            user_verified_variables=["temperature"],
+            max_simultaneous_changes=1,
+        ),
+    )
+    assert request.anomaly_recommendation.enabled is True
+    assert request.objective is RecommendationObjective.REDUCE_ANOMALY_SCORE
+    assert request.target_column is None
+    assert request.requested_task is None
+    assert request.model_performance_policy is None
+    assert request.quality_direction is None
+    assert [item.variable for item in request.request_constraints] == ["temperature"]
+    assert request.user_confirmed_controllable_variables == ["temperature"]
+    assert request.user_verified_variables == ["temperature"]
+    assert request.max_simultaneous_changes == 1
+    assert request.column_role_overrides["temperature"] is ColumnRole.CONTROLLABLE_PROCESS
+
+
+def test_builder_anomaly_recommendation_excludes_filter_column_candidates(
+    tmp_path: Path,
+) -> None:
+    from process_intelligence.core.enums import ColumnRole
+    from process_intelligence.ui.schemas import UiVariableConstraintInput
+    from process_intelligence.workflow import NumericCohortFilter
+
+    csv_path = _write_csv(tmp_path / "sample.csv")
+    request = WorkflowUiRequestBuilder().build(
+        csv_path=csv_path,
+        submission=_anomaly_submission(
+            anomaly_recommendation_enabled=True,
+            objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+            cohort_filter=NumericCohortFilter(
+                column_name="pressure",
+                lower_bound=10.0,
+                upper_bound=50.0,
+            ),
+            column_role_overrides={
+                "temperature": ColumnRole.CONTROLLABLE_PROCESS,
+                "pressure": ColumnRole.CONTROLLABLE_PROCESS,
+            },
+            constraints=[
+                UiVariableConstraintInput(
+                    variable="temperature",
+                    minimum=60.0,
+                    maximum=160.0,
+                ),
+                UiVariableConstraintInput(
+                    variable="pressure",
+                    minimum=10.0,
+                    maximum=50.0,
+                ),
+            ],
+            user_confirmed_controllable_variables=["temperature", "pressure"],
+            user_verified_variables=["temperature", "pressure"],
+        ),
+    )
+    assert [item.variable for item in request.request_constraints] == ["temperature"]
+    assert request.user_confirmed_controllable_variables == ["temperature"]
+    assert request.user_verified_variables == ["temperature"]
+    assert "pressure" not in request.column_role_overrides
+
+
+def test_builder_supervised_does_not_submit_anomaly_recommendation_flag(
+    tmp_path: Path,
+) -> None:
+    csv_path = _write_csv(tmp_path / "sample.csv")
+    request = WorkflowUiRequestBuilder().build(
+        csv_path=csv_path,
+        submission=_submission(),
+    )
+    assert request.anomaly_recommendation.enabled is False

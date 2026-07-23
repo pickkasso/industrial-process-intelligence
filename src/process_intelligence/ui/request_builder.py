@@ -15,6 +15,7 @@ from process_intelligence.evaluation.performance_acceptance import (
     MetricAcceptanceRule,
     ModelPerformanceAcceptancePolicy,
 )
+from process_intelligence.recommendation import RecommendationObjective
 from process_intelligence.ui.schemas import (
     UiMetricRuleInput,
     UiVariableConstraintInput,
@@ -24,6 +25,7 @@ from process_intelligence.workflow.enums import AnalysisExecutionMode
 from process_intelligence.workflow.schemas import (
     AnalysisWorkflowPolicy,
     AnalysisWorkflowRequest,
+    AnomalyRecommendationConfig,
     ScalarMetadataValue,
 )
 
@@ -97,6 +99,71 @@ class WorkflowUiRequestBuilder:
         metadata["analysis_mode"] = submission_copy.analysis_mode.value
 
         if submission_copy.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY:
+            anomaly_enabled = bool(submission_copy.anomaly_recommendation_enabled)
+            if anomaly_enabled:
+                constraints = [
+                    self._to_variable_constraint(item)
+                    for item in submission_copy.constraints
+                ]
+                if submission_copy.cohort_filter is not None:
+                    filter_column = submission_copy.cohort_filter.column_name
+                    constraints = [
+                        item
+                        for item in constraints
+                        if item.variable != filter_column
+                    ]
+                    confirmed = [
+                        name
+                        for name in submission_copy.user_confirmed_controllable_variables
+                        if name != filter_column
+                    ]
+                    verified = [
+                        name
+                        for name in submission_copy.user_verified_variables
+                        if name != filter_column
+                    ]
+                    role_overrides = {
+                        name: role
+                        for name, role in submission_copy.column_role_overrides.items()
+                        if name != filter_column
+                    }
+                else:
+                    confirmed = list(
+                        submission_copy.user_confirmed_controllable_variables
+                    )
+                    verified = list(submission_copy.user_verified_variables)
+                    role_overrides = dict(submission_copy.column_role_overrides)
+                return AnalysisWorkflowRequest(
+                    csv_path=csv_path,
+                    analysis_mode=AnalysisExecutionMode.ANOMALY_ONLY,
+                    target_column=None,
+                    feature_columns=list(submission_copy.feature_columns),
+                    model_performance_policy=None,
+                    timestamp_column=submission_copy.timestamp_column,
+                    identifier_columns=list(submission_copy.identifier_columns),
+                    excluded_columns=list(submission_copy.excluded_columns),
+                    column_role_overrides=role_overrides,
+                    requested_task=None,
+                    objective=RecommendationObjective.REDUCE_ANOMALY_SCORE,
+                    quality_direction=None,
+                    quality_target=None,
+                    request_constraints=constraints,
+                    industry_constraints=[],
+                    user_overrides=[],
+                    user_confirmed_controllable_variables=confirmed,
+                    user_verified_variables=verified,
+                    max_simultaneous_changes=submission_copy.max_simultaneous_changes,
+                    operating_point_selection=submission_copy.operating_point_selection,
+                    explicit_operating_row_id=submission_copy.explicit_operating_row_id,
+                    cohort_filter=(
+                        None
+                        if submission_copy.cohort_filter is None
+                        else submission_copy.cohort_filter.model_copy(deep=True)
+                    ),
+                    anomaly_recommendation=AnomalyRecommendationConfig(enabled=True),
+                    metadata=metadata,
+                )
+
             return AnalysisWorkflowRequest(
                 csv_path=csv_path,
                 analysis_mode=AnalysisExecutionMode.ANOMALY_ONLY,
@@ -124,6 +191,7 @@ class WorkflowUiRequestBuilder:
                     if submission_copy.cohort_filter is None
                     else submission_copy.cohort_filter.model_copy(deep=True)
                 ),
+                anomaly_recommendation=AnomalyRecommendationConfig(enabled=False),
                 metadata=metadata,
             )
 
@@ -160,6 +228,7 @@ class WorkflowUiRequestBuilder:
             operating_point_selection=submission_copy.operating_point_selection,
             explicit_operating_row_id=submission_copy.explicit_operating_row_id,
             cohort_filter=None,
+            anomaly_recommendation=AnomalyRecommendationConfig(enabled=False),
             metadata=metadata,
         )
 

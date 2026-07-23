@@ -7,6 +7,14 @@ from process_intelligence.ui.column_configuration import (
     UiColumnSuggestionCategory,
     resolve_active_feature_columns,
 )
+from process_intelligence.ui.configuration_preset import (
+    WorkflowUiConfigurationPreset,
+    apply_configuration_preset_to_session_state,
+    build_configuration_preset,
+    check_configuration_preset_column_compatibility,
+    configuration_preset_to_json,
+    parse_configuration_preset_json,
+)
 from process_intelligence.ui.request_builder import WorkflowUiRequestBuilder
 from process_intelligence.ui.schemas import (
     StreamlitUiConfig,
@@ -28,9 +36,15 @@ __all__ = [
     "UiColumnSuggestionCategory",
     "UiMetricRuleInput",
     "UiVariableConstraintInput",
+    "WorkflowUiConfigurationPreset",
     "WorkflowUiRequestBuilder",
     "WorkflowUiSubmission",
+    "apply_configuration_preset_to_session_state",
+    "build_configuration_preset",
+    "check_configuration_preset_column_compatibility",
+    "configuration_preset_to_json",
     "create_default_analysis_workflow",
+    "parse_configuration_preset_json",
     "render_app",
     "render_presentation_report",
     "resolve_active_feature_columns",

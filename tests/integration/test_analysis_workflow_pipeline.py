@@ -34,6 +34,8 @@ from process_intelligence.recommendation import (
     QualityOptimizationDirection,
     RecommendationObjective,
     RecommendationStatus,
+    WhatIfStabilityClassification,
+    WhatIfVerificationStatus,
 )
 from process_intelligence.workflow import (
     ANOMALY_CONTEXT_MAX_FEATURES,
@@ -46,10 +48,12 @@ from process_intelligence.workflow import (
     AnalysisWorkflowStage,
     AnalysisWorkflowStatus,
     AnomalyContextOrderBasis,
+    AnomalyRecommendationConfig,
     IndustrialProcessAnalysisWorkflow,
     NumericCohortFilter,
     OperatingPointSelectionMode,
     TaskSelectionSource,
+    compute_dataset_content_fingerprint,
 )
 
 # ---------------------------------------------------------------------------
@@ -720,7 +724,116 @@ def test_status_and_recommendation_status(
     assert recommendation.status in _HAPPY_RECOMMENDATION_STATUSES
     if report.status is AnalysisWorkflowStatus.COMPLETED:
         assert recommendation.status is RecommendationStatus.GENERATED
-        assert report.terminal_stage is AnalysisWorkflowStage.RECOMMENDATION
+        assert report.terminal_stage is AnalysisWorkflowStage.WHAT_IF_VERIFICATION
+
+
+# ---------------------------------------------------------------------------
+# What-if verification (Step 11B.13)
+# ---------------------------------------------------------------------------
+
+
+def test_generated_recommendation_has_completed_what_if_verification(
+    quality_outcome: AnalysisWorkflowOutcome,
+) -> None:
+    report = quality_outcome.report
+    if report.status is not AnalysisWorkflowStatus.COMPLETED:
+        pytest.skip("Fixture did not reach a GENERATED recommendation this run.")
+    recommendation = report.final_recommendation
+    assert recommendation is not None
+    assert recommendation.status is RecommendationStatus.GENERATED
+
+    verification = report.recommendation_verification
+    assert verification is not None
+    assert verification.status is WhatIfVerificationStatus.COMPLETED
+    assert verification.scenario_count >= 2
+    # verify() must reuse the already-fitted recommendation models rather
+    # than refitting anything for the local what-if check.
+    assert verification.metadata.get("model_refit_performed") is False
+
+    stage = next(
+        record
+        for record in report.stage_records
+        if record.stage is AnalysisWorkflowStage.WHAT_IF_VERIFICATION
+    )
+    assert stage.executed is True
+    assert stage.succeeded is True
+    assert stage.metadata.get("model_refit_performed") is False
+
+
+def test_anomaly_recommendation_generated_has_completed_what_if_verification(
+    anomaly_recommendation_outcome: AnalysisWorkflowOutcome,
+) -> None:
+    report = anomaly_recommendation_outcome.report
+    recommendation = report.final_recommendation
+    assert recommendation is not None
+    # What-if verification must never mutate the already-generated
+    # recommendation's own status.
+    assert recommendation.status is RecommendationStatus.GENERATED
+
+    verification = report.recommendation_verification
+    assert verification is not None
+    assert verification.status is WhatIfVerificationStatus.COMPLETED
+    assert verification.metadata.get("model_refit_performed") is False
+    assert verification.metadata.get("recommendation_mutated") is False
+
+    stage = next(
+        record
+        for record in report.stage_records
+        if record.stage is AnalysisWorkflowStage.WHAT_IF_VERIFICATION
+    )
+    assert stage.executed is True
+    assert stage.succeeded is True
+
+
+def test_what_if_verification_skipped_when_recommendation_disabled(
+    anomaly_outcome: AnalysisWorkflowOutcome,
+) -> None:
+    report = anomaly_outcome.report
+    recommendation_stage = next(
+        record
+        for record in report.stage_records
+        if record.stage is AnalysisWorkflowStage.RECOMMENDATION
+    )
+    assert recommendation_stage.executed is False
+
+    verification_stage = next(
+        record
+        for record in report.stage_records
+        if record.stage is AnalysisWorkflowStage.WHAT_IF_VERIFICATION
+    )
+    assert verification_stage.executed is False
+    assert report.recommendation_verification is None
+
+
+def test_what_if_verification_skipped_when_recommendation_refused(
+    anomaly_recommendation_csv: Path,
+) -> None:
+    outcome = _make_anomaly_workflow().run(
+        build_anomaly_recommendation_request(
+            anomaly_recommendation_csv,
+            user_confirmed_controllable_variables=[],
+            user_verified_variables=[],
+            request_constraints=[],
+        )
+    )
+    report = outcome.report
+    assert report.final_recommendation is not None
+    assert report.final_recommendation.status is RecommendationStatus.REFUSED
+
+    verification = report.recommendation_verification
+    assert verification is not None
+    assert verification.status is WhatIfVerificationStatus.NOT_APPLICABLE
+    assert verification.stability_classification is WhatIfStabilityClassification.UNAVAILABLE
+    assert verification.scenarios == []
+    assert verification.metadata.get("verification_executed") is False
+    assert verification.metadata.get("model_refit_performed") is False
+
+    verification_stage = next(
+        record
+        for record in report.stage_records
+        if record.stage is AnalysisWorkflowStage.WHAT_IF_VERIFICATION
+    )
+    assert verification_stage.executed is False
 
 
 # ---------------------------------------------------------------------------
@@ -1524,6 +1637,10 @@ def test_anomaly_only_recommendation_pipeline_not_executed(
     )
     assert recommendation_record.executed is False
     assert recommendation_record.metadata["recommendation_applicable"] is False
+    assert (
+        recommendation_record.message
+        == "Recommendation generation is not enabled for anomaly-only analysis."
+    )
     assert report.terminal_stage is AnalysisWorkflowStage.DIAGNOSIS
 
 
@@ -1542,6 +1659,23 @@ def test_anomaly_only_csv_unchanged_after_run(battery_csv: Path) -> None:
         assert after.schema[column] == dtype
 
 
+def test_anomaly_only_dataset_fingerprint_from_csv_content(
+    battery_csv: Path,
+    anomaly_outcome: AnalysisWorkflowOutcome,
+) -> None:
+    expected = compute_dataset_content_fingerprint(battery_csv)
+    report = anomaly_outcome.report
+    assert report.dataset_fingerprint == expected
+    assert report.dataset_fingerprint is not None
+    assert len(report.dataset_fingerprint) == 64
+    assert report.dataset_fingerprint == report.dataset_fingerprint.lower()
+    assert str(battery_csv) not in report.dataset_fingerprint
+    assert battery_csv.name not in report.dataset_fingerprint
+    dumped = report.model_dump(mode="json")
+    assert dumped["dataset_fingerprint"] == expected
+    assert str(battery_csv.resolve()) not in str(dumped)
+
+
 def test_anomaly_only_determinism(battery_csv: Path) -> None:
     first = _run_anomaly(battery_csv).report
     second = _run_anomaly(battery_csv).report
@@ -1549,6 +1683,7 @@ def test_anomaly_only_determinism(battery_csv: Path) -> None:
     assert first.anomaly_event_count == second.anomaly_event_count
     assert first.diagnosis_factor_count == second.diagnosis_factor_count
     assert first.status is second.status
+    assert first.dataset_fingerprint == second.dataset_fingerprint
 
 
 def test_supervised_full_workflow_regression_still_passes(
@@ -2009,3 +2144,273 @@ def test_supervised_workflow_still_skips_cohort_filter(
     )
     assert record.executed is False
     assert quality_outcome.report.cohort_filter_summary.configured is False
+
+
+# ---------------------------------------------------------------------------
+# Step 11B.12 Safe anomaly-only recommendation
+# ---------------------------------------------------------------------------
+
+ANOMALY_REC_FEATURES = [
+    "temperature",
+    "pressure",
+    "flow",
+    "sensor_a",
+    "sensor_b",
+]
+
+
+def write_anomaly_recommendation_csv(path: Path, *, n_rows: int = 300) -> Path:
+    """Write a synthetic process CSV with injectable high-temperature anomalies."""
+    rng = np.random.default_rng(42)
+    temperature = rng.normal(80.0, 3.0, n_rows)
+    pressure = rng.normal(50.0, 2.0, n_rows)
+    flow = rng.normal(20.0, 1.5, n_rows)
+    sensor_a = rng.normal(10.0, 1.0, n_rows)
+    sensor_b = rng.normal(10.0, 1.0, n_rows)
+    for index in range(n_rows - 30, n_rows):
+        temperature[index] = 140.0 + rng.normal(0.0, 1.0)
+        pressure[index] = 50.0 + rng.normal(0.0, 0.5)
+        flow[index] = 20.0 + rng.normal(0.0, 0.3)
+        sensor_a[index] = 10.0 + rng.normal(0.0, 0.2)
+        sensor_b[index] = 10.0 + rng.normal(0.0, 0.2)
+    pl.DataFrame(
+        {
+            "temperature": temperature.tolist(),
+            "pressure": pressure.tolist(),
+            "flow": flow.tolist(),
+            "sensor_a": sensor_a.tolist(),
+            "sensor_b": sensor_b.tolist(),
+            "lot_id": [f"LOT-{index}" for index in range(n_rows)],
+        }
+    ).write_csv(path)
+    return path
+
+
+def build_anomaly_recommendation_request(
+    csv_path: Path,
+    **overrides: Any,
+) -> AnalysisWorkflowRequest:
+    params: dict[str, Any] = {
+        "csv_path": csv_path,
+        "analysis_mode": AnalysisExecutionMode.ANOMALY_ONLY,
+        "feature_columns": list(ANOMALY_REC_FEATURES),
+        "identifier_columns": ["lot_id"],
+        "objective": RecommendationObjective.REDUCE_ANOMALY_SCORE,
+        "anomaly_recommendation": AnomalyRecommendationConfig(enabled=True),
+        "column_role_overrides": {
+            "temperature": ColumnRole.CONTROLLABLE_PROCESS,
+        },
+        "request_constraints": [
+            VariableConstraint(
+                variable="temperature",
+                adjustable=True,
+                minimum=60.0,
+                maximum=160.0,
+                fixed=False,
+            )
+        ],
+        "user_confirmed_controllable_variables": ["temperature"],
+        "user_verified_variables": ["temperature"],
+        "max_simultaneous_changes": 1,
+        "operating_point_selection": (
+            OperatingPointSelectionMode.TOP_UNSUPERVISED_ANOMALY
+        ),
+    }
+    params.update(overrides)
+    return AnalysisWorkflowRequest(**params)
+
+
+@pytest.fixture(scope="module")
+def anomaly_recommendation_csv(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("anomaly_rec") / "anomaly_recommendation.csv"
+    return write_anomaly_recommendation_csv(path)
+
+
+@pytest.fixture(scope="module")
+def anomaly_recommendation_outcome(
+    anomaly_recommendation_csv: Path,
+) -> AnalysisWorkflowOutcome:
+    workflow = _make_anomaly_workflow()
+    return workflow.run(build_anomaly_recommendation_request(anomaly_recommendation_csv))
+
+
+def test_anomaly_recommendation_disabled_remains_skipped(battery_csv: Path) -> None:
+    outcome = _run_anomaly(battery_csv)
+    recommendation = next(
+        record
+        for record in outcome.report.stage_records
+        if record.stage is AnalysisWorkflowStage.RECOMMENDATION
+    )
+    assert recommendation.executed is False
+    assert outcome.report.final_recommendation is None
+    assert outcome.report.status is AnalysisWorkflowStatus.PARTIAL
+
+
+def test_anomaly_recommendation_enabled_generates_changes(
+    anomaly_recommendation_outcome: AnalysisWorkflowOutcome,
+) -> None:
+    report = anomaly_recommendation_outcome.report
+    assert report.status is AnalysisWorkflowStatus.COMPLETED
+    recommendation = report.final_recommendation
+    assert recommendation is not None
+    assert recommendation.status is RecommendationStatus.GENERATED
+    assert recommendation.objective is RecommendationObjective.REDUCE_ANOMALY_SCORE
+    assert recommendation.baseline_anomaly_score is not None
+    assert recommendation.proposed_anomaly_score is not None
+    assert recommendation.proposed_anomaly_score < recommendation.baseline_anomaly_score
+    assert len(recommendation.changes) >= 1
+    assert len(recommendation.changes) <= 1
+    for change in recommendation.changes:
+        assert change.variable == "temperature"
+        assert 60.0 <= change.proposed_value <= 160.0
+    stage = next(
+        record
+        for record in report.stage_records
+        if record.stage is AnalysisWorkflowStage.RECOMMENDATION
+    )
+    assert stage.executed is True
+    assert stage.succeeded is True
+    assert report.metadata["recommendation_pipeline_executed"] is True
+    assert report.metadata["model_performance_status"] == "NOT_APPLICABLE"
+
+
+def test_anomaly_recommendation_uses_operating_row(
+    anomaly_recommendation_outcome: AnalysisWorkflowOutcome,
+) -> None:
+    report = anomaly_recommendation_outcome.report
+    assert report.selected_operating_row_id is not None
+    stage = next(
+        record
+        for record in report.stage_records
+        if record.stage is AnalysisWorkflowStage.RECOMMENDATION
+    )
+    assert stage.metadata["operating_row_id"] == report.selected_operating_row_id
+
+
+def test_anomaly_recommendation_preserves_negative_scores(
+    anomaly_recommendation_outcome: AnalysisWorkflowOutcome,
+) -> None:
+    recommendation = anomaly_recommendation_outcome.report.final_recommendation
+    assert recommendation is not None
+    assert recommendation.proposed_anomaly_score is not None
+    # Negative scores must remain negative when produced by the fitted model.
+    if recommendation.proposed_anomaly_score < 0.0:
+        assert recommendation.proposed_anomaly_score < 0.0
+
+
+def test_anomaly_recommendation_candidate_intersection_excludes_measurements(
+    anomaly_recommendation_outcome: AnalysisWorkflowOutcome,
+) -> None:
+    recommendation = anomaly_recommendation_outcome.report.final_recommendation
+    assert recommendation is not None
+    changed = {change.variable for change in recommendation.changes}
+    assert "sensor_a" not in changed
+    assert "sensor_b" not in changed
+    assert "flow" not in changed or "flow" in recommendation.safety_decision.blocked_variables
+
+
+def test_anomaly_recommendation_no_eligible_candidate_refusal(
+    anomaly_recommendation_csv: Path,
+) -> None:
+    outcome = _make_anomaly_workflow().run(
+        build_anomaly_recommendation_request(
+            anomaly_recommendation_csv,
+            user_confirmed_controllable_variables=[],
+            user_verified_variables=[],
+            request_constraints=[],
+        )
+    )
+    report = outcome.report
+    assert report.final_recommendation is not None
+    assert report.final_recommendation.status is RecommendationStatus.REFUSED
+    assert report.status is AnalysisWorkflowStatus.REFUSED
+    assert report.anomaly_event_count >= 1
+    assert report.diagnosis_factor_count >= 1
+    assert report.metadata["recommendation_pipeline_executed"] is False
+
+
+def test_anomaly_recommendation_excludes_cohort_filter_column(
+    anomaly_recommendation_csv: Path,
+) -> None:
+    outcome = _make_anomaly_workflow().run(
+        build_anomaly_recommendation_request(
+            anomaly_recommendation_csv,
+            feature_columns=list(ANOMALY_REC_FEATURES),
+            cohort_filter=NumericCohortFilter(
+                column_name="pressure",
+                lower_bound=0.0,
+                upper_bound=200.0,
+                exclude_filter_column_from_features=False,
+            ),
+            column_role_overrides={
+                "temperature": ColumnRole.CONTROLLABLE_PROCESS,
+                "pressure": ColumnRole.CONTROLLABLE_PROCESS,
+            },
+            request_constraints=[
+                VariableConstraint(
+                    variable="temperature",
+                    adjustable=True,
+                    minimum=60.0,
+                    maximum=160.0,
+                    fixed=False,
+                ),
+                VariableConstraint(
+                    variable="pressure",
+                    adjustable=True,
+                    minimum=0.0,
+                    maximum=200.0,
+                    fixed=False,
+                ),
+            ],
+            user_confirmed_controllable_variables=["temperature", "pressure"],
+            user_verified_variables=["temperature", "pressure"],
+            max_simultaneous_changes=2,
+        )
+    )
+    recommendation = outcome.report.final_recommendation
+    assert recommendation is not None
+    if recommendation.status is RecommendationStatus.GENERATED:
+        changed = {change.variable for change in recommendation.changes}
+        assert "pressure" not in changed
+
+
+def test_anomaly_recommendation_input_frame_immutable(
+    anomaly_recommendation_csv: Path,
+) -> None:
+    before = pl.read_csv(anomaly_recommendation_csv)
+    _make_anomaly_workflow().run(
+        build_anomaly_recommendation_request(anomaly_recommendation_csv)
+    )
+    after = pl.read_csv(anomaly_recommendation_csv)
+    assert after.equals(before)
+
+
+def test_anomaly_recommendation_deterministic(
+    anomaly_recommendation_csv: Path,
+) -> None:
+    first = _make_anomaly_workflow().run(
+        build_anomaly_recommendation_request(anomaly_recommendation_csv)
+    ).report
+    second = _make_anomaly_workflow().run(
+        build_anomaly_recommendation_request(anomaly_recommendation_csv)
+    ).report
+    assert first.status is second.status
+    assert first.selected_operating_row_id == second.selected_operating_row_id
+    assert first.final_recommendation is not None
+    assert second.final_recommendation is not None
+    assert first.final_recommendation.status is second.final_recommendation.status
+    assert [
+        (c.variable, c.proposed_value) for c in first.final_recommendation.changes
+    ] == [
+        (c.variable, c.proposed_value) for c in second.final_recommendation.changes
+    ]
+
+
+def test_anomaly_recommendation_no_model_report_leakage(
+    anomaly_recommendation_outcome: AnalysisWorkflowOutcome,
+) -> None:
+    dumped = anomaly_recommendation_outcome.report.model_dump(mode="json")
+    blob = str(dumped)
+    assert "IsolationForest" not in blob
+    assert "estimator" not in blob.lower() or "estimator_key" in blob
+    assert "traceback" not in blob.lower()

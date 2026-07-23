@@ -17,8 +17,13 @@ from process_intelligence.evaluation import (
     ModelPerformanceAcceptanceStatus,
 )
 from process_intelligence.recommendation import (
+    RecommendationObjective,
     RecommendationSafetyStatus,
     RecommendationStatus,
+    WhatIfPerturbationDirection,
+    WhatIfStabilityClassification,
+    WhatIfVerificationScenarioType,
+    WhatIfVerificationStatus,
 )
 from process_intelligence.reporting import (
     AnomalyContextRowView,
@@ -30,6 +35,8 @@ from process_intelligence.reporting import (
     PerformanceMetricView,
     RecommendationChangeView,
     RecommendationView,
+    RecommendationWhatIfVerificationView,
+    WhatIfVerificationScenarioView,
     WorkflowCohortFilterSummaryView,
     WorkflowDataSummaryView,
     WorkflowModelSummaryView,
@@ -38,6 +45,7 @@ from process_intelligence.reporting import (
     WorkflowPresentationReport,
     WorkflowRoutingSummaryView,
     WorkflowStageView,
+    stability_classification_message,
 )
 from process_intelligence.workflow import (
     AnalysisWorkflowStage,
@@ -211,6 +219,7 @@ def _change(**overrides: Any) -> RecommendationChangeView:
 def _recommendation(**overrides: Any) -> RecommendationView:
     payload: dict[str, Any] = {
         "status": RecommendationStatus.GENERATED,
+        "objective": RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
         "changes": [_change()],
         "confidence": 0.5,
         "baseline_prediction": 80.0,
@@ -963,3 +972,225 @@ def test_anomaly_context_window_view_round_trip() -> None:
     encoded = json.dumps(report.model_dump(mode="json"))
     assert "RSOCmin" in encoded
     assert "DataFrame" not in encoded
+
+
+# ---------------------------------------------------------------------------
+# What-if verification presentation views (Step 11B.13)
+# ---------------------------------------------------------------------------
+
+
+def _wif_scenario_view(**overrides: Any) -> WhatIfVerificationScenarioView:
+    payload: dict[str, Any] = {
+        "scenario_id": "WIF-000000",
+        "scenario_type": WhatIfVerificationScenarioType.BASELINE,
+        "perturbed_variable": None,
+        "perturbation_direction": None,
+        "perturbed_value": None,
+        "variable_values": {"temperature": 50.0},
+        "predicted_quality": None,
+        "anomaly_score": -0.2,
+        "objective_value": -0.2,
+        "improves_over_baseline": False,
+        "improves_or_matches_proposed": False,
+        "extrapolated": False,
+        "warnings": [],
+    }
+    payload.update(overrides)
+    return WhatIfVerificationScenarioView(**payload)
+
+
+def _wif_verification_view(**overrides: Any) -> RecommendationWhatIfVerificationView:
+    payload: dict[str, Any] = {
+        "status": WhatIfVerificationStatus.COMPLETED,
+        "objective": RecommendationObjective.REDUCE_ANOMALY_SCORE,
+        "baseline_objective_value": -0.2,
+        "proposed_objective_value": -0.6,
+        "scenario_count": 4,
+        "neighbor_scenario_count": 2,
+        "improving_neighbor_count": 1,
+        "non_improving_neighbor_count": 1,
+        "extrapolated_scenario_count": 0,
+        "stability_classification": WhatIfStabilityClassification.MIXED,
+        "stability_message": stability_classification_message(
+            WhatIfStabilityClassification.MIXED
+        ),
+        "scenarios": [
+            _wif_scenario_view(),
+            _wif_scenario_view(
+                scenario_id="WIF-000001",
+                scenario_type=WhatIfVerificationScenarioType.PROPOSED_CENTER,
+                variable_values={"temperature": 65.0},
+                anomaly_score=-0.6,
+                objective_value=-0.6,
+                improves_over_baseline=True,
+                improves_or_matches_proposed=True,
+            ),
+        ],
+        "warnings": [],
+        "rationale": (
+            "Local what-if verification scored adjacent constraint-grid "
+            "neighbors with the same fitted model."
+        ),
+    }
+    payload.update(overrides)
+    return RecommendationWhatIfVerificationView(**payload)
+
+
+def test_wif_scenario_view_constructs_normally() -> None:
+    scenario = _wif_scenario_view()
+    assert scenario.scenario_type is WhatIfVerificationScenarioType.BASELINE
+    assert scenario.variable_values == {"temperature": 50.0}
+    assert scenario.improves_over_baseline is False
+
+
+def test_wif_scenario_view_extra_fields_forbidden() -> None:
+    with pytest.raises(ValidationError):
+        WhatIfVerificationScenarioView(
+            **{**_wif_scenario_view().model_dump(), "unexpected": True}
+        )
+
+
+def test_wif_scenario_view_requires_non_empty_scenario_id() -> None:
+    # Unlike the domain-layer ``WhatIfVerificationScenario``, this
+    # presentation view only requires a non-empty scenario_id string; it
+    # does not re-enforce the WIF-000000 format invariant.
+    with pytest.raises(ValidationError):
+        _wif_scenario_view(scenario_id="")
+
+
+def test_wif_scenario_view_rejects_non_finite_values() -> None:
+    with pytest.raises(ValidationError):
+        _wif_scenario_view(objective_value=float("nan"))
+    with pytest.raises(ValidationError):
+        _wif_scenario_view(anomaly_score=float("inf"))
+    with pytest.raises(ValidationError):
+        _wif_scenario_view(variable_values={"temperature": float("nan")})
+
+
+def test_wif_scenario_view_rejects_non_strict_bool() -> None:
+    with pytest.raises(ValidationError):
+        _wif_scenario_view(improves_over_baseline=1)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        _wif_scenario_view(extrapolated="false")  # type: ignore[arg-type]
+
+
+def test_wif_scenario_view_perturbation_direction_round_trip() -> None:
+    scenario = _wif_scenario_view(
+        scenario_id="WIF-000002",
+        scenario_type=WhatIfVerificationScenarioType.UPPER_NEIGHBOR,
+        perturbed_variable="temperature",
+        perturbation_direction=WhatIfPerturbationDirection.UPPER,
+        perturbed_value=70.0,
+        variable_values={"temperature": 70.0},
+    )
+    dumped = scenario.model_dump(mode="json")
+    encoded = json.dumps(dumped)
+    restored = WhatIfVerificationScenarioView.model_validate(json.loads(encoded))
+    assert restored.perturbation_direction is WhatIfPerturbationDirection.UPPER
+    assert restored == scenario
+
+
+def test_wif_verification_view_constructs_normally() -> None:
+    view = _wif_verification_view()
+    assert view.status is WhatIfVerificationStatus.COMPLETED
+    assert view.stability_classification is WhatIfStabilityClassification.MIXED
+    assert view.stability_message == stability_classification_message(
+        WhatIfStabilityClassification.MIXED
+    )
+    assert len(view.scenarios) == 2
+    assert "not proof of physical safety" in view.disclaimer
+
+
+def test_wif_verification_view_extra_fields_forbidden() -> None:
+    with pytest.raises(ValidationError):
+        RecommendationWhatIfVerificationView(
+            **{**_wif_verification_view().model_dump(), "unexpected": True}
+        )
+
+
+def test_wif_verification_view_rejects_negative_counts() -> None:
+    with pytest.raises(ValidationError):
+        _wif_verification_view(scenario_count=-1)
+    with pytest.raises(ValidationError):
+        _wif_verification_view(neighbor_scenario_count=-1)
+
+
+def test_wif_verification_view_not_applicable_has_empty_scenarios() -> None:
+    view = _wif_verification_view(
+        status=WhatIfVerificationStatus.NOT_APPLICABLE,
+        baseline_objective_value=None,
+        proposed_objective_value=None,
+        scenario_count=0,
+        neighbor_scenario_count=0,
+        improving_neighbor_count=0,
+        non_improving_neighbor_count=0,
+        extrapolated_scenario_count=0,
+        stability_classification=WhatIfStabilityClassification.UNAVAILABLE,
+        stability_message=stability_classification_message(
+            WhatIfStabilityClassification.UNAVAILABLE
+        ),
+        scenarios=[],
+    )
+    assert view.scenarios == []
+    assert view.status is WhatIfVerificationStatus.NOT_APPLICABLE
+
+
+def test_wif_verification_view_scenarios_are_deep_copied() -> None:
+    scenario = _wif_scenario_view()
+    scenarios = [scenario]
+    view = _wif_verification_view(
+        scenarios=scenarios,
+        scenario_count=1,
+        neighbor_scenario_count=0,
+        improving_neighbor_count=0,
+        non_improving_neighbor_count=0,
+        stability_classification=WhatIfStabilityClassification.NO_NEIGHBORS,
+        stability_message=stability_classification_message(
+            WhatIfStabilityClassification.NO_NEIGHBORS
+        ),
+    )
+    original_copy = scenario.model_copy(deep=True)
+    scenarios.append(_wif_scenario_view(scenario_id="WIF-000009"))
+    assert len(view.scenarios) == 1
+    assert view.scenarios[0] == original_copy
+
+
+def test_wif_verification_view_json_round_trip() -> None:
+    view = _wif_verification_view()
+    dumped = json.dumps(view.model_dump(mode="json"))
+    restored = RecommendationWhatIfVerificationView.model_validate(json.loads(dumped))
+    assert restored == view
+
+
+def test_stability_classification_message_covers_every_classification() -> None:
+    for classification in WhatIfStabilityClassification:
+        message = stability_classification_message(classification)
+        assert isinstance(message, str)
+        assert message != ""
+
+
+def test_presentation_report_accepts_recommendation_verification() -> None:
+    report = _presentation(recommendation_verification=_wif_verification_view())
+    assert report.recommendation_verification is not None
+    assert report.recommendation_verification.status is WhatIfVerificationStatus.COMPLETED
+
+
+def test_presentation_report_recommendation_verification_defaults_to_none() -> None:
+    report = _presentation()
+    assert report.recommendation_verification is None
+
+
+def test_presentation_report_recommendation_verification_rejects_wrong_type() -> None:
+    with pytest.raises(ValidationError):
+        _presentation(recommendation_verification="not-a-view")  # type: ignore[arg-type]
+
+
+def test_presentation_report_recommendation_verification_json_round_trip() -> None:
+    report = _presentation(recommendation_verification=_wif_verification_view())
+    dumped = json.dumps(report.model_dump(mode="json"))
+    restored = WorkflowPresentationReport.model_validate(json.loads(dumped))
+    assert restored.recommendation_verification is not None
+    assert (
+        restored.recommendation_verification.stability_classification
+        is WhatIfStabilityClassification.MIXED
+    )

@@ -11,6 +11,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -21,8 +22,16 @@ from process_intelligence.evaluation.performance_acceptance import (
     ModelPerformanceAcceptanceStatus,
 )
 from process_intelligence.recommendation.enums import (
+    RecommendationObjective,
     RecommendationSafetyStatus,
     RecommendationStatus,
+    WhatIfPerturbationDirection,
+    WhatIfStabilityClassification,
+    WhatIfVerificationScenarioType,
+    WhatIfVerificationStatus,
+)
+from process_intelligence.workflow.dataset_fingerprint import (
+    normalize_optional_dataset_fingerprint,
 )
 from process_intelligence.workflow.enums import (
     AnalysisWorkflowStage,
@@ -985,6 +994,7 @@ class RecommendationView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: RecommendationStatus
+    objective: RecommendationObjective
     changes: list[RecommendationChangeView]
     confidence: float
     baseline_prediction: float | None = None
@@ -1011,6 +1021,22 @@ class RecommendationView(BaseModel):
                 raise ValueError(f"invalid RecommendationStatus: {value!r}") from exc
         raise ValueError(
             f"status must be RecommendationStatus, got {type(value).__name__}"
+        )
+
+    @field_validator("objective", mode="before")
+    @classmethod
+    def _validate_objective(cls, value: object) -> RecommendationObjective:
+        if isinstance(value, RecommendationObjective):
+            return value
+        if isinstance(value, str):
+            try:
+                return RecommendationObjective(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid RecommendationObjective: {value!r}"
+                ) from exc
+        raise ValueError(
+            f"objective must be RecommendationObjective, got {type(value).__name__}"
         )
 
     @field_validator("changes", mode="before")
@@ -1142,6 +1168,281 @@ class RecommendationView(BaseModel):
             if self.safety_status is not RecommendationSafetyStatus.REFUSED:
                 raise ValueError("REFUSED requires safety_status REFUSED")
         return self
+
+
+_STABILITY_MESSAGES: dict[WhatIfStabilityClassification, str] = {
+    WhatIfStabilityClassification.STABLE: (
+        "All feasible adjacent grid scenarios remained improved relative to "
+        "the baseline under the same fitted model."
+    ),
+    WhatIfStabilityClassification.MIXED: (
+        "Improvement was retained for some, but not all, adjacent grid scenarios."
+    ),
+    WhatIfStabilityClassification.ISOLATED: (
+        "Improvement was observed at the proposed grid point, but not at its "
+        "feasible immediate neighbors."
+    ),
+    WhatIfStabilityClassification.NO_NEIGHBORS: (
+        "The proposed values were located at grid boundaries, so no adjacent "
+        "verification scenarios were available."
+    ),
+    WhatIfStabilityClassification.NOT_IMPROVING: (
+        "The proposed scenario did not improve the configured objective "
+        "relative to the baseline during verification."
+    ),
+    WhatIfStabilityClassification.UNAVAILABLE: (
+        "Local what-if verification could not be completed."
+    ),
+}
+
+
+def stability_classification_message(
+    classification: WhatIfStabilityClassification,
+) -> str:
+    """Return the deterministic UI message for a stability classification."""
+    return _STABILITY_MESSAGES[classification]
+
+
+class WhatIfVerificationScenarioView(BaseModel):
+    """Presentation row for one local what-if verification scenario."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scenario_id: str
+    scenario_type: WhatIfVerificationScenarioType
+    perturbed_variable: str | None = None
+    perturbation_direction: WhatIfPerturbationDirection | None = None
+    perturbed_value: float | None = None
+    variable_values: dict[str, float] = Field(default_factory=dict)
+    predicted_quality: float | None = None
+    anomaly_score: float | None = None
+    objective_value: float
+    improves_over_baseline: bool
+    improves_or_matches_proposed: bool
+    extrapolated: bool | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+    @field_validator("scenario_id", mode="before")
+    @classmethod
+    def _validate_scenario_id(cls, value: object) -> str:
+        return _require_non_empty_str(value, field_name="scenario_id")
+
+    @field_validator("scenario_type", mode="before")
+    @classmethod
+    def _validate_scenario_type(
+        cls,
+        value: object,
+    ) -> WhatIfVerificationScenarioType:
+        if isinstance(value, WhatIfVerificationScenarioType):
+            return value
+        if isinstance(value, str):
+            return WhatIfVerificationScenarioType(value)
+        raise ValueError(
+            "scenario_type must be WhatIfVerificationScenarioType, "
+            f"got {type(value).__name__}"
+        )
+
+    @field_validator("perturbed_variable", mode="before")
+    @classmethod
+    def _validate_perturbed_variable(cls, value: object) -> str | None:
+        return _require_optional_non_empty_str(
+            value,
+            field_name="perturbed_variable",
+        )
+
+    @field_validator("perturbation_direction", mode="before")
+    @classmethod
+    def _validate_direction(
+        cls,
+        value: object,
+    ) -> WhatIfPerturbationDirection | None:
+        if value is None:
+            return None
+        if isinstance(value, WhatIfPerturbationDirection):
+            return value
+        if isinstance(value, str):
+            return WhatIfPerturbationDirection(value)
+        raise ValueError(
+            "perturbation_direction must be WhatIfPerturbationDirection or None"
+        )
+
+    @field_validator(
+        "perturbed_value",
+        "predicted_quality",
+        "anomaly_score",
+        mode="before",
+    )
+    @classmethod
+    def _validate_optional_floats(cls, value: object) -> float | None:
+        return _require_optional_finite_float(value, field_name="optional float")
+
+    @field_validator("variable_values", mode="before")
+    @classmethod
+    def _validate_variable_values(cls, value: object) -> dict[str, float]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("variable_values must be a dict[str, float]")
+        cleaned: dict[str, float] = {}
+        for key, raw in value.items():
+            name = _require_non_empty_str(key, field_name="variable_values key")
+            cleaned[name] = _require_finite_float(
+                raw,
+                field_name=f"variable_values[{name!r}]",
+            )
+        return cleaned
+
+    @field_validator("objective_value", mode="before")
+    @classmethod
+    def _validate_objective_value(cls, value: object) -> float:
+        return _require_finite_float(value, field_name="objective_value")
+
+    @field_validator(
+        "improves_over_baseline",
+        "improves_or_matches_proposed",
+        mode="before",
+    )
+    @classmethod
+    def _validate_bools(cls, value: object) -> bool:
+        return _require_strict_bool(value, field_name="scenario bool")
+
+    @field_validator("extrapolated", mode="before")
+    @classmethod
+    def _validate_extrapolated(cls, value: object) -> bool | None:
+        if value is None:
+            return None
+        return _require_strict_bool(value, field_name="extrapolated")
+
+    @field_validator("warnings", mode="before")
+    @classmethod
+    def _validate_warnings_before(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("warnings must be a list[str]")
+        return list(value)
+
+    @field_validator("warnings", mode="after")
+    @classmethod
+    def _validate_warnings(cls, value: list[str]) -> list[str]:
+        return _validate_unique_non_empty_strings(value, field_name="warnings")
+
+
+class RecommendationWhatIfVerificationView(BaseModel):
+    """Presentation summary for recommendation local what-if verification."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: WhatIfVerificationStatus
+    objective: RecommendationObjective
+    baseline_objective_value: float | None = None
+    proposed_objective_value: float | None = None
+    scenario_count: int
+    neighbor_scenario_count: int
+    improving_neighbor_count: int
+    non_improving_neighbor_count: int
+    extrapolated_scenario_count: int
+    stability_classification: WhatIfStabilityClassification
+    stability_message: str
+    scenarios: list[WhatIfVerificationScenarioView] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    rationale: str
+    disclaimer: str = (
+        "Adjacent constraint-grid scenarios are scored with the same fitted "
+        "model to show whether the proposed improvement persists locally. "
+        "This is model-local stability evidence, not proof of physical safety "
+        "or causation."
+    )
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _validate_status(cls, value: object) -> WhatIfVerificationStatus:
+        if isinstance(value, WhatIfVerificationStatus):
+            return value
+        if isinstance(value, str):
+            return WhatIfVerificationStatus(value)
+        raise ValueError("status must be WhatIfVerificationStatus")
+
+    @field_validator("objective", mode="before")
+    @classmethod
+    def _validate_objective(cls, value: object) -> RecommendationObjective:
+        if isinstance(value, RecommendationObjective):
+            return value
+        if isinstance(value, str):
+            return RecommendationObjective(value)
+        raise ValueError("objective must be RecommendationObjective")
+
+    @field_validator(
+        "baseline_objective_value",
+        "proposed_objective_value",
+        mode="before",
+    )
+    @classmethod
+    def _validate_optional_objectives(cls, value: object) -> float | None:
+        return _require_optional_finite_float(value, field_name="objective value")
+
+    @field_validator(
+        "scenario_count",
+        "neighbor_scenario_count",
+        "improving_neighbor_count",
+        "non_improving_neighbor_count",
+        "extrapolated_scenario_count",
+        mode="before",
+    )
+    @classmethod
+    def _validate_counts(cls, value: object) -> int:
+        return _require_strict_int_ge(value, field_name="count", minimum=0)
+
+    @field_validator("stability_classification", mode="before")
+    @classmethod
+    def _validate_stability(
+        cls,
+        value: object,
+    ) -> WhatIfStabilityClassification:
+        if isinstance(value, WhatIfStabilityClassification):
+            return value
+        if isinstance(value, str):
+            return WhatIfStabilityClassification(value)
+        raise ValueError("stability_classification must be WhatIfStabilityClassification")
+
+    @field_validator("stability_message", "rationale", "disclaimer", mode="before")
+    @classmethod
+    def _validate_text(cls, value: object) -> str:
+        return _require_non_empty_str(value, field_name="text field")
+
+    @field_validator("scenarios", mode="before")
+    @classmethod
+    def _validate_scenarios_before(
+        cls,
+        value: object,
+    ) -> list[WhatIfVerificationScenarioView]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("scenarios must be a list")
+        return list(value)
+
+    @field_validator("scenarios", mode="after")
+    @classmethod
+    def _validate_scenarios_after(
+        cls,
+        value: list[WhatIfVerificationScenarioView],
+    ) -> list[WhatIfVerificationScenarioView]:
+        return [item.model_copy(deep=True) for item in value]
+
+    @field_validator("warnings", mode="before")
+    @classmethod
+    def _validate_warnings_before(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("warnings must be a list[str]")
+        return list(value)
+
+    @field_validator("warnings", mode="after")
+    @classmethod
+    def _validate_warnings(cls, value: list[str]) -> list[str]:
+        return _validate_unique_non_empty_strings(value, field_name="warnings")
 
 
 class AnomalyEventView(BaseModel):
@@ -1602,9 +1903,11 @@ class WorkflowPresentationReport(BaseModel):
         default_factory=list
     )
     recommendation: RecommendationView | None = None
+    recommendation_verification: RecommendationWhatIfVerificationView | None = None
     warnings: list[str] = Field(default_factory=list)
     disclaimers: list[str] = Field(default_factory=list)
     metadata: dict[str, ScalarMetadataValue] = Field(default_factory=dict)
+    dataset_fingerprint: str | None = None
 
     @field_validator("overview", mode="before")
     @classmethod
@@ -1852,6 +2155,24 @@ class WorkflowPresentationReport(BaseModel):
             f"got {type(value).__name__}"
         )
 
+    @field_validator("recommendation_verification", mode="before")
+    @classmethod
+    def _validate_recommendation_verification(
+        cls,
+        value: object,
+    ) -> RecommendationWhatIfVerificationView | None:
+        if value is None:
+            return None
+        if isinstance(value, RecommendationWhatIfVerificationView):
+            return value.model_copy(deep=True)
+        if isinstance(value, dict):
+            return RecommendationWhatIfVerificationView.model_validate(value)
+        raise ValueError(
+            "recommendation_verification must be "
+            "RecommendationWhatIfVerificationView or None, "
+            f"got {type(value).__name__}"
+        )
+
     @field_validator("warnings", "disclaimers", mode="before")
     @classmethod
     def _validate_string_lists_before(cls, value: object) -> list[str]:
@@ -1872,6 +2193,11 @@ class WorkflowPresentationReport(BaseModel):
         if value is None:
             return {}
         return _validate_scalar_metadata(value)
+
+    @field_validator("dataset_fingerprint", mode="before")
+    @classmethod
+    def _validate_dataset_fingerprint(cls, value: object) -> str | None:
+        return normalize_optional_dataset_fingerprint(value)
 
     @model_validator(mode="after")
     def _validate_presentation_consistency(self) -> Self:
@@ -1913,6 +2239,502 @@ class WorkflowPresentationReport(BaseModel):
                         "RecommendationStatus.REFUSED"
                     )
         return self
+
+
+class DiagnosisFactorPresenceStatus(StrEnum):
+    """Whether a diagnosis factor appears in baseline, current, or both runs."""
+
+    SHARED = "SHARED"
+    BASELINE_ONLY = "BASELINE_ONLY"
+    CURRENT_ONLY = "CURRENT_ONLY"
+
+
+class EventOverlapPresenceStatus(StrEnum):
+    """Whether a selected anomaly event appears in baseline, current, or both."""
+
+    SHARED = "SHARED"
+    BASELINE_ONLY = "BASELINE_ONLY"
+    CURRENT_ONLY = "CURRENT_ONLY"
+
+
+class RunConfigurationComparisonView(BaseModel):
+    """Presentation comparison of baseline vs current run configuration."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    baseline_analysis_mode: str | None = None
+    current_analysis_mode: str | None = None
+    baseline_industry: str | None = None
+    current_industry: str | None = None
+    baseline_cohort_configured: bool
+    current_cohort_configured: bool
+    baseline_cohort_description: str
+    current_cohort_description: str
+    baseline_analysis_rows: int
+    current_analysis_rows: int
+    baseline_feature_count: int | None = None
+    current_feature_count: int | None = None
+    baseline_train_row_count: int
+    current_train_row_count: int
+    baseline_validation_row_count: int
+    current_validation_row_count: int
+    baseline_test_row_count: int
+    current_test_row_count: int
+    baseline_anomaly_model: str | None = None
+    current_anomaly_model: str | None = None
+    baseline_anomaly_event_count: int
+    current_anomaly_event_count: int
+    baseline_diagnosis_factor_count: int
+    current_diagnosis_factor_count: int
+    baseline_operating_row_id: int | str | None = None
+    current_operating_row_id: int | str | None = None
+
+    @field_validator(
+        "baseline_analysis_mode",
+        "current_analysis_mode",
+        "baseline_industry",
+        "current_industry",
+        "baseline_anomaly_model",
+        "current_anomaly_model",
+        mode="before",
+    )
+    @classmethod
+    def _validate_optional_strings(cls, value: object) -> str | None:
+        return _require_optional_non_empty_str(value, field_name="optional string")
+
+    @field_validator(
+        "baseline_cohort_configured",
+        "current_cohort_configured",
+        mode="before",
+    )
+    @classmethod
+    def _validate_bools(cls, value: object) -> bool:
+        return _require_strict_bool(value, field_name="cohort configured")
+
+    @field_validator(
+        "baseline_cohort_description",
+        "current_cohort_description",
+        mode="before",
+    )
+    @classmethod
+    def _validate_descriptions(cls, value: object) -> str:
+        return _require_non_empty_str(value, field_name="cohort description")
+
+    @field_validator(
+        "baseline_analysis_rows",
+        "current_analysis_rows",
+        "baseline_train_row_count",
+        "current_train_row_count",
+        "baseline_validation_row_count",
+        "current_validation_row_count",
+        "baseline_test_row_count",
+        "current_test_row_count",
+        "baseline_anomaly_event_count",
+        "current_anomaly_event_count",
+        "baseline_diagnosis_factor_count",
+        "current_diagnosis_factor_count",
+        mode="before",
+    )
+    @classmethod
+    def _validate_counts(cls, value: object) -> int:
+        return _require_strict_int_ge0(value, field_name="count field")
+
+    @field_validator(
+        "baseline_feature_count",
+        "current_feature_count",
+        mode="before",
+    )
+    @classmethod
+    def _validate_optional_feature_count(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        return _require_strict_int_ge0(value, field_name="feature_count")
+
+    @field_validator(
+        "baseline_operating_row_id",
+        "current_operating_row_id",
+        mode="before",
+    )
+    @classmethod
+    def _validate_operating_row_id(cls, value: object) -> int | str | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("operating row ID must not be a bool")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            return _require_non_empty_str(value, field_name="operating row ID")
+        raise ValueError(
+            "operating row ID must be int, str, or None, "
+            f"got {type(value).__name__}"
+        )
+
+
+class EventOverlapEntryView(BaseModel):
+    """One original-row identity compared across baseline and current events."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    presence_status: EventOverlapPresenceStatus
+    original_row_id: int | str
+    baseline_rank: int | None = None
+    current_rank: int | None = None
+
+    @field_validator("presence_status", mode="before")
+    @classmethod
+    def _validate_presence_status(cls, value: object) -> EventOverlapPresenceStatus:
+        if isinstance(value, EventOverlapPresenceStatus):
+            return value
+        if isinstance(value, str):
+            try:
+                return EventOverlapPresenceStatus(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid EventOverlapPresenceStatus: {value!r}"
+                ) from exc
+        raise ValueError(
+            "presence_status must be EventOverlapPresenceStatus, "
+            f"got {type(value).__name__}"
+        )
+
+    @field_validator("original_row_id", mode="before")
+    @classmethod
+    def _validate_original_row_id(cls, value: object) -> int | str:
+        if isinstance(value, bool):
+            raise ValueError("original_row_id must not be a bool")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            return _require_non_empty_str(value, field_name="original_row_id")
+        raise ValueError(
+            f"original_row_id must be int or str, got {type(value).__name__}"
+        )
+
+    @field_validator("baseline_rank", "current_rank", mode="before")
+    @classmethod
+    def _validate_optional_rank(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        return _require_strict_int_ge(value, field_name="rank", minimum=1)
+
+    @model_validator(mode="after")
+    def _validate_rank_presence(self) -> Self:
+        if self.presence_status is EventOverlapPresenceStatus.SHARED:
+            if self.baseline_rank is None or self.current_rank is None:
+                raise ValueError("SHARED events require both baseline and current ranks")
+        elif self.presence_status is EventOverlapPresenceStatus.BASELINE_ONLY:
+            if self.baseline_rank is None or self.current_rank is not None:
+                raise ValueError(
+                    "BASELINE_ONLY events require baseline_rank only"
+                )
+        elif self.presence_status is EventOverlapPresenceStatus.CURRENT_ONLY:
+            if self.current_rank is None or self.baseline_rank is not None:
+                raise ValueError(
+                    "CURRENT_ONLY events require current_rank only"
+                )
+        return self
+
+
+class EventOverlapView(BaseModel):
+    """Selected-event overlap between baseline and current anomaly runs."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    baseline_event_count: int
+    current_event_count: int
+    shared_event_count: int
+    shared_original_row_ids: list[int | str] = Field(default_factory=list)
+    baseline_only_original_row_ids: list[int | str] = Field(default_factory=list)
+    current_only_original_row_ids: list[int | str] = Field(default_factory=list)
+    entries: list[EventOverlapEntryView] = Field(default_factory=list)
+
+    @field_validator(
+        "baseline_event_count",
+        "current_event_count",
+        "shared_event_count",
+        mode="before",
+    )
+    @classmethod
+    def _validate_counts(cls, value: object) -> int:
+        return _require_strict_int_ge0(value, field_name="event count")
+
+    @field_validator(
+        "shared_original_row_ids",
+        "baseline_only_original_row_ids",
+        "current_only_original_row_ids",
+        mode="before",
+    )
+    @classmethod
+    def _validate_id_lists_before(cls, value: object) -> list[int | str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError(
+                f"row ID list must be a list[int | str], got {type(value).__name__}"
+            )
+        return list(value)
+
+    @field_validator(
+        "shared_original_row_ids",
+        "baseline_only_original_row_ids",
+        "current_only_original_row_ids",
+        mode="after",
+    )
+    @classmethod
+    def _validate_id_lists(cls, value: list[int | str]) -> list[int | str]:
+        cleaned: list[int | str] = []
+        seen: set[int | str] = set()
+        for item in value:
+            if isinstance(item, bool):
+                raise ValueError("row ID list must not contain bool values")
+            if isinstance(item, int):
+                row_id: int | str = item
+            elif isinstance(item, str):
+                row_id = _require_non_empty_str(item, field_name="row ID")
+            else:
+                raise ValueError(
+                    "row ID list entries must be int or str, "
+                    f"got {type(item).__name__}"
+                )
+            if row_id in seen:
+                raise ValueError(f"row ID list must not contain duplicates: {row_id!r}")
+            seen.add(row_id)
+            cleaned.append(row_id)
+        return cleaned
+
+    @field_validator("entries", mode="before")
+    @classmethod
+    def _validate_entries_before(cls, value: object) -> list[EventOverlapEntryView]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError(
+                f"entries must be a list[EventOverlapEntryView], "
+                f"got {type(value).__name__}"
+            )
+        return list(value)
+
+    @field_validator("entries", mode="after")
+    @classmethod
+    def _validate_entries(
+        cls,
+        value: list[EventOverlapEntryView],
+    ) -> list[EventOverlapEntryView]:
+        copied: list[EventOverlapEntryView] = []
+        seen: set[int | str] = set()
+        for item in value:
+            if not isinstance(item, EventOverlapEntryView):
+                raise ValueError(
+                    "entries entries must be EventOverlapEntryView, "
+                    f"got {type(item).__name__}"
+                )
+            if item.original_row_id in seen:
+                raise ValueError(
+                    "entries must not contain duplicate original_row_id: "
+                    f"{item.original_row_id!r}"
+                )
+            seen.add(item.original_row_id)
+            copied.append(item.model_copy(deep=True))
+        return copied
+
+    @model_validator(mode="after")
+    def _validate_overlap_consistency(self) -> Self:
+        if self.shared_event_count != len(self.shared_original_row_ids):
+            raise ValueError(
+                "shared_event_count must equal len(shared_original_row_ids)"
+            )
+        if self.shared_event_count > self.baseline_event_count:
+            raise ValueError("shared_event_count must be <= baseline_event_count")
+        if self.shared_event_count > self.current_event_count:
+            raise ValueError("shared_event_count must be <= current_event_count")
+        if len(self.baseline_only_original_row_ids) != (
+            self.baseline_event_count - self.shared_event_count
+        ):
+            raise ValueError(
+                "baseline_only_original_row_ids length must equal "
+                "baseline_event_count - shared_event_count"
+            )
+        if len(self.current_only_original_row_ids) != (
+            self.current_event_count - self.shared_event_count
+        ):
+            raise ValueError(
+                "current_only_original_row_ids length must equal "
+                "current_event_count - shared_event_count"
+            )
+        return self
+
+
+class DiagnosisFactorComparisonView(BaseModel):
+    """One diagnosis factor compared across baseline and current ranks."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    feature_name: str
+    baseline_rank: int | None = None
+    current_rank: int | None = None
+    baseline_direction: str | None = None
+    current_direction: str | None = None
+    presence_status: DiagnosisFactorPresenceStatus
+
+    @field_validator("feature_name", mode="before")
+    @classmethod
+    def _validate_feature_name(cls, value: object) -> str:
+        return _require_non_empty_str(value, field_name="feature_name")
+
+    @field_validator("baseline_rank", "current_rank", mode="before")
+    @classmethod
+    def _validate_optional_rank(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        return _require_strict_int_ge(value, field_name="rank", minimum=1)
+
+    @field_validator("baseline_direction", "current_direction", mode="before")
+    @classmethod
+    def _validate_optional_direction(cls, value: object) -> str | None:
+        return _require_optional_non_empty_str(value, field_name="direction")
+
+    @field_validator("presence_status", mode="before")
+    @classmethod
+    def _validate_presence_status(
+        cls,
+        value: object,
+    ) -> DiagnosisFactorPresenceStatus:
+        if isinstance(value, DiagnosisFactorPresenceStatus):
+            return value
+        if isinstance(value, str):
+            try:
+                return DiagnosisFactorPresenceStatus(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid DiagnosisFactorPresenceStatus: {value!r}"
+                ) from exc
+        raise ValueError(
+            "presence_status must be DiagnosisFactorPresenceStatus, "
+            f"got {type(value).__name__}"
+        )
+
+    @model_validator(mode="after")
+    def _validate_presence_ranks(self) -> Self:
+        if self.presence_status is DiagnosisFactorPresenceStatus.SHARED:
+            if self.baseline_rank is None or self.current_rank is None:
+                raise ValueError("SHARED factors require both baseline and current ranks")
+        elif self.presence_status is DiagnosisFactorPresenceStatus.BASELINE_ONLY:
+            if self.baseline_rank is None or self.current_rank is not None:
+                raise ValueError(
+                    "BASELINE_ONLY factors require baseline_rank only"
+                )
+        elif self.presence_status is DiagnosisFactorPresenceStatus.CURRENT_ONLY:
+            if self.current_rank is None or self.baseline_rank is not None:
+                raise ValueError(
+                    "CURRENT_ONLY factors require current_rank only"
+                )
+        return self
+
+
+class AnomalyRunComparisonView(BaseModel):
+    """Immutable presentation DTO for baseline vs current anomaly-run comparison."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    compatible: bool
+    compatibility_message: str
+    same_dataset: bool
+    configuration: RunConfigurationComparisonView
+    event_overlap: EventOverlapView
+    factor_comparison: list[DiagnosisFactorComparisonView] = Field(
+        default_factory=list
+    )
+    warnings: list[str] = Field(default_factory=list)
+    disclaimers: list[str] = Field(default_factory=list)
+
+    @field_validator("compatible", "same_dataset", mode="before")
+    @classmethod
+    def _validate_bools(cls, value: object) -> bool:
+        return _require_strict_bool(value, field_name="comparison bool field")
+
+    @field_validator("compatibility_message", mode="before")
+    @classmethod
+    def _validate_compatibility_message(cls, value: object) -> str:
+        return _require_non_empty_str(value, field_name="compatibility_message")
+
+    @field_validator("configuration", mode="before")
+    @classmethod
+    def _validate_configuration(
+        cls,
+        value: object,
+    ) -> RunConfigurationComparisonView:
+        if isinstance(value, RunConfigurationComparisonView):
+            return value.model_copy(deep=True)
+        if isinstance(value, dict):
+            return RunConfigurationComparisonView.model_validate(value)
+        raise ValueError(
+            "configuration must be RunConfigurationComparisonView, "
+            f"got {type(value).__name__}"
+        )
+
+    @field_validator("event_overlap", mode="before")
+    @classmethod
+    def _validate_event_overlap(cls, value: object) -> EventOverlapView:
+        if isinstance(value, EventOverlapView):
+            return value.model_copy(deep=True)
+        if isinstance(value, dict):
+            return EventOverlapView.model_validate(value)
+        raise ValueError(
+            f"event_overlap must be EventOverlapView, got {type(value).__name__}"
+        )
+
+    @field_validator("factor_comparison", mode="before")
+    @classmethod
+    def _validate_factor_comparison_before(
+        cls,
+        value: object,
+    ) -> list[DiagnosisFactorComparisonView]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError(
+                "factor_comparison must be a list[DiagnosisFactorComparisonView], "
+                f"got {type(value).__name__}"
+            )
+        return list(value)
+
+    @field_validator("factor_comparison", mode="after")
+    @classmethod
+    def _validate_factor_comparison(
+        cls,
+        value: list[DiagnosisFactorComparisonView],
+    ) -> list[DiagnosisFactorComparisonView]:
+        copied: list[DiagnosisFactorComparisonView] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, DiagnosisFactorComparisonView):
+                raise ValueError(
+                    "factor_comparison entries must be DiagnosisFactorComparisonView, "
+                    f"got {type(item).__name__}"
+                )
+            if item.feature_name in seen:
+                raise ValueError(
+                    "factor_comparison must not contain duplicate feature_name: "
+                    f"{item.feature_name!r}"
+                )
+            seen.add(item.feature_name)
+            copied.append(item.model_copy(deep=True))
+        return copied
+
+    @field_validator("warnings", "disclaimers", mode="before")
+    @classmethod
+    def _validate_string_lists_before(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError(f"string list must be a list[str], got {type(value).__name__}")
+        return list(value)
+
+    @field_validator("warnings", "disclaimers", mode="after")
+    @classmethod
+    def _validate_string_lists(cls, value: list[str]) -> list[str]:
+        return _validate_unique_non_empty_strings(value, field_name="string list")
 
 
 @dataclass(frozen=True, slots=True)

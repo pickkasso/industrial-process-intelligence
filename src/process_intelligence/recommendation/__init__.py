@@ -32,6 +32,10 @@ from process_intelligence.recommendation.enums import (
     RecommendationReasonCode,
     RecommendationSafetyStatus,
     RecommendationStatus,
+    WhatIfPerturbationDirection,
+    WhatIfStabilityClassification,
+    WhatIfVerificationScenarioType,
+    WhatIfVerificationStatus,
 )
 from process_intelligence.recommendation.pipeline import (
     RecommendationPipeline,
@@ -77,6 +81,14 @@ from process_intelligence.recommendation.schemas import (
     RecommendationSafetyDecision,
     RecommendationSafetyPolicy,
     VariableEligibilityAssessment,
+)
+from process_intelligence.recommendation.what_if_verification import (
+    RecommendationWhatIfVerificationOutcome,
+    RecommendationWhatIfVerificationResult,
+    RecommendationWhatIfVerifier,
+    WhatIfVerificationScenario,
+    classify_what_if_stability,
+    recommendation_warnings_for_stability,
 )
 
 __all__ = [
@@ -127,6 +139,9 @@ __all__ = [
     "RecommendationSafetyPolicy",
     "RecommendationSafetyStatus",
     "RecommendationStatus",
+    "RecommendationWhatIfVerificationOutcome",
+    "RecommendationWhatIfVerificationResult",
+    "RecommendationWhatIfVerifier",
     "ResolvedVariableConstraint",
     "ScenarioRankingOutcome",
     "ScenarioRankingPolicy",
@@ -140,4 +155,11 @@ __all__ = [
     "ScenarioScoringStatus",
     "VariableCandidateGrid",
     "VariableEligibilityAssessment",
+    "WhatIfPerturbationDirection",
+    "WhatIfStabilityClassification",
+    "WhatIfVerificationScenario",
+    "WhatIfVerificationScenarioType",
+    "WhatIfVerificationStatus",
+    "classify_what_if_stability",
+    "recommendation_warnings_for_stability",
 ]

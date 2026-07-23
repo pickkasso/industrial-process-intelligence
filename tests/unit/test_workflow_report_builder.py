@@ -6,6 +6,7 @@ import copy
 import json
 import math
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -26,7 +27,13 @@ from process_intelligence.recommendation import (
     RecommendationSafetyDecision,
     RecommendationSafetyStatus,
     RecommendationStatus,
+    RecommendationWhatIfVerificationResult,
     VariableEligibilityAssessment,
+    WhatIfPerturbationDirection,
+    WhatIfStabilityClassification,
+    WhatIfVerificationScenario,
+    WhatIfVerificationScenarioType,
+    WhatIfVerificationStatus,
 )
 from process_intelligence.recommendation.schemas import DEFAULT_RECOMMENDATION_DISCLAIMER
 from process_intelligence.reporting import AnalysisWorkflowReportBuilder
@@ -190,6 +197,90 @@ def _refused_result() -> RecommendationResult:
         disclaimer=DEFAULT_RECOMMENDATION_DISCLAIMER,
         generated_at=_GENERATED_AT,
     )
+
+
+def _wif_scenario(**overrides: Any) -> WhatIfVerificationScenario:
+    payload: dict[str, Any] = {
+        "scenario_id": "WIF-000000",
+        "scenario_type": WhatIfVerificationScenarioType.BASELINE,
+        "perturbed_variable": None,
+        "perturbation_direction": None,
+        "variable_values": {"pressure": 50.0},
+        "predicted_quality": None,
+        "anomaly_score": -0.35,
+        "objective_value": -0.35,
+        "improves_over_baseline": False,
+        "improves_or_matches_proposed": False,
+        "extrapolated": False,
+        "warnings": [],
+    }
+    payload.update(overrides)
+    return WhatIfVerificationScenario(**payload)
+
+
+def _wif_result(**overrides: Any) -> RecommendationWhatIfVerificationResult:
+    scenarios = overrides.pop(
+        "scenarios",
+        [
+            _wif_scenario(),
+            _wif_scenario(
+                scenario_id="WIF-000001",
+                scenario_type=WhatIfVerificationScenarioType.PROPOSED_CENTER,
+                variable_values={"pressure": 48.0},
+                anomaly_score=-0.55,
+                objective_value=-0.55,
+                improves_over_baseline=True,
+                improves_or_matches_proposed=True,
+            ),
+            _wif_scenario(
+                scenario_id="WIF-000002",
+                scenario_type=WhatIfVerificationScenarioType.LOWER_NEIGHBOR,
+                perturbed_variable="pressure",
+                perturbation_direction=WhatIfPerturbationDirection.LOWER,
+                variable_values={"pressure": 44.0},
+                anomaly_score=-0.6,
+                objective_value=-0.6,
+                improves_over_baseline=True,
+                improves_or_matches_proposed=True,
+            ),
+            _wif_scenario(
+                scenario_id="WIF-000003",
+                scenario_type=WhatIfVerificationScenarioType.UPPER_NEIGHBOR,
+                perturbed_variable="pressure",
+                perturbation_direction=WhatIfPerturbationDirection.UPPER,
+                variable_values={"pressure": 52.0},
+                anomaly_score=-0.1,
+                objective_value=-0.1,
+                improves_over_baseline=False,
+                improves_or_matches_proposed=False,
+            ),
+        ],
+    )
+    payload: dict[str, Any] = {
+        "status": WhatIfVerificationStatus.COMPLETED,
+        "objective": RecommendationObjective.REDUCE_ANOMALY_SCORE,
+        "baseline_objective_value": -0.35,
+        "proposed_objective_value": -0.55,
+        "scenario_count": len(scenarios),
+        "neighbor_scenario_count": 2,
+        "improving_neighbor_count": 1,
+        "non_improving_neighbor_count": 1,
+        "extrapolated_scenario_count": 0,
+        "stability_classification": WhatIfStabilityClassification.MIXED,
+        "scenarios": scenarios,
+        "warnings": [],
+        "rationale": (
+            "Local what-if verification scored adjacent constraint-grid "
+            "neighbors with the same fitted model."
+        ),
+        "evaluated_at": _GENERATED_AT,
+        "metadata": {
+            "verification_executed": True,
+            "model_refit_performed": False,
+        },
+    }
+    payload.update(overrides)
+    return RecommendationWhatIfVerificationResult(**payload)
 
 
 def _performance_assessment(
@@ -553,6 +644,90 @@ def test_refused_conversion() -> None:
     assert report.overview.status is AnalysisWorkflowStatus.REFUSED
     assert report.recommendation is None
     assert report.model_performance is None
+
+
+# ---------------------------------------------------------------------------
+# What-if verification view mapping (Step 11B.13)
+# ---------------------------------------------------------------------------
+
+
+def test_recommendation_verification_absent_maps_to_none() -> None:
+    # ``_completed_report()`` terminates at RECOMMENDATION (no verification
+    # field set), matching workflow runs that predate What-if verification.
+    outcome = AnalysisWorkflowReportBuilder().build(_completed_report())
+    assert outcome.report.recommendation_verification is None
+
+
+def test_recommendation_verification_completed_maps_to_view() -> None:
+    source = _completed_report(
+        terminal_stage=AnalysisWorkflowStage.WHAT_IF_VERIFICATION,
+        stage_records=_prefix_records(AnalysisWorkflowStage.WHAT_IF_VERIFICATION),
+        recommendation_verification=_wif_result(),
+    )
+    report = AnalysisWorkflowReportBuilder().build(source).report
+    verification = report.recommendation_verification
+    assert verification is not None
+    assert verification.status is WhatIfVerificationStatus.COMPLETED
+    assert verification.stability_classification is WhatIfStabilityClassification.MIXED
+    assert verification.scenario_count == 4
+    assert verification.neighbor_scenario_count == 2
+    assert len(verification.scenarios) == 4
+    assert verification.scenarios[0].scenario_id == "WIF-000000"
+    assert verification.stability_message != ""
+
+
+def test_recommendation_verification_not_applicable_maps_to_view() -> None:
+    verification_result = _wif_result(
+        status=WhatIfVerificationStatus.NOT_APPLICABLE,
+        baseline_objective_value=None,
+        proposed_objective_value=None,
+        scenario_count=0,
+        neighbor_scenario_count=0,
+        improving_neighbor_count=0,
+        non_improving_neighbor_count=0,
+        extrapolated_scenario_count=0,
+        stability_classification=WhatIfStabilityClassification.UNAVAILABLE,
+        scenarios=[],
+        warnings=[
+            "What-if verification was not applicable because recommendation "
+            "was refused."
+        ],
+    )
+    source = _refused_report(recommendation_verification=verification_result)
+    report = AnalysisWorkflowReportBuilder().build(source).report
+    verification = report.recommendation_verification
+    assert verification is not None
+    assert verification.status is WhatIfVerificationStatus.NOT_APPLICABLE
+    assert verification.scenarios == []
+    assert verification.stability_classification is WhatIfStabilityClassification.UNAVAILABLE
+
+
+def test_recommendation_verification_no_model_report_leakage() -> None:
+    source = _completed_report(
+        terminal_stage=AnalysisWorkflowStage.WHAT_IF_VERIFICATION,
+        stage_records=_prefix_records(AnalysisWorkflowStage.WHAT_IF_VERIFICATION),
+        recommendation_verification=_wif_result(),
+    )
+    report = AnalysisWorkflowReportBuilder().build(source).report
+    encoded = report.model_dump_json()
+    assert "IsolationForest" not in encoded
+    assert "traceback" not in encoded.lower()
+
+
+def test_recommendation_verification_json_round_trip() -> None:
+    source = _completed_report(
+        terminal_stage=AnalysisWorkflowStage.WHAT_IF_VERIFICATION,
+        stage_records=_prefix_records(AnalysisWorkflowStage.WHAT_IF_VERIFICATION),
+        recommendation_verification=_wif_result(),
+    )
+    report = AnalysisWorkflowReportBuilder().build(source).report
+    encoded = json.dumps(report.model_dump(mode="json"))
+    restored = type(report).model_validate(json.loads(encoded))
+    assert restored.recommendation_verification is not None
+    assert (
+        restored.recommendation_verification.stability_classification
+        is WhatIfStabilityClassification.MIXED
+    )
 
 
 def test_invalid_input_type() -> None:
@@ -1049,6 +1224,16 @@ def test_anomaly_only_analysis_mode_shown_in_metadata() -> None:
     report = AnalysisWorkflowReportBuilder().build(_anomaly_only_report()).report
     assert report.metadata["analysis_mode"] == "ANOMALY_ONLY"
     assert report.metadata["recommendation_applicable"] is False
+
+
+def test_dataset_fingerprint_passthrough_to_presentation() -> None:
+    fingerprint = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    source = _anomaly_only_report(dataset_fingerprint=fingerprint)
+    report = AnalysisWorkflowReportBuilder().build(source).report
+    assert report.dataset_fingerprint == fingerprint
+    dumped = report.model_dump(mode="json")
+    assert dumped["dataset_fingerprint"] == fingerprint
+    assert str(Path("C:/tmp/secret.csv")) not in str(dumped)
 
 
 def test_anomaly_only_target_and_task_not_applicable() -> None:

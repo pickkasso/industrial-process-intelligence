@@ -413,11 +413,14 @@ def test_stage_order_matches_workflow(
 ) -> None:
     source = quality_outcome.report
     presentation = AnalysisWorkflowReportBuilder().build(source).report
-    assert len(presentation.stages) == 21
+    stage_count = len(list(AnalysisWorkflowStage))
+    assert len(presentation.stages) == stage_count
     assert [stage.stage for stage in presentation.stages] == [
         record.stage for record in source.stage_records
     ]
-    assert [stage.sequence for stage in presentation.stages] == list(range(1, 22))
+    assert [stage.sequence for stage in presentation.stages] == list(
+        range(1, stage_count + 1)
+    )
 
 
 def test_recommendation_mapping_for_generated_or_ready(
