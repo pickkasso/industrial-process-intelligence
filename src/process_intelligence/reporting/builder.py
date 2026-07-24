@@ -753,6 +753,11 @@ def _build_recommendation_view(
         warnings=list(recommendation.warnings),
         safety_status=recommendation.safety_decision.status,
         safety_messages=list(recommendation.safety_decision.messages),
+        target_prediction_plausibility=(
+            None
+            if recommendation.target_prediction_plausibility is None
+            else recommendation.target_prediction_plausibility.model_copy(deep=True)
+        ),
     )
 
 

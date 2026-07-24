@@ -14,7 +14,7 @@ Industrial Process Intelligence Platform을 혼자 실행하기 위한 짧은 �
 
 ## Typical workflow
 
-1. **Upload a CSV file** — UTF-8 CSV만 지원합니다. 업로드 내용은 세션에 영구 저장되지 않습니다.
+1. **Choose a data source** — Upload a UTF-8 CSV, or select **Built-in manufacturing demo** (no CSV file required). Uploaded content is not stored permanently.
 2. **Select analysis mode**
    - `SUPERVISED`: target이 있고 품질·잔차·추천까지 필요할 때
    - `ANOMALY_ONLY`: label/target 없이 이상 탐지와 연관 변수 진단만 필요할 때
@@ -26,6 +26,29 @@ Industrial Process Intelligence Platform을 혼자 실행하기 위한 짧은 �
 5. **Check Current configuration summary and Run readiness** — False 항목을 해결한 뒤 Run analysis를 누릅니다.
 6. **Inspect the report** — Overview, stage execution, anomaly/diagnosis, recommendation, warnings/disclaimers를 확인합니다.
 7. **Export configuration** — 같은 설정으로 다시 돌릴 때 Download configuration JSON을 사용합니다.
+
+## Built-in manufacturing demo
+
+Use the in-memory synthetic dataset when you do not have a CSV ready:
+
+1. Select **Built-in manufacturing demo**
+2. Select a demo template (**Supervised quality prediction** or **Anomaly-only process monitoring**)
+3. Click **Apply demo configuration**
+4. Review the configuration
+5. Click **Run analysis**
+
+Notes:
+
+- The data is **synthetic**. Results do **not** represent production accuracy.
+- No analysis starts automatically when you select the demo source, change a template, or apply the template.
+- Demo ground-truth columns (`injected_anomaly`, `anomaly_type`) are labeled as evaluation metadata and are excluded from model features by the demo templates.
+- The **Supervised quality prediction** template configures four synthetic verified controllable setpoints so the public workflow can demonstrate prediction → residual diagnosis → recommendation → what-if verification:
+  - `temperature_setpoint`
+  - `pressure_setpoint`
+  - `flow_rate_setpoint`
+  - `cycle_time_setpoint`
+- Approved setpoint bounds in the supervised demo are **demonstration-only**. Do **not** reuse them as real equipment limits or production decision constraints.
+- The **Anomaly-only process monitoring** template remains recommendation-disabled and does not configure controllable constraints.
 
 ## Mode differences
 
@@ -57,6 +80,46 @@ Industrial Process Intelligence Platform을 혼자 실행하기 위한 짧은 �
 | Cohort too small after filter | Widen bounds or disable the cohort filter |
 | Recommendation refused after anomaly success | Anomaly/diagnosis results remain usable; fix controllable/verified/constraint inputs if you need a recommendation |
 | Configuration export blocked | Complete or clear incomplete rows; enabled-but-incomplete cohort filters are not silently dropped |
+
+## Demo dataset
+
+### Built-in UI demo
+
+Prefer the Streamlit **Built-in manufacturing demo** when you want a ready-to-run synthetic dataset without writing a CSV file. Apply a demo template before running analysis.
+
+### CLI CSV generator
+
+Generate a reproducible manufacturing demo CSV (not committed to the repository):
+
+```powershell
+python scripts/generate_demo_dataset.py --output demo_manufacturing.csv
+```
+
+Optional knobs: `--rows`, `--seed`, `--anomaly-fraction`.
+
+Recommended column roles for a quick demo:
+
+| Mode | Suggested settings |
+| --- | --- |
+| SUPERVISED | target: `quality_score` (or `defect_rate`, not both as features); timestamp: `timestamp` |
+| ANOMALY_ONLY | no target; process setpoints + measurements only; timestamp: `timestamp` |
+
+`quality_score` and `defect_rate` are generated quality outputs. Select only one as a supervised target. Neither should be used as an anomaly-only input in the built-in acceptance test. Always exclude `injected_anomaly` and `anomaly_type` from analysis features. They remain evaluation metadata only.
+
+### Demo validation
+
+`scripts/validate_demo_workflow.py` runs the public analysis workflow against the default synthetic dataset and checks that:
+
+- supervised regression selects a model with finite metrics that beat a naive mean-target baseline
+- anomaly-only detections concentrate in injected anomaly rows above a documented enrichment threshold
+- residual anomaly events, when exposed, show meaningful overlap with injected anomalies
+- model features exclude quality outputs, ground-truth metadata, and identity/order columns (timestamp may still drive TIME splitting)
+
+```powershell
+python scripts/validate_demo_workflow.py
+```
+
+A successful validation only proves the synthetic demo path is useful and non-trivial. It does **not** represent real-world production accuracy.
 
 ## Safety reminders
 

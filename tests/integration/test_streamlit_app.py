@@ -24,7 +24,10 @@ from process_intelligence.recommendation import (
     RecommendationSafetyDecision,
     RecommendationSafetyStatus,
     RecommendationStatus,
+    RecommendationTargetPlausibility,
     RecommendationWhatIfVerificationResult,
+    TargetPredictionDomain,
+    TargetPredictionPlausibilityStatus,
     VariableEligibilityAssessment,
     WhatIfPerturbationDirection,
     WhatIfStabilityClassification,
@@ -714,8 +717,11 @@ def test_initial_header_and_uploader() -> None:
     assert "Model-based decision support" in blob
     assert "guarantee" in blob.lower()
     assert "Quick start" in blob
-    assert "Upload a CSV file." in blob
+    assert "Upload a CSV file" in blob
+    assert "built-in manufacturing demo" in blob.lower()
     assert "Export reusable configuration when needed." in blob
+    radio = next(item for item in at.radio if item.label == "Data source")
+    assert radio.value == "Upload CSV"
 
 
 def test_run_without_upload_shows_guidance() -> None:
@@ -724,6 +730,7 @@ def test_run_without_upload_shows_guidance() -> None:
     assert len(at.button) == 0
     blob = _text_blob(at)
     assert "Upload a valid CSV" in blob
+    assert "built-in manufacturing demo" in blob.lower()
     assert "Quick start" in blob
 
 
@@ -1067,6 +1074,58 @@ def test_presentation_rerender_is_deterministic() -> None:
     assert "Analysis completed with a generated recommendation" in blob
     again = WorkflowPresentationReport.model_validate(first).model_dump(mode="json")
     assert again == first
+
+
+def test_streamlit_displays_declared_domain_extrapolation_warning() -> None:
+    source = _completed_report()
+    assert source.final_recommendation is not None
+    recommendation = source.final_recommendation.model_copy(
+        update={
+            "baseline_prediction": 96.5,
+            "proposed_prediction": 115.55,
+            "objective": RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
+            "target_prediction_plausibility": RecommendationTargetPlausibility(
+                domain=TargetPredictionDomain(
+                    observed_minimum=45.0,
+                    observed_maximum=98.0,
+                    declared_minimum=40.0,
+                    declared_maximum=100.0,
+                ),
+                baseline_raw_prediction=96.5,
+                proposed_raw_prediction=115.55,
+                baseline_status=TargetPredictionPlausibilityStatus.WITHIN_OBSERVED_RANGE,
+                proposed_status=(
+                    TargetPredictionPlausibilityStatus.OUTSIDE_DECLARED_DOMAIN
+                ),
+                warning_messages=[
+                    "Raw predicted target is outside the declared semantic "
+                    "target domain and must not be interpreted as a "
+                    "quantitatively attainable quality value."
+                ],
+            ),
+            "warnings": [
+                "Raw predicted target is outside the declared semantic target "
+                "domain and must not be interpreted as a quantitatively "
+                "attainable quality value."
+            ],
+        },
+        deep=True,
+    )
+    report = AnalysisWorkflowReportBuilder().build(
+        source.model_copy(update={"final_recommendation": recommendation}, deep=True)
+    ).report
+    at = AppTest.from_function(
+        _render_entry,
+        default_timeout=30,
+        kwargs={"report_json": report.model_dump(mode="json")},
+    ).run()
+    assert not at.exception
+    blob = _text_blob(at) + str(at)
+    assert "OUTSIDE_DECLARED_DOMAIN" in blob
+    assert "outside the declared target domain" in blob.lower()
+    assert "must not be treated as a normal verified improvement" in blob.lower()
+    assert "115.55" in blob
+    assert "Association does not establish causation" in blob
 
 
 # ---------------------------------------------------------------------------
@@ -2671,4 +2730,291 @@ def test_configuration_preset_export_keeps_wide_csv_ui() -> None:
     assert "Objective" in labels
     assert any(item.label == "CSV upload" for item in at.file_uploader)
     assert "Analysis configuration preset" in _text_blob(at)
+
+
+# ---------------------------------------------------------------------------
+# Built-in manufacturing demo data source
+# ---------------------------------------------------------------------------
+
+
+def _select_builtin_demo(at: AppTest) -> AppTest:
+    radio = next(item for item in at.radio if item.label == "Data source")
+    return radio.set_value("Built-in manufacturing demo").run()
+
+
+def _select_demo_template(at: AppTest, template: str) -> AppTest:
+    box = next(
+        item for item in at.selectbox if item.label == "Demo analysis template"
+    )
+    return box.select(template).run()
+
+
+def _apply_demo_configuration(at: AppTest) -> AppTest:
+    button = next(
+        item for item in at.button if item.label == "Apply demo configuration"
+    )
+    return button.click().run()
+
+
+def _run_readiness_flags(at: AppTest) -> dict[str, bool]:
+    flags: dict[str, bool] = {}
+    for line in _text_blob(at).splitlines():
+        value = line.strip()
+        if value.startswith("True: "):
+            flags[value.removeprefix("True: ")] = True
+        elif value.startswith("False: "):
+            flags[value.removeprefix("False: ")] = False
+    return flags
+
+
+def test_builtin_demo_default_source_remains_upload_csv() -> None:
+    at = _make_app().run()
+    assert not at.exception
+    radio = next(item for item in at.radio if item.label == "Data source")
+    assert radio.value == "Upload CSV"
+    assert any(item.label == "CSV upload" for item in at.file_uploader)
+
+
+def test_builtin_demo_loads_in_memory_dataset() -> None:
+    at = _select_builtin_demo(_make_app().run())
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "synthetic built-in manufacturing demo" in blob.lower()
+    assert "Ground-truth demo metadata" in blob
+    assert "injected_anomaly" in blob
+    assert "anomaly_type" in blob
+    metrics = {item.label: item.value for item in at.metric}
+    assert int(metrics.get("Rows", -1)) == 1500
+    assert int(metrics.get("Columns", -1)) == 17
+    assert int(metrics.get("Seed", -1)) == 42
+    assert int(metrics.get("Anomaly rows", -1)) > 0
+    assert not any(item.label == "CSV upload" for item in at.file_uploader)
+    state = at.session_state.filtered_state
+    assert "last_presentation_report_json" not in state
+
+
+def test_builtin_demo_template_change_alone_does_not_apply() -> None:
+    at = _select_builtin_demo(_make_app().run())
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    assert not at.exception
+    mode_box = next(item for item in at.selectbox if item.label == "Analysis mode")
+    # Default UI mode remains SUPERVISED until Apply is clicked.
+    assert mode_box.value == "SUPERVISED"
+    assert "Demo configuration applied." not in _text_blob(at)
+    state = at.session_state.filtered_state
+    assert "last_presentation_report_json" not in state
+
+
+def test_builtin_demo_apply_supervised_template() -> None:
+    at = _select_builtin_demo(_make_app().run())
+    at = _select_demo_template(at, "Supervised quality prediction")
+    at = _apply_demo_configuration(at)
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "Demo configuration applied." in blob
+    assert "Verified controllable variables: 4" in blob
+    assert "temperature_setpoint" in blob
+    assert "demonstration-only" in blob.lower()
+    mode_box = next(item for item in at.selectbox if item.label == "Analysis mode")
+    assert mode_box.value == "SUPERVISED"
+    target_box = next(item for item in at.selectbox if item.label == "Target column")
+    assert target_box.value == "quality_score"
+    task_box = next(item for item in at.selectbox if item.label == "Analysis task")
+    assert task_box.value == "REGRESSION"
+    timestamp_box = next(
+        item for item in at.selectbox if item.label == "Timestamp column (optional)"
+    )
+    assert timestamp_box.value == "timestamp"
+    state = at.session_state.filtered_state
+    assert state.get("ui_explicit_feature_columns") == [
+        "temperature_setpoint",
+        "pressure_setpoint",
+        "flow_rate_setpoint",
+        "cycle_time_setpoint",
+        "temperature_actual",
+        "pressure_actual",
+        "flow_rate_actual",
+        "vibration",
+        "motor_current",
+        "chamber_humidity",
+    ]
+    assert state.get("ui_use_recommended_numeric_feature_set") is False
+    assert state.get("ui_confirmed_controllable_variables") == [
+        "temperature_setpoint",
+        "pressure_setpoint",
+        "flow_rate_setpoint",
+        "cycle_time_setpoint",
+    ]
+    assert state.get("ui_verified_variables") == [
+        "temperature_setpoint",
+        "pressure_setpoint",
+        "flow_rate_setpoint",
+        "cycle_time_setpoint",
+    ]
+    assert state.get("ui_recommendation_constraint_columns") == [
+        "temperature_setpoint",
+        "pressure_setpoint",
+        "flow_rate_setpoint",
+        "cycle_time_setpoint",
+    ]
+    assert state.get("constraint_min_temperature_setpoint") == 170.0
+    assert state.get("constraint_max_temperature_setpoint") == 200.0
+    assert state.get("constraint_min_pressure_setpoint") == 1.8
+    assert state.get("constraint_max_pressure_setpoint") == 3.2
+    assert state.get("constraint_min_flow_rate_setpoint") == 90.0
+    assert state.get("constraint_max_flow_rate_setpoint") == 150.0
+    assert state.get("constraint_min_cycle_time_setpoint") == 40.0
+    assert state.get("constraint_max_cycle_time_setpoint") == 60.0
+    assert "last_presentation_report_json" not in state
+    run_button = next(item for item in at.button if item.label == "Run analysis")
+    assert run_button.disabled is False
+    flags = _run_readiness_flags(at)
+    assert flags.get("demo features exclude forbidden columns") is True
+    assert all(flags.values())
+    summary_blob = _text_blob(at)
+    assert "Constraint variable count: `4`" in summary_blob or (
+        "constraint" in summary_blob.lower() and "4" in summary_blob
+    )
+
+
+def test_builtin_demo_template_change_alone_does_not_change_controllables() -> None:
+    at = _select_builtin_demo(_make_app().run())
+    at = _apply_demo_configuration(at)
+    state = at.session_state.filtered_state
+    assert len(state.get("ui_confirmed_controllable_variables", [])) == 4
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    assert not at.exception
+    state = at.session_state.filtered_state
+    # Selecting a template without Apply must not clear/apply controllables.
+    assert state.get("ui_confirmed_controllable_variables") == [
+        "temperature_setpoint",
+        "pressure_setpoint",
+        "flow_rate_setpoint",
+        "cycle_time_setpoint",
+    ]
+    assert "Demo configuration applied." not in _text_blob(at)
+    assert "last_presentation_report_json" not in state
+
+
+def test_builtin_demo_apply_anomaly_only_template() -> None:
+    at = _select_builtin_demo(_make_app().run())
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    at = _apply_demo_configuration(at)
+    assert not at.exception
+    mode_box = next(item for item in at.selectbox if item.label == "Analysis mode")
+    assert mode_box.value == "ANOMALY_ONLY"
+    assert "Target column" not in [item.label for item in at.selectbox]
+    timestamp_box = next(
+        item for item in at.selectbox if item.label == "Timestamp column (optional)"
+    )
+    assert timestamp_box.value == "timestamp"
+    operating_box = next(
+        item
+        for item in at.selectbox
+        if item.label == "Operating-point selection mode"
+    )
+    assert operating_box.value == "TOP_UNSUPERVISED_ANOMALY"
+    state = at.session_state.filtered_state
+    assert state.get("anomaly_recommendation_enabled") is False
+    assert state.get("ui_restrict_operating_cohort") is False
+    assert state.get("ui_confirmed_controllable_variables") == []
+    assert state.get("ui_verified_variables") == []
+    assert state.get("ui_recommendation_constraint_columns") == []
+    assert len(state.get("ui_explicit_feature_columns", [])) == 10
+    assert "last_presentation_report_json" not in state
+    run_button = next(item for item in at.button if item.label == "Run analysis")
+    assert run_button.disabled is False
+    flags = _run_readiness_flags(at)
+    assert flags.get("demo features exclude forbidden columns") is True
+    assert all(flags.values())
+
+
+def test_builtin_demo_switch_anomaly_clears_supervised_controllables() -> None:
+    at = _select_builtin_demo(_make_app().run())
+    at = _select_demo_template(at, "Supervised quality prediction")
+    at = _apply_demo_configuration(at)
+    assert at.session_state.filtered_state.get(
+        "ui_confirmed_controllable_variables"
+    ) == [
+        "temperature_setpoint",
+        "pressure_setpoint",
+        "flow_rate_setpoint",
+        "cycle_time_setpoint",
+    ]
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    at = _apply_demo_configuration(at)
+    state = at.session_state.filtered_state
+    assert state.get("ui_confirmed_controllable_variables") == []
+    assert state.get("ui_verified_variables") == []
+    assert state.get("ui_recommendation_constraint_columns") == []
+    assert state.get("anomaly_recommendation_enabled") is False
+
+
+def test_builtin_demo_switch_to_upload_clears_demo_controllables() -> None:
+    at = _select_builtin_demo(_make_app().run())
+    at = _apply_demo_configuration(at)
+    assert len(
+        at.session_state.filtered_state.get("ui_confirmed_controllable_variables", [])
+    ) == 4
+    radio = next(item for item in at.radio if item.label == "Data source")
+    at = radio.set_value("Upload CSV").run()
+    state = at.session_state.filtered_state
+    assert state.get("ui_confirmed_controllable_variables") == []
+    assert state.get("ui_verified_variables") == []
+    assert state.get("ui_recommendation_constraint_columns") == []
+    assert "constraint_min_temperature_setpoint" not in state
+    assert any(item.label == "CSV upload" for item in at.file_uploader)
+
+
+def test_builtin_demo_no_auto_run_on_source_or_apply() -> None:
+    at = _select_builtin_demo(_make_app().run())
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    at = _apply_demo_configuration(at)
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    # Deterministic workflow factory would populate a report only after Run.
+    assert "Overview" not in [item.value for item in at.header]
+
+
+def test_builtin_demo_source_switch_clears_stale_results() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    assert "last_presentation_report_json" in at.session_state.filtered_state
+
+    at = _select_builtin_demo(at)
+    state = at.session_state.filtered_state
+    assert "last_presentation_report_json" not in state
+    assert "comparison_baseline_report_json" not in state
+
+    at = _apply_demo_configuration(at)
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    assert "last_presentation_report_json" in at.session_state.filtered_state
+
+    radio = next(item for item in at.radio if item.label == "Data source")
+    at = radio.set_value("Upload CSV").run()
+    state = at.session_state.filtered_state
+    assert "last_presentation_report_json" not in state
+    assert "comparison_baseline_report_json" not in state
+    # Upload flow is active again; demo frame is not silently retained.
+    assert any(item.label == "CSV upload" for item in at.file_uploader)
+    assert "Upload a valid CSV" in _text_blob(at)
+
+
+def test_builtin_demo_forbidden_feature_disables_run() -> None:
+    at = _select_builtin_demo(_make_app().run())
+    at = _apply_demo_configuration(at)
+    assert not at.exception
+    feature_box = next(
+        item for item in at.multiselect if item.label == "Feature columns"
+    )
+    at = feature_box.set_value(
+        ["temperature_setpoint", "pressure_setpoint", "injected_anomaly"]
+    ).run()
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "injected_anomaly" in blob
+    assert "must not include" in blob.lower() or "Ground-truth" in blob
+    run_button = next(item for item in at.button if item.label == "Run analysis")
+    assert run_button.disabled is True
+    flags = _run_readiness_flags(at)
+    assert flags.get("demo features exclude forbidden columns") is False
 

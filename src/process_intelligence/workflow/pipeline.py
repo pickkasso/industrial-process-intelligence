@@ -115,6 +115,10 @@ from process_intelligence.recommendation import (
 )
 from process_intelligence.recommendation.candidate_grid import CandidateGridReport
 from process_intelligence.recommendation.schemas import DEFAULT_RECOMMENDATION_DISCLAIMER
+from process_intelligence.recommendation.target_domain import (
+    assess_recommendation_target_plausibility,
+    build_target_prediction_domain,
+)
 from process_intelligence.recommendation.what_if_verification import (
     RecommendationWhatIfVerificationResult,
 )
@@ -249,6 +253,8 @@ class _RunState:
     target_unique_non_null_count: int | None = None
     target_refusal_code: str | None = None
     target_suitability_message: str | None = None
+    observed_target_minimum: float | None = None
+    observed_target_maximum: float | None = None
 
 
 def _row_id_set(frame: pl.DataFrame) -> set[int]:
@@ -1169,6 +1175,12 @@ class IndustrialProcessAnalysisWorkflow:
                 feature_columns=feature_columns,
                 leakage_report=leakage_report,
             )
+            observed_min, observed_max = _observed_training_target_bounds(
+                split.train,
+                target_column=request.target_column,
+            )
+            state.observed_target_minimum = observed_min
+            state.observed_target_maximum = observed_max
             state.supervised_model_available = True
             state.independent_test_evaluation_performed = True
             performance_outcome = ModelPerformanceAssessor(
@@ -2036,14 +2048,21 @@ class IndustrialProcessAnalysisWorkflow:
             if name in current_values
         ]
 
+        # Role overrides affect eligibility assessment only. Recommendation
+        # safety continues to use the diagnosis-stage ensemble confidence
+        # (mean over all returned factors). Truncating to a leading subset is
+        # not a documented workflow policy and can raise confidence enough to
+        # bypass the unchanged 0.20 minimum-diagnosis-confidence gate.
+        factors_for_request = _apply_role_overrides_to_diagnosis_factors(
+            diagnosis_result.factors,
+            role_overrides=request.column_role_overrides,
+        )
         diagnosis_for_request = DiagnosisResult(
             anomaly_id=diagnosis_result.anomaly_id,
             task=recommendation_task,
             method_used=list(diagnosis_result.method_used),
             scope=diagnosis_result.scope,
-            factors=[
-                factor.model_copy(deep=True) for factor in diagnosis_result.factors
-            ],
+            factors=factors_for_request,
             confidence=float(diagnosis_result.confidence),
             analyzed_row_count=diagnosis_result.analyzed_row_count,
             reference_row_count=max(diagnosis_result.reference_row_count, 5),
@@ -2144,12 +2163,20 @@ class IndustrialProcessAnalysisWorkflow:
         )
 
         outcome = pipeline.run(pipeline_request)
-        final_result = outcome.report.final_result
+        final_result = self._attach_target_prediction_plausibility(
+            outcome.report.final_result,
+            request=request,
+            state=state,
+        )
         state.recommendation_pipeline_executed = True
         state.final_recommendation = final_result
 
         pipeline_warnings = list(operating_warnings)
         pipeline_warnings.extend(outcome.report.warnings)
+        if final_result.target_prediction_plausibility is not None:
+            pipeline_warnings.extend(
+                final_result.target_prediction_plausibility.warning_messages
+            )
 
         if final_result.status is RecommendationStatus.GENERATED:
             state.status = AnalysisWorkflowStatus.COMPLETED
@@ -2221,6 +2248,59 @@ class IndustrialProcessAnalysisWorkflow:
                     "recommendation was refused."
                 ),
             )
+
+    def _attach_target_prediction_plausibility(
+        self,
+        recommendation: RecommendationResult,
+        *,
+        request: AnalysisWorkflowRequest,
+        state: _RunState,
+    ) -> RecommendationResult:
+        """Attach raw-prediction domain plausibility without clipping values.
+
+        Uses observed training-target bounds retained on the run state and
+        optional caller-declared semantic bounds from the workflow request.
+        Does not inspect demo source names or session state.
+        """
+        training_targets: list[float] | None = None
+        if (
+            state.observed_target_minimum is not None
+            and state.observed_target_maximum is not None
+        ):
+            # Reconstruct the observed endpoints for domain construction. Full
+            # training vectors are not retained on the run state.
+            training_targets = [
+                float(state.observed_target_minimum),
+                float(state.observed_target_maximum),
+            ]
+        domain = build_target_prediction_domain(
+            training_targets,
+            declared_minimum=request.declared_target_minimum,
+            declared_maximum=request.declared_target_maximum,
+        )
+        if (
+            recommendation.baseline_prediction is None
+            and recommendation.proposed_prediction is None
+            and domain is None
+        ):
+            return recommendation
+
+        plausibility = assess_recommendation_target_plausibility(
+            baseline_prediction=recommendation.baseline_prediction,
+            proposed_prediction=recommendation.proposed_prediction,
+            domain=domain,
+        )
+        warnings = list(recommendation.warnings)
+        for message in plausibility.warning_messages:
+            if message not in warnings:
+                warnings.append(message)
+        return recommendation.model_copy(
+            update={
+                "target_prediction_plausibility": plausibility,
+                "warnings": warnings,
+            },
+            deep=True,
+        )
 
     def _skip_what_if_verification(
         self,
@@ -2911,6 +2991,27 @@ def _build_diagnosis_frame(
 def _append_unique_warning(warnings: list[str], message: str) -> None:
     if message not in warnings:
         warnings.append(message)
+
+
+def _observed_training_target_bounds(
+    train_frame: pl.DataFrame,
+    *,
+    target_column: str,
+) -> tuple[float | None, float | None]:
+    """Return finite min/max of the training target column, if available."""
+    if target_column not in train_frame.columns:
+        return None, None
+    values = train_frame.get_column(target_column).drop_nulls().to_list()
+    finite_values: list[float] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        number = float(value)
+        if math.isfinite(number):
+            finite_values.append(number)
+    if not finite_values:
+        return None, None
+    return float(min(finite_values)), float(max(finite_values))
 
 
 def _apply_role_overrides_to_diagnosis_factors(

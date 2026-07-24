@@ -30,6 +30,9 @@ from process_intelligence.recommendation.enums import (
     WhatIfVerificationScenarioType,
     WhatIfVerificationStatus,
 )
+from process_intelligence.recommendation.target_domain import (
+    RecommendationTargetPlausibility,
+)
 from process_intelligence.workflow.dataset_fingerprint import (
     normalize_optional_dataset_fingerprint,
 )
@@ -1008,6 +1011,7 @@ class RecommendationView(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     safety_status: RecommendationSafetyStatus
     safety_messages: list[str] = Field(default_factory=list)
+    target_prediction_plausibility: RecommendationTargetPlausibility | None = None
 
     @field_validator("status", mode="before")
     @classmethod
@@ -1135,6 +1139,24 @@ class RecommendationView(BaseModel):
                 ) from exc
         raise ValueError(
             "safety_status must be RecommendationSafetyStatus, "
+            f"got {type(value).__name__}"
+        )
+
+    @field_validator("target_prediction_plausibility", mode="before")
+    @classmethod
+    def _validate_target_prediction_plausibility(
+        cls,
+        value: object,
+    ) -> RecommendationTargetPlausibility | None:
+        if value is None:
+            return None
+        if isinstance(value, RecommendationTargetPlausibility):
+            return value.model_copy(deep=True)
+        if isinstance(value, dict):
+            return RecommendationTargetPlausibility.model_validate(value)
+        raise ValueError(
+            "target_prediction_plausibility must be "
+            "RecommendationTargetPlausibility or None, "
             f"got {type(value).__name__}"
         )
 

@@ -4,7 +4,7 @@
 
 ## Project overview
 
-- CSV 업로드 후 열 역할 확인, 분석 실행, 보고서 검토, 설정 프리셋 재사용
+- CSV 업로드 또는 built-in manufacturing demo 후 열 역할 확인, 분석 실행, 보고서 검토, 설정 프리셋 재사용
 - **SUPERVISED**: target 기반 예측·성능 수용·추천
 - **ANOMALY_ONLY**: target 없이 비지도 이상 탐지·연관 변수 진단
 - 결과는 모델 기반 의사결정 지원이며 운영 명령이 아닙니다
@@ -43,13 +43,26 @@ python -m pip install -e .
 
 ## Quick start (UI)
 
-1. Upload a CSV file.
-2. Select supervised or anomaly-only analysis.
+1. Upload a CSV file, or select **Built-in manufacturing demo** (no CSV file required).
+2. Select supervised or anomaly-only analysis (or apply a demo template).
 3. Review the suggested columns and safety-critical settings.
 4. Run the analysis and inspect the report.
 5. Export reusable configuration when needed.
 
 자세한 운영 안내는 [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)를 참고하세요.
+
+## Demo dataset
+
+The Streamlit UI includes a **built-in manufacturing demo** that loads a deterministic synthetic dataset in memory—no CSV file is required. Demo ground-truth columns (`injected_anomaly`, `anomaly_type`) and unused quality/identity columns are excluded from model features by the demo templates. The supervised built-in demo configures four synthetic verified controllable setpoints (`temperature_setpoint`, `pressure_setpoint`, `flow_rate_setpoint`, `cycle_time_setpoint`) with fixed demonstration-only engineering bounds so recommendation and what-if verification can run. Those demo recommendation bounds are illustrative only and must not be reused as real equipment limits. Selecting the demo or changing a template does **not** run analysis; click **Apply demo configuration**, then **Run analysis**.
+
+A CLI generator remains available for local CSV demos of supervised quality prediction, anomaly-only detection, residual anomaly detection, and diagnosis workflows. The built-in synthetic dataset is validated through both supervised and anomaly-only public workflows.
+
+```powershell
+python scripts/generate_demo_dataset.py --output demo_manufacturing.csv
+python scripts/validate_demo_workflow.py
+```
+
+Generated columns `quality_score` and `defect_rate` are quality outputs. Use only one as a supervised target; do **not** use either as an anomaly-only model input in the built-in acceptance path. Generated columns `injected_anomaly` and `anomaly_type` are ground-truth evaluation metadata only. Do **not** select them as model features.
 
 ## Analysis modes
 
@@ -81,6 +94,10 @@ python -m pip install -e .
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
 ```
+
+## Continuous integration
+
+GitHub Actions runs Ruff, mypy, and pytest automatically on pushes to `main` and on pull requests targeting `main`. CI also verifies that the Streamlit application starts successfully (headless smoke test against the health endpoint). See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ## Documentation
 

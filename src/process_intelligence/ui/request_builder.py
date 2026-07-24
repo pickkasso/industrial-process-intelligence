@@ -217,6 +217,8 @@ class WorkflowUiRequestBuilder:
             objective=submission_copy.objective,
             quality_direction=submission_copy.quality_direction,
             quality_target=submission_copy.quality_target,
+            declared_target_minimum=submission_copy.declared_target_minimum,
+            declared_target_maximum=submission_copy.declared_target_maximum,
             request_constraints=constraints,
             industry_constraints=[],
             user_overrides=[],

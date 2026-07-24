@@ -103,6 +103,20 @@ class WhatIfVerificationStatus(StrEnum):
     UNAVAILABLE = "UNAVAILABLE"
 
 
+class TargetPredictionPlausibilityStatus(StrEnum):
+    """Plausibility of a supervised recommendation target prediction.
+
+    Statuses describe whether a raw model prediction lies inside the observed
+    training-target range and an optional caller-declared semantic domain.
+    They do not clip predictions or assert physical attainability.
+    """
+
+    WITHIN_OBSERVED_RANGE = "WITHIN_OBSERVED_RANGE"
+    OUTSIDE_OBSERVED_RANGE = "OUTSIDE_OBSERVED_RANGE"
+    OUTSIDE_DECLARED_DOMAIN = "OUTSIDE_DECLARED_DOMAIN"
+    DOMAIN_UNAVAILABLE = "DOMAIN_UNAVAILABLE"
+
+
 class WhatIfStabilityClassification(StrEnum):
     """Deterministic local stability label for a generated recommendation.
 

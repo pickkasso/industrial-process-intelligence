@@ -251,6 +251,8 @@ class WorkflowUiSubmission(BaseModel):
     objective: RecommendationObjective | None = None
     quality_direction: QualityOptimizationDirection | None = None
     quality_target: float | None = None
+    declared_target_minimum: float | None = None
+    declared_target_maximum: float | None = None
     performance_rules: list[UiMetricRuleInput] = Field(default_factory=list)
     constraints: list[UiVariableConstraintInput] = Field(default_factory=list)
     user_confirmed_controllable_variables: list[str] = Field(default_factory=list)
@@ -443,6 +445,11 @@ class WorkflowUiSubmission(BaseModel):
     @classmethod
     def _validate_quality_target(cls, value: object) -> float | None:
         return _require_optional_finite_float(value, field_name="quality_target")
+
+    @field_validator("declared_target_minimum", "declared_target_maximum", mode="before")
+    @classmethod
+    def _validate_declared_target_bounds(cls, value: object) -> float | None:
+        return _require_optional_finite_float(value, field_name="declared target bound")
 
     @field_validator("performance_rules", mode="before")
     @classmethod
@@ -646,6 +653,14 @@ class WorkflowUiSubmission(BaseModel):
                 raise ValueError(
                     "quality_target must be None when analysis_mode is ANOMALY_ONLY"
                 )
+            if (
+                self.declared_target_minimum is not None
+                or self.declared_target_maximum is not None
+            ):
+                raise ValueError(
+                    "declared_target_minimum and declared_target_maximum must be "
+                    "None when analysis_mode is ANOMALY_ONLY"
+                )
             if anomaly_recommendation_enabled:
                 if self.objective is not RecommendationObjective.REDUCE_ANOMALY_SCORE:
                     raise ValueError(
@@ -767,6 +782,24 @@ class WorkflowUiSubmission(BaseModel):
         elif self.quality_target is not None:
             raise ValueError(
                 "quality_target must be None unless quality_direction is TARGET"
+            )
+
+        if (self.declared_target_minimum is None) ^ (
+            self.declared_target_maximum is None
+        ):
+            raise ValueError(
+                "declared_target_minimum and declared_target_maximum must both "
+                "be set or both None"
+            )
+        if (
+            self.declared_target_minimum is not None
+            and self.declared_target_maximum is not None
+            and self.declared_target_minimum > self.declared_target_maximum
+        ):
+            raise ValueError(
+                "declared_target_minimum must be <= declared_target_maximum "
+                f"(got {self.declared_target_minimum} > "
+                f"{self.declared_target_maximum})"
             )
 
         for item in self.constraints:

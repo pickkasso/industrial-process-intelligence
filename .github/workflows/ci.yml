@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt
+          python -m pip install -e .
+
+      - name: Ruff
+        run: python -m ruff check .
+
+      - name: mypy
+        run: python -m mypy src
+
+      - name: pytest
+        run: python -m pytest tests -q
+
+      - name: Streamlit startup smoke test
+        run: |
+          set -euo pipefail
+          PORT=8510
+          LOG="$(mktemp)"
+          STREAMLIT_PID=""
+
+          cleanup() {
+            if [[ -n "${STREAMLIT_PID}" ]] && kill -0 "${STREAMLIT_PID}" 2>/dev/null; then
+              kill "${STREAMLIT_PID}" 2>/dev/null || true
+              wait "${STREAMLIT_PID}" 2>/dev/null || true
+            fi
+            rm -f "${LOG}"
+          }
+          trap cleanup EXIT
+
+          python -m streamlit run app.py \
+            --server.headless true \
+            --server.port "${PORT}" \
+            --browser.gatherUsageStats false \
+            >"${LOG}" 2>&1 &
+          STREAMLIT_PID=$!
+
+          TIMEOUT_SECS=60
+          elapsed=0
+          until curl -sf "http://127.0.0.1:${PORT}/_stcore/health" >/dev/null; do
+            if ! kill -0 "${STREAMLIT_PID}" 2>/dev/null; then
+              echo "Streamlit process exited before becoming healthy."
+              echo "----- Streamlit log -----"
+              cat "${LOG}"
+              exit 1
+            fi
+            if [[ "${elapsed}" -ge "${TIMEOUT_SECS}" ]]; then
+              echo "Streamlit did not become healthy within ${TIMEOUT_SECS}s."
+              echo "----- Streamlit log -----"
+              cat "${LOG}"
+              exit 1
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
+          done
+
+          echo "Streamlit health check passed on port ${PORT}."

@@ -25,6 +25,9 @@ from process_intelligence.recommendation.enums import (
     RecommendationSafetyStatus,
     RecommendationStatus,
 )
+from process_intelligence.recommendation.target_domain import (
+    RecommendationTargetPlausibility,
+)
 
 ScalarMetadataValue = str | int | float | bool | None
 """Allowed scalar types for recommendation metadata dictionaries."""
@@ -1058,6 +1061,7 @@ class RecommendationResult(BaseModel):
     generated_at: datetime
     warnings: list[str] = Field(default_factory=list)
     metadata: dict[str, ScalarMetadataValue] = Field(default_factory=dict)
+    target_prediction_plausibility: RecommendationTargetPlausibility | None = None
 
     @field_validator("status", mode="before")
     @classmethod
@@ -1189,6 +1193,24 @@ class RecommendationResult(BaseModel):
         if value is None:
             return {}
         return _validate_scalar_metadata(value)
+
+    @field_validator("target_prediction_plausibility", mode="before")
+    @classmethod
+    def _validate_target_prediction_plausibility(
+        cls,
+        value: object,
+    ) -> RecommendationTargetPlausibility | None:
+        if value is None:
+            return None
+        if isinstance(value, RecommendationTargetPlausibility):
+            return value.model_copy(deep=True)
+        if isinstance(value, dict):
+            return RecommendationTargetPlausibility.model_validate(value)
+        raise ValueError(
+            "target_prediction_plausibility must be "
+            "RecommendationTargetPlausibility or None, "
+            f"got {type(value).__name__}"
+        )
 
     @model_validator(mode="after")
     def _validate_result_consistency(self) -> Self:

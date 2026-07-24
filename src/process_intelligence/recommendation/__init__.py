@@ -32,6 +32,7 @@ from process_intelligence.recommendation.enums import (
     RecommendationReasonCode,
     RecommendationSafetyStatus,
     RecommendationStatus,
+    TargetPredictionPlausibilityStatus,
     WhatIfPerturbationDirection,
     WhatIfStabilityClassification,
     WhatIfVerificationScenarioType,
@@ -81,6 +82,14 @@ from process_intelligence.recommendation.schemas import (
     RecommendationSafetyDecision,
     RecommendationSafetyPolicy,
     VariableEligibilityAssessment,
+)
+from process_intelligence.recommendation.target_domain import (
+    RecommendationTargetPlausibility,
+    TargetPredictionDomain,
+    TargetPredictionPlausibilityAssessment,
+    assess_recommendation_target_plausibility,
+    build_target_prediction_domain,
+    evaluate_target_prediction_plausibility,
 )
 from process_intelligence.recommendation.what_if_verification import (
     RecommendationWhatIfVerificationOutcome,
@@ -139,6 +148,7 @@ __all__ = [
     "RecommendationSafetyPolicy",
     "RecommendationSafetyStatus",
     "RecommendationStatus",
+    "RecommendationTargetPlausibility",
     "RecommendationWhatIfVerificationOutcome",
     "RecommendationWhatIfVerificationResult",
     "RecommendationWhatIfVerifier",
@@ -153,6 +163,9 @@ __all__ = [
     "ScenarioScoringReport",
     "ScenarioScoringRequest",
     "ScenarioScoringStatus",
+    "TargetPredictionDomain",
+    "TargetPredictionPlausibilityAssessment",
+    "TargetPredictionPlausibilityStatus",
     "VariableCandidateGrid",
     "VariableEligibilityAssessment",
     "WhatIfPerturbationDirection",
@@ -160,6 +173,9 @@ __all__ = [
     "WhatIfVerificationScenario",
     "WhatIfVerificationScenarioType",
     "WhatIfVerificationStatus",
+    "assess_recommendation_target_plausibility",
+    "build_target_prediction_domain",
     "classify_what_if_stability",
+    "evaluate_target_prediction_plausibility",
     "recommendation_warnings_for_stability",
 ]

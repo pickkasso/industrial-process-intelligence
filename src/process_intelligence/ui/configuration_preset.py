@@ -268,6 +268,8 @@ class WorkflowUiConfigurationPreset(BaseModel):
     recommendation_objective: RecommendationObjective | None = None
     quality_direction: QualityOptimizationDirection | None = None
     quality_target: float | None = None
+    declared_target_minimum: float | None = None
+    declared_target_maximum: float | None = None
     performance_rules: list[UiMetricRuleInput] = Field(default_factory=list)
     cohort_filter: NumericCohortFilter | None = None
     anomaly_recommendation_enabled: bool = False
@@ -427,6 +429,11 @@ class WorkflowUiConfigurationPreset(BaseModel):
     @classmethod
     def _validate_quality_target(cls, value: object) -> float | None:
         return _require_optional_finite_float(value, field_name="quality_target")
+
+    @field_validator("declared_target_minimum", "declared_target_maximum", mode="before")
+    @classmethod
+    def _validate_declared_target_bounds(cls, value: object) -> float | None:
+        return _require_optional_finite_float(value, field_name="declared target bound")
 
     @field_validator("performance_rules", mode="before")
     @classmethod
@@ -983,6 +990,8 @@ def build_configuration_preset(
     recommendation_objective: RecommendationObjective | None = None,
     quality_direction: QualityOptimizationDirection | None = None,
     quality_target: float | None = None,
+    declared_target_minimum: float | None = None,
+    declared_target_maximum: float | None = None,
     performance_rules: Sequence[UiMetricRuleInput] | None = None,
     cohort_filter: NumericCohortFilter | None = None,
     anomaly_recommendation_enabled: bool = False,
@@ -1010,6 +1019,8 @@ def build_configuration_preset(
         recommendation_objective=recommendation_objective,
         quality_direction=quality_direction,
         quality_target=quality_target,
+        declared_target_minimum=declared_target_minimum,
+        declared_target_maximum=declared_target_maximum,
         performance_rules=[
             item.model_copy(deep=True) for item in (performance_rules or ())
         ],

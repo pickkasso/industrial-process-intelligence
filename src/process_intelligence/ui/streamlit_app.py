@@ -29,6 +29,10 @@ from process_intelligence.core.exceptions import (
     ProcessIntelligenceError,
 )
 from process_intelligence.data import evaluate_target_suitability
+from process_intelligence.demo_data import (
+    DEMO_QUALITY_SCORE_DECLARED_MAXIMUM,
+    DEMO_QUALITY_SCORE_DECLARED_MINIMUM,
+)
 from process_intelligence.evaluation.performance_acceptance import (
     MetricAcceptanceDirection,
     ModelPerformanceAcceptanceStatus,
@@ -37,6 +41,7 @@ from process_intelligence.recommendation import (
     QualityOptimizationDirection,
     RecommendationObjective,
     RecommendationStatus,
+    TargetPredictionPlausibilityStatus,
     WhatIfVerificationStatus,
 )
 from process_intelligence.reporting import AnalysisWorkflowReportBuilder
@@ -92,6 +97,26 @@ from process_intelligence.ui.configuration_preset import (
     clear_configuration_preset_widget_prefixes,
     configuration_preset_to_json,
     parse_configuration_preset_json,
+)
+from process_intelligence.ui.demo_configuration import (
+    DATA_SOURCE_BUILTIN_DEMO,
+    DATA_SOURCE_UPLOAD_CSV,
+    SESSION_DATA_SOURCE_KEY,
+    SESSION_DATA_SOURCE_PREVIOUS_KEY,
+    SESSION_DEMO_APPLY_SUCCESS_KEY,
+    SESSION_DEMO_APPLY_SUMMARY_KEY,
+    SESSION_DEMO_TEMPLATE_KEY,
+    build_demo_configuration_preset,
+    clear_demo_recommendation_session_state,
+    clear_stale_analysis_session_state,
+    demo_configuration_apply_summary,
+    demo_dataset_to_workflow_csv_bytes,
+    demo_template_options,
+    filter_ground_truth_from_recommended_features,
+    ground_truth_metadata_columns_present,
+    is_builtin_demo_source,
+    load_builtin_demo_dataset,
+    validate_demo_feature_guard,
 )
 from process_intelligence.ui.request_builder import WorkflowUiRequestBuilder
 from process_intelligence.ui.schemas import (
@@ -273,8 +298,9 @@ def _render_quick_start() -> None:
     """Compact operator guidance shown before or above CSV upload."""
     st.subheader("Quick start")
     st.markdown(
-        "1. Upload a CSV file.\n"
-        "2. Select supervised or anomaly-only analysis.\n"
+        "1. Upload a CSV file, or select the built-in manufacturing demo.\n"
+        "2. Select supervised or anomaly-only analysis "
+        "(or apply a demo template).\n"
         "3. Review the suggested columns and safety-critical settings.\n"
         "4. Run the analysis and inspect the report.\n"
         "5. Export reusable configuration when needed."
@@ -1157,8 +1183,8 @@ def render_app(
 
     st.title(ui_config.page_title)
     st.markdown(
-        "Upload a process CSV, configure columns and acceptance rules, then run "
-        "the industrial analysis workflow."
+        "Upload a process CSV or load the built-in manufacturing demo, configure "
+        "columns and acceptance rules, then run the industrial analysis workflow."
     )
     st.info(
         "Model-based decision support only. These outputs do not guarantee "
@@ -1166,12 +1192,36 @@ def render_app(
     )
     _render_quick_start()
 
-    uploaded = st.file_uploader(
-        "CSV upload",
-        type=["csv"],
-        accept_multiple_files=False,
-        help="CSV files only. Uploaded content is not stored permanently.",
+    if SESSION_DATA_SOURCE_KEY not in st.session_state:
+        st.session_state[SESSION_DATA_SOURCE_KEY] = DATA_SOURCE_UPLOAD_CSV
+    data_source = st.radio(
+        "Data source",
+        options=[DATA_SOURCE_UPLOAD_CSV, DATA_SOURCE_BUILTIN_DEMO],
+        key=SESSION_DATA_SOURCE_KEY,
+        horizontal=True,
+        help=(
+            "Upload CSV keeps the existing file workflow. Built-in manufacturing "
+            "demo loads a synthetic in-memory dataset without writing a CSV file."
+        ),
     )
+    previous_data_source = st.session_state.get(SESSION_DATA_SOURCE_PREVIOUS_KEY)
+    if (
+        previous_data_source is not None
+        and previous_data_source != data_source
+    ):
+        clear_stale_analysis_session_state(
+            cast(MutableMapping[str, Any], st.session_state)
+        )
+        st.session_state.pop(SESSION_DEMO_APPLY_SUCCESS_KEY, None)
+        st.session_state.pop(SESSION_DEMO_APPLY_SUMMARY_KEY, None)
+        if is_builtin_demo_source(previous_data_source) and not is_builtin_demo_source(
+            data_source
+        ):
+            clear_demo_recommendation_session_state(
+                cast(MutableMapping[str, Any], st.session_state)
+            )
+    st.session_state[SESSION_DATA_SOURCE_PREVIOUS_KEY] = data_source
+    demo_source_active = is_builtin_demo_source(data_source)
 
     columns: list[str] = []
     analysis_frame: pl.DataFrame | None = None
@@ -1179,47 +1229,208 @@ def render_app(
     upload_bytes: bytes | None = None
     config_report: UiColumnConfigurationReport | None = None
 
-    if uploaded is not None:
+    if demo_source_active:
+        demo_summary = None
         try:
-            upload_bytes = bytes(uploaded.getvalue())
-            if len(upload_bytes) == 0:
-                st.error("Uploaded CSV is empty. Provide a non-empty CSV file.")
-                upload_bytes = None
-            elif len(upload_bytes) > ui_config.maximum_upload_bytes:
-                st.error(
-                    "Uploaded CSV exceeds the configured maximum upload size. "
-                    "Reduce the file size and try again."
-                )
-                upload_bytes = None
-            else:
-                columns, analysis_frame, preview_frame = _read_csv_for_ui(
-                    upload_bytes,
-                    preview_row_count=ui_config.preview_row_count,
-                )
-                columns = [name for name in columns if name != _ORIGINAL_ROW_ID]
-                if _ORIGINAL_ROW_ID in analysis_frame.columns:
-                    analysis_frame = analysis_frame.drop(_ORIGINAL_ROW_ID)
-                config_report = active_configurator.analyze(analysis_frame)
-        except (pl.exceptions.PolarsError, UnicodeDecodeError, ValueError) as exc:
-            _display_user_error(exc, area="CSV upload / parsing")
+            demo_frame, demo_summary = load_builtin_demo_dataset()
+            upload_bytes = demo_dataset_to_workflow_csv_bytes(demo_frame)
+            columns, analysis_frame, preview_frame = _read_csv_for_ui(
+                upload_bytes,
+                preview_row_count=ui_config.preview_row_count,
+            )
+            columns = [name for name in columns if name != _ORIGINAL_ROW_ID]
+            if analysis_frame is not None and _ORIGINAL_ROW_ID in analysis_frame.columns:
+                analysis_frame = analysis_frame.drop(_ORIGINAL_ROW_ID)
+            config_report = active_configurator.analyze(analysis_frame)
+        except (pl.exceptions.PolarsError, ValueError, TypeError) as exc:
+            _display_user_error(exc, area="Built-in demo dataset")
             upload_bytes = None
             columns = []
             analysis_frame = None
             preview_frame = None
             config_report = None
+            demo_summary = None
+        if demo_summary is not None:
+            st.info(
+                "Source: synthetic built-in manufacturing demo data "
+                "(not production data)."
+            )
+            meta_cols = st.columns(4)
+            meta_cols[0].metric("Rows", demo_summary.row_count)
+            meta_cols[1].metric("Columns", demo_summary.column_count)
+            meta_cols[2].metric("Seed", demo_summary.random_seed)
+            meta_cols[3].metric("Anomaly rows", demo_summary.anomaly_row_count)
+            st.caption(
+                "Analysis on this dataset does not represent production accuracy. "
+                "Selecting the demo source or changing a template does not run "
+                "analysis."
+            )
+            if SESSION_DEMO_TEMPLATE_KEY not in st.session_state:
+                st.session_state[SESSION_DEMO_TEMPLATE_KEY] = (
+                    demo_template_options()[0]
+                )
+            st.selectbox(
+                "Demo analysis template",
+                options=list(demo_template_options()),
+                key=SESSION_DEMO_TEMPLATE_KEY,
+                help=(
+                    "Choose a leakage-safe template, then click "
+                    "Apply demo configuration. Changing the template alone "
+                    "does not overwrite the current configuration."
+                ),
+            )
+            if st.button(
+                "Apply demo configuration",
+                type="secondary",
+                key="apply_demo_configuration",
+            ):
+                template_label = str(
+                    st.session_state.get(SESSION_DEMO_TEMPLATE_KEY)
+                )
+                demo_preset = build_demo_configuration_preset(template_label)
+                clear_stale_analysis_session_state(
+                    cast(MutableMapping[str, Any], st.session_state)
+                )
+                st.session_state[SESSION_PRESET_PENDING_APPLY_KEY] = (
+                    build_configuration_preset_session_updates(demo_preset)
+                )
+                st.session_state[SESSION_DEMO_APPLY_SUCCESS_KEY] = True
+                st.session_state[SESSION_DEMO_APPLY_SUMMARY_KEY] = (
+                    demo_configuration_apply_summary(demo_preset)
+                )
+                st.rerun()
+            if st.session_state.pop(SESSION_DEMO_APPLY_SUCCESS_KEY, False):
+                apply_summary = st.session_state.get(SESSION_DEMO_APPLY_SUMMARY_KEY)
+                st.success("Demo configuration applied.")
+                if isinstance(apply_summary, dict):
+                    st.caption(
+                        "mode="
+                        f"{apply_summary.get('analysis_mode')}; "
+                        f"target={apply_summary.get('target')}; "
+                        f"features={apply_summary.get('feature_count')}; "
+                        "operating_point="
+                        f"{apply_summary.get('operating_point_selection_mode')}; "
+                        "recommendation="
+                        f"{apply_summary.get('anomaly_recommendation_enabled')}."
+                    )
+                    controllable_count = apply_summary.get(
+                        "verified_controllable_count", 0
+                    )
+                    if (
+                        isinstance(controllable_count, int)
+                        and controllable_count > 0
+                    ):
+                        controllable_names = apply_summary.get(
+                            "verified_controllable_variables", []
+                        )
+                        bounds = apply_summary.get("approved_synthetic_bounds", [])
+                        bound_parts: list[str] = []
+                        if isinstance(bounds, list):
+                            for item in bounds:
+                                if not isinstance(item, dict):
+                                    continue
+                                variable = item.get("variable")
+                                lower = item.get("lower_bound")
+                                upper = item.get("upper_bound")
+                                if (
+                                    isinstance(variable, str)
+                                    and isinstance(lower, (int, float))
+                                    and isinstance(upper, (int, float))
+                                ):
+                                    bound_parts.append(
+                                        f"{variable}=[{lower}, {upper}]"
+                                    )
+                        names_text = (
+                            ", ".join(str(name) for name in controllable_names)
+                            if isinstance(controllable_names, list)
+                            else ""
+                        )
+                        st.caption(
+                            f"Verified controllable variables: {controllable_count}"
+                            + (f" ({names_text})" if names_text else "")
+                            + (
+                                f"; approved synthetic bounds: "
+                                f"{'; '.join(bound_parts)}"
+                                if bound_parts
+                                else ""
+                            )
+                            + ". These limits are demonstration-only and must "
+                            "not be reused as real equipment operating limits."
+                        )
+    else:
+        uploaded = st.file_uploader(
+            "CSV upload",
+            type=["csv"],
+            accept_multiple_files=False,
+            help="CSV files only. Uploaded content is not stored permanently.",
+        )
+        if uploaded is not None:
+            try:
+                upload_bytes = bytes(uploaded.getvalue())
+                if len(upload_bytes) == 0:
+                    st.error("Uploaded CSV is empty. Provide a non-empty CSV file.")
+                    upload_bytes = None
+                elif len(upload_bytes) > ui_config.maximum_upload_bytes:
+                    st.error(
+                        "Uploaded CSV exceeds the configured maximum upload size. "
+                        "Reduce the file size and try again."
+                    )
+                    upload_bytes = None
+                else:
+                    columns, analysis_frame, preview_frame = _read_csv_for_ui(
+                        upload_bytes,
+                        preview_row_count=ui_config.preview_row_count,
+                    )
+                    columns = [name for name in columns if name != _ORIGINAL_ROW_ID]
+                    if (
+                        analysis_frame is not None
+                        and _ORIGINAL_ROW_ID in analysis_frame.columns
+                    ):
+                        analysis_frame = analysis_frame.drop(_ORIGINAL_ROW_ID)
+                    config_report = active_configurator.analyze(analysis_frame)
+            except (pl.exceptions.PolarsError, UnicodeDecodeError, ValueError) as exc:
+                _display_user_error(exc, area="CSV upload / parsing")
+                upload_bytes = None
+                columns = []
+                analysis_frame = None
+                preview_frame = None
+                config_report = None
 
     if preview_frame is not None:
-        show_preview = st.checkbox("Show CSV preview", value=False)
+        preview_label = (
+            "Show dataset preview" if demo_source_active else "Show CSV preview"
+        )
+        show_preview = st.checkbox(preview_label, value=False)
         if show_preview:
             st.caption(
                 f"Showing up to {ui_config.preview_row_count} rows for column review."
             )
             st.dataframe(preview_frame.to_dicts(), use_container_width=True)
 
+    if demo_source_active and columns:
+        ground_truth_present = ground_truth_metadata_columns_present(columns)
+        if ground_truth_present:
+            st.markdown("Ground-truth demo metadata")
+            st.caption(
+                "The following columns are synthetic evaluation labels only. "
+                "They are retained for preview and later evaluation, must not be "
+                "selected as model features, and are not used in workflow "
+                "execution: "
+                + ", ".join(ground_truth_present)
+                + "."
+            )
+
     if not columns or config_report is None:
-        st.warning(
-            "Upload a valid CSV to configure columns and run the analysis workflow."
-        )
+        if demo_source_active:
+            st.warning(
+                "Built-in manufacturing demo could not be loaded. "
+                "Try Upload CSV or reload the page."
+            )
+        else:
+            st.warning(
+                "Upload a valid CSV or select the built-in manufacturing demo "
+                "to configure columns and run the analysis workflow."
+            )
         _render_cached_report_if_any()
         return
 
@@ -1370,6 +1581,10 @@ def render_app(
     )
 
     base_recommended = list(config_report.recommended_feature_columns)
+    if demo_source_active:
+        base_recommended = filter_ground_truth_from_recommended_features(
+            base_recommended
+        )
     active_features = resolve_active_feature_columns(
         base_recommended,
         selected_target=selected_target,
@@ -2140,6 +2355,15 @@ def render_app(
             "explicit row ID supplied when required": explicit_row_id_ok,
         }
 
+    demo_feature_guard = validate_demo_feature_guard(
+        modeling_feature_columns if anomaly_only else feature_columns,
+        data_source=data_source,
+    )
+    if demo_source_active:
+        readiness["demo features exclude forbidden columns"] = demo_feature_guard.ok
+        if not demo_feature_guard.ok and demo_feature_guard.message is not None:
+            st.error(demo_feature_guard.message)
+
     recommendation_enabled_summary = (
         bool(anomaly_recommendation_enabled)
         if anomaly_only
@@ -2186,7 +2410,11 @@ def render_app(
 
     if submitted:
         if upload_bytes is None:
-            st.error("CSV upload is required before running the workflow.")
+            st.error(
+                "A loaded dataset is required before running the workflow."
+                if demo_source_active
+                else "CSV upload is required before running the workflow."
+            )
         elif anomaly_only:
             _run_workflow_from_upload(
                 upload_bytes=upload_bytes,
@@ -2209,6 +2437,8 @@ def render_app(
                 ),
                 quality_direction=None,
                 quality_target=None,
+                declared_target_minimum=None,
+                declared_target_maximum=None,
                 performance_rule_rows=[],
                 constraint_rows=(
                     list(constraint_rows) if anomaly_recommendation_enabled else []
@@ -2256,6 +2486,16 @@ def render_app(
                 objective=selected_objective,
                 quality_direction=quality_direction,
                 quality_target=quality_target,
+                declared_target_minimum=(
+                    DEMO_QUALITY_SCORE_DECLARED_MINIMUM
+                    if demo_source_active
+                    else None
+                ),
+                declared_target_maximum=(
+                    DEMO_QUALITY_SCORE_DECLARED_MAXIMUM
+                    if demo_source_active
+                    else None
+                ),
                 performance_rule_rows=performance_rule_rows,
                 constraint_rows=constraint_rows,
                 confirmed_controllable=list(confirmed_controllable),
@@ -2789,7 +3029,20 @@ def render_presentation_report(report: WorkflowPresentationReport) -> None:
             for warning in recommendation.warnings:
                 st.warning(warning)
     elif recommendation.status is RecommendationStatus.GENERATED:
-        st.success(f"Status: {recommendation.status.value}")
+        plausibility = recommendation.target_prediction_plausibility
+        proposed_outside_declared = (
+            plausibility is not None
+            and plausibility.proposed_status
+            is TargetPredictionPlausibilityStatus.OUTSIDE_DECLARED_DOMAIN
+        )
+        if proposed_outside_declared:
+            st.warning(
+                f"Status: {recommendation.status.value} — predicted quality is "
+                "outside the declared target domain and must not be treated as a "
+                "normal verified improvement."
+            )
+        else:
+            st.success(f"Status: {recommendation.status.value}")
         st.write(f"Objective: {recommendation.objective.value}")
         st.dataframe(
             [
@@ -2807,15 +3060,76 @@ def render_presentation_report(report: WorkflowPresentationReport) -> None:
             ],
             use_container_width=True,
         )
-        st.write(
-            {
-                "baseline_quality_prediction": recommendation.baseline_prediction,
-                "proposed_quality_prediction": recommendation.proposed_prediction,
-                "baseline_anomaly_score": recommendation.baseline_anomaly_score,
-                "proposed_anomaly_score": recommendation.proposed_anomaly_score,
-                "overall_confidence": recommendation.confidence,
-                "safety_status": recommendation.safety_status.value,
-            }
+        prediction_summary: dict[str, object] = {
+            "raw_baseline_quality_prediction": recommendation.baseline_prediction,
+            "raw_proposed_quality_prediction": recommendation.proposed_prediction,
+            "baseline_anomaly_score": recommendation.baseline_anomaly_score,
+            "proposed_anomaly_score": recommendation.proposed_anomaly_score,
+            "overall_confidence": recommendation.confidence,
+            "safety_status": recommendation.safety_status.value,
+            "extrapolation_flag": recommendation.extrapolation_flag,
+        }
+        if plausibility is not None:
+            domain = plausibility.domain
+            prediction_summary.update(
+                {
+                    "observed_training_target_minimum": (
+                        None if domain is None else domain.observed_minimum
+                    ),
+                    "observed_training_target_maximum": (
+                        None if domain is None else domain.observed_maximum
+                    ),
+                    "declared_target_minimum": (
+                        None if domain is None else domain.declared_minimum
+                    ),
+                    "declared_target_maximum": (
+                        None if domain is None else domain.declared_maximum
+                    ),
+                    "baseline_prediction_plausibility": (
+                        None
+                        if plausibility.baseline_status is None
+                        else plausibility.baseline_status.value
+                    ),
+                    "proposed_prediction_plausibility": (
+                        None
+                        if plausibility.proposed_status is None
+                        else plausibility.proposed_status.value
+                    ),
+                }
+            )
+        st.write(prediction_summary)
+        if proposed_outside_declared:
+            domain = None if plausibility is None else plausibility.domain
+            if (
+                domain is not None
+                and domain.declared_minimum is not None
+                and domain.declared_maximum is not None
+            ):
+                domain_text = (
+                    f"[{domain.declared_minimum:g}, {domain.declared_maximum:g}]"
+                )
+            else:
+                domain_text = (
+                    f"[{DEMO_QUALITY_SCORE_DECLARED_MINIMUM:g}, "
+                    f"{DEMO_QUALITY_SCORE_DECLARED_MAXIMUM:g}]"
+                )
+            st.error(
+                "The raw proposed quality prediction is outside the declared "
+                f"target domain {domain_text}. Do not interpret the estimated "
+                "improvement quantitatively as an attainable quality score."
+            )
+        if plausibility is not None:
+            for message in plausibility.warning_messages:
+                st.warning(message)
+        for warning in recommendation.warnings:
+            if (
+                plausibility is None
+                or warning not in plausibility.warning_messages
+            ):
+                st.warning(warning)
+        st.caption(
+            "Association does not establish causation. Proposed changes require "
+            "domain, safety, and operational verification."
         )
     elif recommendation.status is RecommendationStatus.READY_FOR_OPTIMIZATION:
         st.warning(f"Status: {recommendation.status.value}")
@@ -2882,6 +3196,8 @@ def _run_workflow_from_upload(
     objective: RecommendationObjective | None,
     quality_direction: QualityOptimizationDirection | None,
     quality_target: float | None,
+    declared_target_minimum: float | None,
+    declared_target_maximum: float | None,
     performance_rule_rows: Sequence[Mapping[str, Any]],
     constraint_rows: Sequence[Mapping[str, float | str]],
     confirmed_controllable: list[str],
@@ -2944,6 +3260,8 @@ def _run_workflow_from_upload(
             objective=objective,
             quality_direction=quality_direction,
             quality_target=quality_target,
+            declared_target_minimum=declared_target_minimum,
+            declared_target_maximum=declared_target_maximum,
             performance_rules=performance_rules,
             constraints=constraints,
             user_confirmed_controllable_variables=confirmed_controllable,
