@@ -68,6 +68,9 @@ SESSION_DEMO_APPLY_SUMMARY_KEY: Final[str] = "ui_demo_configuration_apply_summar
 SESSION_REPORT_KEY: Final[str] = "last_presentation_report_json"
 SESSION_BASELINE_REPORT_KEY: Final[str] = "comparison_baseline_report_json"
 SESSION_BASELINE_LABEL_KEY: Final[str] = "comparison_baseline_label"
+SESSION_REPRODUCIBILITY_BUNDLE_INPUTS_KEY: Final[str] = (
+    "last_reproducibility_bundle_inputs_json"
+)
 
 # Columns that must never appear as model features for the built-in demo.
 FORBIDDEN_DEMO_MODEL_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
@@ -498,6 +501,7 @@ def clear_stale_analysis_session_state(
     session_state.pop(SESSION_REPORT_KEY, None)
     session_state.pop(SESSION_BASELINE_REPORT_KEY, None)
     session_state.pop(SESSION_BASELINE_LABEL_KEY, None)
+    session_state.pop(SESSION_REPRODUCIBILITY_BUNDLE_INPUTS_KEY, None)
 
 
 def clear_demo_recommendation_session_state(

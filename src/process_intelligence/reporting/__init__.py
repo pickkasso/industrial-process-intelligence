@@ -1,12 +1,57 @@
-"""Public API for workflow presentation reporting (Step 11A / 11B.11).
+"""Public API for workflow presentation reporting (Step 11A / 11B.11 / 14).
 
-Exposes JSON-safe presentation DTOs, ``AnalysisWorkflowReportBuilder``, and
-anomaly-run comparison helpers. Does not expose Streamlit, REST, CLI,
-persistence, or rendering helpers.
+Exposes JSON-safe presentation DTOs, ``AnalysisWorkflowReportBuilder``,
+anomaly-run comparison helpers, reproducibility-bundle export helpers, and
+read-only reproducibility-bundle verification helpers.
+Does not expose Streamlit, REST, CLI, persistence, or rendering helpers.
 """
 
 from process_intelligence.reporting.builder import AnalysisWorkflowReportBuilder
 from process_intelligence.reporting.comparison import build_anomaly_run_comparison
+from process_intelligence.reporting.reproducibility import (
+    ReproducibilityComparison,
+    ReproducibilityComponentStatus,
+    ReproducibilityMatchStatus,
+    assert_reproducibility_comparison_has_no_forbidden_objects,
+    compare_setup_to_run_manifest,
+    reproducibility_comparison_to_json,
+)
+from process_intelligence.reporting.reproducibility_bundle import (
+    BUNDLE_ARCHIVE_ROOT,
+    BUNDLE_MANIFEST_BASENAME,
+    BUNDLE_SCHEMA_VERSION,
+    SIGNED_BUNDLE_FILE_BASENAMES,
+    ReproducibilityBundle,
+    ReproducibilityBundleFile,
+    ReproducibilityBundleManifest,
+    assert_bundle_has_no_forbidden_objects,
+    build_effective_configuration_payload,
+    build_environment_payload,
+    build_feature_schema_payload,
+    build_reproducibility_bundle,
+    compute_reproducibility_bundle_signature,
+    reproducibility_bundle_download_filename,
+    serialize_reproducibility_bundle,
+)
+from process_intelligence.reporting.reproducibility_bundle_verification import (
+    MAX_BUNDLE_ARCHIVE_MEMBER_COUNT,
+    MAX_BUNDLE_COMPRESSION_RATIO,
+    MAX_BUNDLE_ENTRY_UNCOMPRESSED_BYTES,
+    MAX_BUNDLE_TOTAL_UNCOMPRESSED_BYTES,
+    MAX_BUNDLE_ZIP_BYTES,
+    ReproducibilityBundleFileStatus,
+    ReproducibilityBundleFileVerification,
+    ReproducibilityBundleInspectionSummary,
+    ReproducibilityBundleVerificationResult,
+    ReproducibilityBundleVerificationStatus,
+    SchemaCompatibilityResult,
+    SchemaCompatibilityStatus,
+    evaluate_schema_compatibility,
+    inspect_reproducibility_bundle,
+    parse_reproducibility_bundle,
+    validate_reproducibility_bundle_archive,
+    verify_reproducibility_bundle,
+)
 from process_intelligence.reporting.schemas import (
     AnomalyContextIdentifierValueView,
     AnomalyContextRowView,
@@ -37,8 +82,14 @@ from process_intelligence.reporting.schemas import (
     WorkflowStageView,
     stability_classification_message,
 )
+from process_intelligence.workflow.run_manifest import (
+    AnalysisRunManifest,
+    AnalysisStageManifestEntry,
+)
 
 __all__ = [
+    "AnalysisRunManifest",
+    "AnalysisStageManifestEntry",
     "AnalysisWorkflowReportBuilder",
     "AnomalyContextIdentifierValueView",
     "AnomalyContextRowView",
@@ -46,7 +97,15 @@ __all__ = [
     "AnomalyContextWindowView",
     "AnomalyEventView",
     "AnomalyRunComparisonView",
+    "BUNDLE_ARCHIVE_ROOT",
+    "BUNDLE_MANIFEST_BASENAME",
+    "BUNDLE_SCHEMA_VERSION",
     "DiagnosisFactorComparisonView",
+    "MAX_BUNDLE_ARCHIVE_MEMBER_COUNT",
+    "MAX_BUNDLE_COMPRESSION_RATIO",
+    "MAX_BUNDLE_ENTRY_UNCOMPRESSED_BYTES",
+    "MAX_BUNDLE_TOTAL_UNCOMPRESSED_BYTES",
+    "MAX_BUNDLE_ZIP_BYTES",
     "DiagnosisFactorPresenceStatus",
     "DiagnosisFactorView",
     "EventOverlapEntryView",
@@ -57,7 +116,21 @@ __all__ = [
     "RecommendationChangeView",
     "RecommendationWhatIfVerificationView",
     "RecommendationView",
+    "ReproducibilityBundle",
+    "ReproducibilityBundleFile",
+    "ReproducibilityBundleFileStatus",
+    "ReproducibilityBundleFileVerification",
+    "ReproducibilityBundleInspectionSummary",
+    "ReproducibilityBundleManifest",
+    "ReproducibilityBundleVerificationResult",
+    "ReproducibilityBundleVerificationStatus",
+    "ReproducibilityComparison",
+    "ReproducibilityComponentStatus",
+    "ReproducibilityMatchStatus",
     "RunConfigurationComparisonView",
+    "SIGNED_BUNDLE_FILE_BASENAMES",
+    "SchemaCompatibilityResult",
+    "SchemaCompatibilityStatus",
     "WhatIfVerificationScenarioView",
     "WorkflowCohortFilterSummaryView",
     "WorkflowDataSummaryView",
@@ -67,6 +140,22 @@ __all__ = [
     "WorkflowPresentationReport",
     "WorkflowRoutingSummaryView",
     "WorkflowStageView",
+    "assert_bundle_has_no_forbidden_objects",
+    "assert_reproducibility_comparison_has_no_forbidden_objects",
     "build_anomaly_run_comparison",
+    "build_effective_configuration_payload",
+    "build_environment_payload",
+    "build_feature_schema_payload",
+    "build_reproducibility_bundle",
+    "compare_setup_to_run_manifest",
+    "compute_reproducibility_bundle_signature",
+    "evaluate_schema_compatibility",
+    "inspect_reproducibility_bundle",
+    "parse_reproducibility_bundle",
+    "reproducibility_bundle_download_filename",
+    "reproducibility_comparison_to_json",
+    "serialize_reproducibility_bundle",
     "stability_classification_message",
+    "validate_reproducibility_bundle_archive",
+    "verify_reproducibility_bundle",
 ]

@@ -43,6 +43,8 @@ from process_intelligence.reporting import (
 from process_intelligence.ui import render_presentation_report
 from process_intelligence.workflow import (
     AnalysisExecutionMode,
+    AnalysisRunManifest,
+    AnalysisStageManifestEntry,
     AnalysisWorkflowOutcome,
     AnalysisWorkflowReport,
     AnalysisWorkflowStage,
@@ -53,6 +55,7 @@ from process_intelligence.workflow import (
     AnomalyContextValue,
     AnomalyContextWindow,
     IndustrialProcessAnalysisWorkflow,
+    OperatingPointSelectionMode,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -70,6 +73,77 @@ _CSV_BYTES = (
     b"2,LOT-1,51.0,221.0,81.0,ok\n"
     b"3,LOT-2,52.0,219.0,79.5,ok\n"
 )
+
+_SUPERVISED_DATASET_FP = (
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+)
+_SUPERVISED_CONFIG_FP = (
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+)
+_SUPERVISED_RUN_SIGNATURE = (
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+)
+_ANOMALY_DATASET_FP = (
+    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+)
+_ANOMALY_CONFIG_FP = (
+    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+)
+_ANOMALY_RUN_SIGNATURE = (
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+)
+
+
+def _sample_run_manifest(
+    *,
+    analysis_mode: AnalysisExecutionMode = AnalysisExecutionMode.SUPERVISED,
+    workflow_status: AnalysisWorkflowStatus = AnalysisWorkflowStatus.COMPLETED,
+    dataset_fingerprint: str = _SUPERVISED_DATASET_FP,
+    configuration_fingerprint: str = _SUPERVISED_CONFIG_FP,
+    run_signature: str = _SUPERVISED_RUN_SIGNATURE,
+    target_column: str | None = "quality",
+    resolved_task: AnalysisTask | None = AnalysisTask.REGRESSION,
+    feature_columns: list[str] | None = None,
+    selected_model: str | None = "ridge",
+    operating_point_selection_mode: OperatingPointSelectionMode = (
+        OperatingPointSelectionMode.TOP_RESIDUAL_ANOMALY
+    ),
+    refusal_or_failure_code: str | None = None,
+) -> AnalysisRunManifest:
+    features = (
+        ["pressure", "temperature"]
+        if feature_columns is None
+        else list(feature_columns)
+    )
+    return AnalysisRunManifest(
+        manifest_schema_version=1,
+        run_signature=run_signature,
+        configuration_fingerprint=configuration_fingerprint,
+        dataset_fingerprint=dataset_fingerprint,
+        application_version="0.1.0",
+        started_at_utc=_UTC_START,
+        completed_at_utc=_UTC_END,
+        duration_seconds=300.0,
+        analysis_mode=analysis_mode,
+        requested_task=resolved_task,
+        resolved_task=resolved_task,
+        target_column=target_column,
+        timestamp_column="timestamp",
+        feature_count=len(features),
+        feature_columns=features,
+        operating_point_selection_mode=operating_point_selection_mode,
+        workflow_status=workflow_status,
+        selected_model=selected_model,
+        stage_entries=[
+            AnalysisStageManifestEntry(
+                stage=AnalysisWorkflowStage.LOAD,
+                status="SUCCEEDED",
+                message="LOAD stage completed.",
+            )
+        ],
+        warning_count=1,
+        refusal_or_failure_code=refusal_or_failure_code,
+    )
 
 
 def _wif_scenario(**overrides: object) -> WhatIfVerificationScenario:
@@ -303,9 +377,8 @@ def _completed_report(
             "anomaly_score_direction": "higher_is_more_anomalous",
             "row_identity_preserved": True,
         },
-        dataset_fingerprint=(
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ),
+        dataset_fingerprint=_SUPERVISED_DATASET_FP,
+        run_manifest=_sample_run_manifest(),
     )
 
 
@@ -600,8 +673,20 @@ def _anomaly_only_report() -> AnalysisWorkflowReport:
             "anomaly_event_selection_source": "UNSUPERVISED_ANOMALY_SCORE",
             "diagnosis_source": "ROBUST_GROUP_COMPARISON",
         },
-        dataset_fingerprint=(
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        dataset_fingerprint=_ANOMALY_DATASET_FP,
+        run_manifest=_sample_run_manifest(
+            analysis_mode=AnalysisExecutionMode.ANOMALY_ONLY,
+            workflow_status=AnalysisWorkflowStatus.PARTIAL,
+            dataset_fingerprint=_ANOMALY_DATASET_FP,
+            configuration_fingerprint=_ANOMALY_CONFIG_FP,
+            run_signature=_ANOMALY_RUN_SIGNATURE,
+            target_column=None,
+            resolved_task=None,
+            feature_columns=["pressure", "temperature"],
+            selected_model="isolation_forest",
+            operating_point_selection_mode=(
+                OperatingPointSelectionMode.TOP_UNSUPERVISED_ANOMALY
+            ),
         ),
     )
 
@@ -692,6 +777,7 @@ def _text_blob(at: AppTest) -> str:
         "success",
         "warning",
         "error",
+        "json",
     ):
         elements = getattr(at, attr, [])
         for element in elements:
@@ -699,6 +785,14 @@ def _text_blob(at: AppTest) -> str:
             if value is not None:
                 parts.append(str(value))
     return "\n".join(parts)
+
+
+def _assert_setup_comparison_status(at: AppTest, status: str) -> None:
+    blob = _text_blob(at)
+    assert f"Overall status: `{status}`" in blob or status in blob
+    report_json = at.session_state.filtered_state.get("last_presentation_report_json")
+    assert isinstance(report_json, dict)
+    assert report_json.get("run_manifest") is not None
 
 
 def test_app_py_loads() -> None:
@@ -712,7 +806,11 @@ def test_initial_header_and_uploader() -> None:
     at = _make_app().run()
     assert not at.exception
     assert "Industrial Process Intelligence" in at.title[0].value
-    assert len(at.file_uploader) == 1
+    assert len(at.file_uploader) >= 1
+    assert any(item.label == "CSV upload" for item in at.file_uploader)
+    assert any(
+        item.label == "Upload reproducibility bundle ZIP" for item in at.file_uploader
+    )
     blob = _text_blob(at)
     assert "Model-based decision support" in blob
     assert "guarantee" in blob.lower()
@@ -720,6 +818,7 @@ def test_initial_header_and_uploader() -> None:
     assert "Upload a CSV file" in blob
     assert "built-in manufacturing demo" in blob.lower()
     assert "Export reusable configuration when needed." in blob
+    assert "Verify reproducibility bundle" in blob
     radio = next(item for item in at.radio if item.label == "Data source")
     assert radio.value == "Upload CSV"
 
@@ -1217,12 +1316,13 @@ def test_what_if_verification_no_full_feature_dump() -> None:
     ).run()
     assert not at.exception
     blob = _text_blob(at) + str(at)
-    # Only the compact controllable-variable mapping used by the fixture
-    # ("pressure") is present in the what-if scenarios; there is no raw
-    # feature-row dump of the full dataset's other columns.
-    assert "temperature" not in blob
+    # What-if scenarios expose only the compact controllable mapping
+    # ("pressure"). Provenance may list model feature names, but there must be
+    # no raw feature-row dump of other dataset columns.
     assert "sensor" not in blob
     assert "DataFrame" not in blob
+    assert "feature_values" not in blob
+    assert "to_dicts" not in blob
 
 
 def test_default_factory_is_real_workflow() -> None:
@@ -2453,7 +2553,8 @@ def test_configuration_preset_uploader_present() -> None:
     labels = [item.label for item in at.file_uploader]
     assert "CSV upload" in labels
     assert "Upload configuration JSON" in labels
-    assert len(at.file_uploader) == 2
+    assert "Upload reproducibility bundle ZIP" in labels
+    assert len(at.file_uploader) == 3
 
 
 def test_configuration_preset_apply_before_click_does_not_change_ui_state() -> None:
@@ -3017,4 +3118,1145 @@ def test_builtin_demo_forbidden_feature_disables_run() -> None:
     assert run_button.disabled is True
     flags = _run_readiness_flags(at)
     assert flags.get("demo features exclude forbidden columns") is False
+
+
+# ---------------------------------------------------------------------------
+# Built-in demo ground-truth evaluation panel (Step 13E)
+# ---------------------------------------------------------------------------
+
+
+_DEMO_EVAL_RUN_COUNT = {"count": 0}
+
+
+def _demo_injected_row_ids(csv_path: Path, *, limit: int = 3) -> list[int]:
+    import pandas as pd  # type: ignore[import-untyped]
+
+    frame = pd.read_csv(csv_path)
+    if "injected_anomaly" not in frame.columns:
+        return []
+    ids = [
+        int(index)
+        for index, flag in enumerate(frame["injected_anomaly"].tolist())
+        if bool(flag)
+    ]
+    return ids[:limit]
+
+
+def _run_manifest_matching_request(request: object) -> AnalysisRunManifest:
+    """Build a run manifest that matches the request's declared setup inputs."""
+    from process_intelligence.workflow import (
+        AnalysisWorkflowPolicy,
+        AnalysisWorkflowStage,
+        AnalysisWorkflowStageRecord,
+        AnalysisWorkflowStatus,
+        build_analysis_run_manifest,
+    )
+    from process_intelligence.workflow.dataset_fingerprint import (
+        compute_dataset_content_fingerprint,
+    )
+    from process_intelligence.workflow.schemas import AnalysisWorkflowRequest
+
+    assert isinstance(request, AnalysisWorkflowRequest)
+    fingerprint = compute_dataset_content_fingerprint(Path(request.csv_path))
+    features = list(request.feature_columns)
+    return build_analysis_run_manifest(
+        request=request,
+        policy=AnalysisWorkflowPolicy(),
+        stage_records=[
+            AnalysisWorkflowStageRecord(
+                stage=AnalysisWorkflowStage.LOAD,
+                executed=True,
+                succeeded=True,
+                structured_refusal=False,
+                message="LOAD completed.",
+                warnings=[],
+                metadata={},
+            )
+        ],
+        workflow_status=AnalysisWorkflowStatus.COMPLETED,
+        dataset_fingerprint=fingerprint,
+        feature_columns=features,
+        analysis_mode=request.analysis_mode,
+        requested_task=request.requested_task,
+        resolved_task=request.requested_task,
+        target_column=request.target_column,
+        selected_model="ridge",
+        warning_count=0,
+        started_at_utc=_UTC_START,
+        completed_at_utc=_UTC_END,
+        duration_seconds=300.0,
+    )
+
+
+def _demo_aware_report(
+    *,
+    request: object,
+    run_count_bucket: dict[str, int] | None = None,
+) -> AnalysisWorkflowReport:
+    from process_intelligence.workflow.dataset_fingerprint import (
+        compute_dataset_content_fingerprint,
+    )
+    from process_intelligence.workflow.enums import AnalysisExecutionMode as _Mode
+    from process_intelligence.workflow.schemas import AnalysisWorkflowRequest
+
+    if run_count_bucket is not None:
+        run_count_bucket["count"] += 1
+    assert isinstance(request, AnalysisWorkflowRequest)
+    csv_path = Path(request.csv_path)
+    fingerprint = compute_dataset_content_fingerprint(csv_path)
+    mode = request.analysis_mode
+    injected_ids = _demo_injected_row_ids(csv_path)
+    if not injected_ids:
+        injected_ids = [0]
+    matching_manifest = _run_manifest_matching_request(request)
+
+    if mode is _Mode.ANOMALY_ONLY:
+        report = _anomaly_only_report()
+        events = [
+            AnomalyEvent(
+                anomaly_id=str(row_id),
+                anomaly_type=AnomalyType.PROCESS_INPUT,
+                anomaly_score=0.8 - (0.05 * index),
+                severity="high",
+                sample_id=row_id,
+                model_confidence=0.75,
+                detector="unsupervised_anomaly_model",
+                rationale="Demo-aware unsupervised anomaly event.",
+                contributing_variables=[],
+            )
+            for index, row_id in enumerate(injected_ids)
+        ]
+        return report.model_copy(
+            update={
+                "anomaly_events": events,
+                "anomaly_event_count": len(events),
+                "selected_operating_row_id": injected_ids[0],
+                "dataset_fingerprint": fingerprint,
+                "run_manifest": matching_manifest,
+                "metadata": {
+                    **report.metadata,
+                    "analysis_mode": _Mode.ANOMALY_ONLY.value,
+                },
+            }
+        )
+
+    report = _completed_report()
+    residual_events = [
+        AnomalyEvent(
+            anomaly_id=str(row_id),
+            anomaly_type=AnomalyType.PROCESS_INPUT,
+            anomaly_score=0.7 - (0.05 * index),
+            severity="high",
+            sample_id=row_id,
+            model_confidence=0.7,
+            detector="residual_anomaly_detector",
+            rationale="Demo-aware residual anomaly event.",
+            contributing_variables=[],
+        )
+        for index, row_id in enumerate(injected_ids)
+    ]
+    return report.model_copy(
+        update={
+            "analysis_mode": _Mode.SUPERVISED,
+            "anomaly_events": residual_events,
+            "anomaly_event_count": len(residual_events),
+            "selected_operating_row_id": injected_ids[0],
+            "dataset_fingerprint": fingerprint,
+            "run_manifest": matching_manifest,
+            "metadata": {
+                **report.metadata,
+                "analysis_mode": _Mode.SUPERVISED.value,
+            },
+        }
+    )
+
+
+class _FingerprintMatchingWorkflow:
+    """Workflow double with a run manifest that matches the submitted request."""
+
+    last_request: object | None = None
+    run_count: int = 0
+
+    def run(self, request: object) -> AnalysisWorkflowOutcome:
+        type(self).last_request = request
+        type(self).run_count += 1
+        from process_intelligence.workflow.dataset_fingerprint import (
+            compute_dataset_content_fingerprint,
+        )
+        from process_intelligence.workflow.schemas import AnalysisWorkflowRequest
+
+        assert isinstance(request, AnalysisWorkflowRequest)
+        fingerprint = compute_dataset_content_fingerprint(Path(request.csv_path))
+        report = _completed_report().model_copy(
+            update={
+                "dataset_fingerprint": fingerprint,
+                "run_manifest": _run_manifest_matching_request(request),
+                "metadata": {
+                    **_completed_report().metadata,
+                    "analysis_mode": request.analysis_mode.value,
+                },
+            }
+        )
+        return AnalysisWorkflowOutcome(report=report)
+
+
+class _DemoAwareWorkflow:
+    """Workflow double that mirrors the loaded demo fingerprint and ground truth."""
+
+    def run(self, request: object) -> AnalysisWorkflowOutcome:
+        assert request is not None
+        return AnalysisWorkflowOutcome(report=_demo_aware_report(request=request))
+
+
+class _CountingDemoAwareWorkflow:
+    """Demo-aware workflow that counts ``run`` invocations."""
+
+    def run(self, request: object) -> AnalysisWorkflowOutcome:
+        assert request is not None
+        return AnalysisWorkflowOutcome(
+            report=_demo_aware_report(
+                request=request,
+                run_count_bucket=_DEMO_EVAL_RUN_COUNT,
+            )
+        )
+
+
+def _make_demo_eval_app() -> AppTest:
+    return AppTest.from_function(
+        _ui_entry,
+        default_timeout=60,
+        kwargs={"workflow_factory": lambda: _DemoAwareWorkflow()},
+    )
+
+
+def _make_counting_demo_eval_app() -> AppTest:
+    return AppTest.from_function(
+        _ui_entry,
+        default_timeout=60,
+        kwargs={"workflow_factory": lambda: _CountingDemoAwareWorkflow()},
+    )
+
+
+def _run_demo_analysis(at: AppTest) -> AppTest:
+    button = next(item for item in at.button if item.label == "Run analysis")
+    return button.click().run()
+
+
+def test_demo_evaluation_panel_absent_before_analysis() -> None:
+    at = _select_builtin_demo(_make_demo_eval_app().run())
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    at = _apply_demo_configuration(at)
+    assert not at.exception
+    assert "Demo ground-truth evaluation" not in _text_blob(at)
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+
+
+def test_demo_evaluation_panel_appears_after_anomaly_only_demo_analysis() -> None:
+    from process_intelligence.demo_data import (
+        DemoDatasetConfiguration,
+        generate_demo_dataset,
+    )
+    from process_intelligence.reporting import WorkflowPresentationReport
+    from process_intelligence.ui.demo_evaluation import (
+        DemoAnomalyEvaluationStatus,
+        evaluate_demo_anomaly_presentation,
+        format_enrichment,
+        format_percentage,
+    )
+
+    at = _select_builtin_demo(_make_demo_eval_app().run())
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    at = _apply_demo_configuration(at)
+    at = _run_demo_analysis(at)
+    assert not at.exception
+    headers = [item.value for item in at.header]
+    assert "Demo ground-truth evaluation" in headers
+    metrics = {item.label: item.value for item in at.metric}
+
+    state = at.session_state.filtered_state
+    report_json = state["last_presentation_report_json"]
+    assert isinstance(report_json, dict)
+    presentation = WorkflowPresentationReport.model_validate(report_json)
+    helper = evaluate_demo_anomaly_presentation(
+        report=presentation,
+        demo_frame=generate_demo_dataset(DemoDatasetConfiguration()),
+    )
+    assert helper.evaluation_status is DemoAnomalyEvaluationStatus.AVAILABLE
+    assert helper.matched_event_count >= 1
+    assert helper.enrichment_factor is not None
+    assert int(metrics["Displayed events evaluated"]) == helper.evaluated_event_count
+    assert int(metrics["Ground-truth matches"]) == helper.matched_event_count
+    assert metrics["Precision among displayed event representatives"] == (
+        format_percentage(helper.selected_event_precision)
+    )
+    assert metrics["Full-demo anomaly prevalence"] == format_percentage(
+        helper.dataset_anomaly_prevalence
+    )
+    assert metrics["Enrichment over demo prevalence"] == format_enrichment(
+        helper.enrichment_factor
+    )
+    assert "injected_anomaly" not in state.get("ui_explicit_feature_columns", [])
+    assert "anomaly_type" not in state.get("ui_explicit_feature_columns", [])
+
+
+def test_demo_evaluation_panel_appears_after_supervised_residual_events() -> None:
+    from process_intelligence.demo_data import (
+        DemoDatasetConfiguration,
+        generate_demo_dataset,
+    )
+    from process_intelligence.reporting import WorkflowPresentationReport
+    from process_intelligence.ui.demo_evaluation import (
+        DemoAnomalyEvaluationStatus,
+        evaluate_demo_anomaly_presentation,
+    )
+
+    at = _select_builtin_demo(_make_demo_eval_app().run())
+    at = _select_demo_template(at, "Supervised quality prediction")
+    at = _apply_demo_configuration(at)
+    before_features = list(
+        at.session_state.filtered_state.get("ui_explicit_feature_columns", [])
+    )
+    at = _run_demo_analysis(at)
+    assert not at.exception
+    headers = [item.value for item in at.header]
+    assert "Demo ground-truth evaluation" in headers
+    presentation = WorkflowPresentationReport.model_validate(
+        at.session_state.filtered_state["last_presentation_report_json"]
+    )
+    assert presentation.metadata.get("analysis_mode") == "SUPERVISED"
+    helper = evaluate_demo_anomaly_presentation(
+        report=presentation,
+        demo_frame=generate_demo_dataset(DemoDatasetConfiguration()),
+    )
+    assert helper.evaluation_status is DemoAnomalyEvaluationStatus.AVAILABLE
+    assert helper.matched_event_count >= 1
+    after_features = list(
+        at.session_state.filtered_state.get("ui_explicit_feature_columns", [])
+    )
+    assert after_features == before_features
+    assert "injected_anomaly" not in after_features
+
+
+def test_demo_evaluation_panel_absent_for_uploaded_csv() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_demo_eval_app().run()))
+    at = _run_demo_analysis(at)
+    assert not at.exception
+    assert "last_presentation_report_json" in at.session_state.filtered_state
+    assert "Demo ground-truth evaluation" not in _text_blob(at)
+
+
+def test_demo_evaluation_panel_disappears_after_source_switch() -> None:
+    at = _select_builtin_demo(_make_demo_eval_app().run())
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    at = _apply_demo_configuration(at)
+    at = _run_demo_analysis(at)
+    assert "Demo ground-truth evaluation" in _text_blob(at)
+    radio = next(item for item in at.radio if item.label == "Data source")
+    at = radio.set_value("Upload CSV").run()
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    assert "Demo ground-truth evaluation" not in _text_blob(at)
+
+
+def test_demo_evaluation_skips_stale_fingerprint_report() -> None:
+    from process_intelligence.reporting import (
+        AnalysisWorkflowReportBuilder,
+        WorkflowPresentationReport,
+    )
+    from process_intelligence.ui.demo_configuration import (
+        demo_dataset_to_workflow_csv_bytes,
+        load_builtin_demo_dataset,
+    )
+    from process_intelligence.workflow import (
+        compute_dataset_content_fingerprint_from_bytes,
+    )
+
+    at = _select_builtin_demo(_make_demo_eval_app().run())
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    at = _apply_demo_configuration(at)
+    stale = AnalysisWorkflowReportBuilder().build(_anomaly_only_report()).report
+    demo_bytes = demo_dataset_to_workflow_csv_bytes(load_builtin_demo_dataset()[0])
+    live_fingerprint = compute_dataset_content_fingerprint_from_bytes(demo_bytes)
+    assert stale.dataset_fingerprint != live_fingerprint
+    at.session_state["last_presentation_report_json"] = stale.model_dump(mode="json")
+    at = at.run()
+    assert not at.exception
+    # Stale canned fingerprint must not match the live demo bytes.
+    assert "Demo ground-truth evaluation" not in [item.value for item in at.header]
+    cached = at.session_state.filtered_state.get("last_presentation_report_json")
+    assert isinstance(cached, dict)
+    report = WorkflowPresentationReport.model_validate(cached)
+    assert report.dataset_fingerprint == stale.dataset_fingerprint
+
+
+def test_demo_evaluation_does_not_change_workflow_outputs_or_rerun() -> None:
+    from process_intelligence.demo_data import (
+        DemoDatasetConfiguration,
+        generate_demo_dataset,
+    )
+    from process_intelligence.reporting import WorkflowPresentationReport
+    from process_intelligence.ui.demo_evaluation import evaluate_demo_anomaly_presentation
+
+    _DEMO_EVAL_RUN_COUNT["count"] = 0
+    at = _select_builtin_demo(_make_counting_demo_eval_app().run())
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    at = _apply_demo_configuration(at)
+    at = _run_demo_analysis(at)
+    assert _DEMO_EVAL_RUN_COUNT["count"] == 1
+    report_json = at.session_state.filtered_state["last_presentation_report_json"]
+    presentation = WorkflowPresentationReport.model_validate(report_json)
+    before_status = presentation.overview.status
+    before_event_ids = [event.original_row_id for event in presentation.anomaly_events]
+    before_dump = presentation.model_dump(mode="json")
+
+    evaluate_demo_anomaly_presentation(
+        report=presentation,
+        demo_frame=generate_demo_dataset(DemoDatasetConfiguration()),
+    )
+    after_dump = presentation.model_dump(mode="json")
+    assert after_dump == before_dump
+    assert presentation.overview.status == before_status
+    assert [event.original_row_id for event in presentation.anomaly_events] == (
+        before_event_ids
+    )
+
+    # Re-render without clicking Run again must not invoke the workflow.
+    at = at.run()
+    assert _DEMO_EVAL_RUN_COUNT["count"] == 1
+    assert "Demo ground-truth evaluation" in [item.value for item in at.header]
+
+
+def test_run_provenance_absent_before_analysis() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_app().run()))
+    assert not at.exception
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    assert not any(item.label == "Run provenance" for item in at.expander)
+
+
+def test_run_provenance_present_after_analysis() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    assert not at.exception
+    assert any(item.label == "Run provenance" for item in at.expander)
+    report_json = at.session_state.filtered_state["last_presentation_report_json"]
+    report = WorkflowPresentationReport.model_validate(report_json)
+    assert report.run_manifest is not None
+    assert report.run_manifest.dataset_fingerprint == _SUPERVISED_DATASET_FP
+    assert report.run_manifest.configuration_fingerprint == _SUPERVISED_CONFIG_FP
+    assert report.run_manifest.run_signature == _SUPERVISED_RUN_SIGNATURE
+    assert report.run_manifest.feature_count == 2
+    blob = _text_blob(at)
+    assert "does not prove model correctness" in blob
+    assert "C:\\Users\\" not in blob
+    assert "sample.csv" not in blob or "Run provenance" in blob
+
+
+def test_run_provenance_removed_on_source_switch() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    assert "last_presentation_report_json" in at.session_state.filtered_state
+    radio = next(item for item in at.radio if item.label == "Data source")
+    at = radio.set_value("Built-in manufacturing demo").run()
+    assert not at.exception
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    assert not any(item.label == "Run provenance" for item in at.expander)
+
+
+def test_widget_change_without_rerun_keeps_stored_manifest() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    before = at.session_state.filtered_state["last_presentation_report_json"]
+    before_signature = before["run_manifest"]["run_signature"]
+    # Presentation-only rerender without clicking Run analysis.
+    at = at.run()
+    after = at.session_state.filtered_state["last_presentation_report_json"]
+    assert after["run_manifest"]["run_signature"] == before_signature
+    assert after["run_manifest"] == before["run_manifest"]
+    assert any(item.label == "Run provenance" for item in at.expander)
+
+
+def test_new_run_replaces_previous_manifest() -> None:
+    class _AlternatingWorkflow:
+        def __init__(self) -> None:
+            self._calls = 0
+
+        def run(self, request: object) -> AnalysisWorkflowOutcome:
+            assert request is not None
+            self._calls += 1
+            if self._calls == 1:
+                return AnalysisWorkflowOutcome(report=_completed_report())
+            alternate = _completed_report().model_copy(
+                update={
+                    "run_manifest": _sample_run_manifest(
+                        run_signature=_ANOMALY_RUN_SIGNATURE,
+                        configuration_fingerprint=_ANOMALY_CONFIG_FP,
+                    )
+                }
+            )
+            return AnalysisWorkflowOutcome(report=alternate)
+
+    workflow = _AlternatingWorkflow()
+    at = AppTest.from_function(
+        _ui_entry,
+        default_timeout=30,
+        kwargs={"workflow_factory": lambda: workflow},
+    ).run()
+    at = _prepare_runnable_form(_upload_csv(at))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    first = at.session_state.filtered_state["last_presentation_report_json"]
+    assert first["run_manifest"]["run_signature"] == _SUPERVISED_RUN_SIGNATURE
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    second = at.session_state.filtered_state["last_presentation_report_json"]
+    assert second["run_manifest"]["run_signature"] == _ANOMALY_RUN_SIGNATURE
+    assert workflow._calls == 2
+
+
+def test_no_automatic_analysis_on_upload() -> None:
+    run_count = {"count": 0}
+
+    class _CountingWorkflow:
+        def run(self, request: object) -> AnalysisWorkflowOutcome:
+            run_count["count"] += 1
+            return AnalysisWorkflowOutcome(report=_completed_report())
+
+    at = AppTest.from_function(
+        _ui_entry,
+        default_timeout=30,
+        kwargs={"workflow_factory": lambda: _CountingWorkflow()},
+    ).run()
+    at = _upload_csv(at)
+    assert run_count["count"] == 0
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    assert not any(item.label == "Run provenance" for item in at.expander)
+
+
+# ---------------------------------------------------------------------------
+# Current-setup reproducibility comparison (Step 14B)
+# ---------------------------------------------------------------------------
+
+
+def _make_fingerprint_app() -> AppTest:
+    _FingerprintMatchingWorkflow.last_request = None
+    _FingerprintMatchingWorkflow.run_count = 0
+    return AppTest.from_function(
+        _ui_entry,
+        default_timeout=30,
+        kwargs={"workflow_factory": lambda: _FingerprintMatchingWorkflow()},
+    )
+
+
+def test_setup_comparison_absent_before_analysis() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    assert not at.exception
+    assert "Current setup comparison" not in _text_blob(at)
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+
+
+def test_setup_comparison_exact_match_after_uploaded_csv_run() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    assert not at.exception
+    assert _FingerprintMatchingWorkflow.run_count == 1
+    report = WorkflowPresentationReport.model_validate(
+        at.session_state.filtered_state["last_presentation_report_json"]
+    )
+    assert report.run_manifest is not None
+    blob = _text_blob(at)
+    assert "Current setup comparison" in blob
+    _assert_setup_comparison_status(at, "EXACT_MATCH")
+    assert "match this stored run" in blob.lower()
+    assert "C:\\Users\\" not in blob
+    assert "bit-for-bit" in blob.lower()
+
+
+def test_setup_comparison_configuration_change_and_revert() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    before = at.session_state.filtered_state["last_presentation_report_json"]
+    before_manifest = before["run_manifest"]
+    before_signature = before_manifest["run_signature"]
+    _assert_setup_comparison_status(at, "EXACT_MATCH")
+
+    # Behavior-affecting operating-point change without rerunning analysis.
+    operating_box = next(
+        item
+        for item in at.selectbox
+        if item.label == "Operating-point selection mode"
+    )
+    original_mode = operating_box.value
+    at = operating_box.select("LATEST_ROW").run()
+    assert not at.exception
+    after_change = at.session_state.filtered_state["last_presentation_report_json"]
+    assert after_change["run_manifest"] == before_manifest
+    assert after_change["run_manifest"]["run_signature"] == before_signature
+    _assert_setup_comparison_status(at, "CONFIGURATION_CHANGED")
+    assert "differs from the configuration" in _text_blob(at).lower()
+    assert _FingerprintMatchingWorkflow.run_count == 1
+
+    # Revert the operating-point mode; comparison returns to EXACT_MATCH.
+    operating_box = next(
+        item
+        for item in at.selectbox
+        if item.label == "Operating-point selection mode"
+    )
+    at = operating_box.select(original_mode).run()
+    assert not at.exception
+    after_revert = at.session_state.filtered_state["last_presentation_report_json"]
+    assert after_revert["run_manifest"] == before_manifest
+    _assert_setup_comparison_status(at, "EXACT_MATCH")
+    assert _FingerprintMatchingWorkflow.run_count == 1
+
+
+def test_setup_comparison_incomplete_current_configuration() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    before = at.session_state.filtered_state["last_presentation_report_json"]
+    target_box = next(item for item in at.selectbox if item.label == "Target column")
+    at = target_box.select("(select target)").run()
+    assert not at.exception
+    after = at.session_state.filtered_state["last_presentation_report_json"]
+    assert after["run_manifest"] == before["run_manifest"]
+    blob = _text_blob(at)
+    _assert_setup_comparison_status(at, "CURRENT_CONFIGURATION_INCOMPLETE")
+    assert "cannot be fingerprinted" in blob.lower()
+    assert "C:\\Users\\" not in blob
+    assert _FingerprintMatchingWorkflow.run_count == 1
+
+
+def test_setup_comparison_source_switch_removes_comparison() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    _assert_setup_comparison_status(at, "EXACT_MATCH")
+    radio = next(item for item in at.radio if item.label == "Data source")
+    at = radio.set_value("Built-in manufacturing demo").run()
+    assert not at.exception
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    assert "Current setup comparison" not in _text_blob(at)
+
+
+def test_setup_comparison_new_run_replaces_signature() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    first_signature = at.session_state.filtered_state["last_presentation_report_json"][
+        "run_manifest"
+    ]["run_signature"]
+    operating_box = next(
+        item
+        for item in at.selectbox
+        if item.label == "Operating-point selection mode"
+    )
+    at = operating_box.select("LATEST_ROW").run()
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    second_signature = at.session_state.filtered_state["last_presentation_report_json"][
+        "run_manifest"
+    ]["run_signature"]
+    assert second_signature != first_signature
+    _assert_setup_comparison_status(at, "EXACT_MATCH")
+    assert _FingerprintMatchingWorkflow.run_count == 2
+
+
+def test_setup_comparison_exact_match_after_supervised_demo_run() -> None:
+    at = _select_builtin_demo(_make_demo_eval_app().run())
+    at = _select_demo_template(at, "Supervised quality prediction")
+    at = _apply_demo_configuration(at)
+    at = _run_demo_analysis(at)
+    assert not at.exception
+    report = WorkflowPresentationReport.model_validate(
+        at.session_state.filtered_state["last_presentation_report_json"]
+    )
+    assert report.run_manifest is not None
+    assert "Current setup comparison" in _text_blob(at)
+    _assert_setup_comparison_status(at, "EXACT_MATCH")
+
+
+def test_setup_comparison_exact_match_after_anomaly_only_demo_run() -> None:
+    at = _select_builtin_demo(_make_demo_eval_app().run())
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    at = _apply_demo_configuration(at)
+    at = _run_demo_analysis(at)
+    assert not at.exception
+    report = WorkflowPresentationReport.model_validate(
+        at.session_state.filtered_state["last_presentation_report_json"]
+    )
+    assert report.run_manifest is not None
+    assert report.run_manifest.feature_count == 10
+    _assert_setup_comparison_status(at, "EXACT_MATCH")
+
+
+def test_setup_comparison_operating_point_change_on_anomaly_demo() -> None:
+    at = _select_builtin_demo(_make_demo_eval_app().run())
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    at = _apply_demo_configuration(at)
+    at = _run_demo_analysis(at)
+    before = at.session_state.filtered_state["last_presentation_report_json"]
+    operating_box = next(
+        item
+        for item in at.selectbox
+        if item.label == "Operating-point selection mode"
+    )
+    at = operating_box.select("LATEST_ROW").run()
+    assert not at.exception
+    after = at.session_state.filtered_state["last_presentation_report_json"]
+    assert after["run_manifest"] == before["run_manifest"]
+    _assert_setup_comparison_status(at, "CONFIGURATION_CHANGED")
+
+
+def test_setup_comparison_demo_evaluation_does_not_change_match() -> None:
+    _DEMO_EVAL_RUN_COUNT["count"] = 0
+    at = _select_builtin_demo(_make_counting_demo_eval_app().run())
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    at = _apply_demo_configuration(at)
+    at = _run_demo_analysis(at)
+    before = at.session_state.filtered_state["last_presentation_report_json"]
+    before_signature = before["run_manifest"]["run_signature"]
+    _assert_setup_comparison_status(at, "EXACT_MATCH")
+    at = at.run()
+    after = at.session_state.filtered_state["last_presentation_report_json"]
+    assert after["run_manifest"]["run_signature"] == before_signature
+    assert after["run_manifest"] == before["run_manifest"]
+    _assert_setup_comparison_status(at, "EXACT_MATCH")
+    assert _DEMO_EVAL_RUN_COUNT["count"] == 1
+
+
+def test_setup_comparison_template_select_without_apply_keeps_match() -> None:
+    at = _select_builtin_demo(_make_demo_eval_app().run())
+    at = _select_demo_template(at, "Supervised quality prediction")
+    at = _apply_demo_configuration(at)
+    at = _run_demo_analysis(at)
+    before = at.session_state.filtered_state["last_presentation_report_json"]
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    assert not at.exception
+    after = at.session_state.filtered_state["last_presentation_report_json"]
+    assert after["run_manifest"] == before["run_manifest"]
+    _assert_setup_comparison_status(at, "EXACT_MATCH")
+
+
+def test_setup_comparison_presentation_rerender_stays_exact_match() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    before = at.session_state.filtered_state["last_presentation_report_json"]
+    at = at.run()
+    after = at.session_state.filtered_state["last_presentation_report_json"]
+    assert after["run_manifest"] == before["run_manifest"]
+    _assert_setup_comparison_status(at, "EXACT_MATCH")
+    assert _FingerprintMatchingWorkflow.run_count == 1
+
+
+_BUNDLE_DOWNLOAD_LABEL = "Download reproducibility bundle"
+_BUNDLE_EXPORT_NOTICE_FRAGMENT = "raw dataset is not included"
+
+
+def _bundle_download_buttons(at: AppTest) -> list[object]:
+    return [item for item in at.download_button if item.label == _BUNDLE_DOWNLOAD_LABEL]
+
+
+def _build_bundle_from_session(at: AppTest) -> object:
+    from process_intelligence.reporting import (
+        WorkflowPresentationReport,
+        build_reproducibility_bundle,
+        serialize_reproducibility_bundle,
+    )
+
+    report = WorkflowPresentationReport.model_validate(
+        at.session_state.filtered_state["last_presentation_report_json"]
+    )
+    assert report.run_manifest is not None
+    inputs = at.session_state.filtered_state["last_reproducibility_bundle_inputs_json"]
+    assert isinstance(inputs, dict)
+    bundle = build_reproducibility_bundle(
+        run_manifest=report.run_manifest,
+        effective_configuration=inputs["effective_configuration"],
+        feature_schema=inputs["feature_schema"],
+        environment=inputs["environment"],
+        application_version=report.run_manifest.application_version,
+    )
+    zip_bytes = serialize_reproducibility_bundle(bundle)
+    assert isinstance(zip_bytes, (bytes, bytearray))
+    assert len(zip_bytes) > 0
+    return bundle
+
+
+def test_reproducibility_bundle_download_absent_before_completed_run() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    assert not at.exception
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    assert _bundle_download_buttons(at) == []
+
+
+def test_reproducibility_bundle_download_present_after_completed_run() -> None:
+    from process_intelligence.reporting import (
+        WorkflowPresentationReport,
+        reproducibility_bundle_download_filename,
+    )
+
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    assert not at.exception
+    downloads = _bundle_download_buttons(at)
+    assert len(downloads) == 1
+    assert downloads[0].key == "download_reproducibility_bundle"
+    assert _BUNDLE_EXPORT_NOTICE_FRAGMENT in _text_blob(at)
+    report = WorkflowPresentationReport.model_validate(
+        at.session_state.filtered_state["last_presentation_report_json"]
+    )
+    assert report.run_manifest is not None
+    expected_name = reproducibility_bundle_download_filename(report.run_manifest)
+    assert expected_name.startswith("reproducibility_bundle_")
+    assert expected_name.endswith(".zip")
+    assert report.run_manifest.run_signature[:12] in expected_name
+
+
+def test_reproducibility_bundle_supervised_demo_generation_succeeds() -> None:
+    at = _select_builtin_demo(_make_demo_eval_app().run())
+    at = _select_demo_template(at, "Supervised quality prediction")
+    at = _apply_demo_configuration(at)
+    at = _run_demo_analysis(at)
+    assert not at.exception
+    assert _bundle_download_buttons(at)
+    bundle = _build_bundle_from_session(at)
+    assert bundle.bundle_manifest.run_signature
+    assert bundle.bundle_manifest.dataset_fingerprint is not None
+
+
+def test_reproducibility_bundle_anomaly_only_demo_generation_succeeds() -> None:
+    at = _select_builtin_demo(_make_demo_eval_app().run())
+    at = _select_demo_template(at, "Anomaly-only process monitoring")
+    at = _apply_demo_configuration(at)
+    at = _run_demo_analysis(at)
+    assert not at.exception
+    assert _bundle_download_buttons(at)
+    bundle = _build_bundle_from_session(at)
+    files = bundle.file_map()
+    assert "reproducibility_bundle/run_manifest.json" in files
+    assert "reproducibility_bundle/effective_configuration.json" in files
+
+
+def test_reproducibility_bundle_uploaded_csv_generation_succeeds() -> None:
+    from process_intelligence.reporting import (
+        WorkflowPresentationReport,
+        reproducibility_bundle_download_filename,
+    )
+
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    assert not at.exception
+    assert _bundle_download_buttons(at)
+    bundle = _build_bundle_from_session(at)
+    report = WorkflowPresentationReport.model_validate(
+        at.session_state.filtered_state["last_presentation_report_json"]
+    )
+    assert report.run_manifest is not None
+    expected_name = reproducibility_bundle_download_filename(report.run_manifest)
+    assert bundle.bundle_manifest.run_signature[:12] in expected_name
+
+
+def test_reproducibility_bundle_generation_does_not_rerun_analysis() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    assert _FingerprintMatchingWorkflow.run_count == 1
+    assert _bundle_download_buttons(at)
+    _build_bundle_from_session(at)
+    at = at.run()
+    assert _FingerprintMatchingWorkflow.run_count == 1
+    assert _bundle_download_buttons(at)
+
+
+def test_reproducibility_bundle_generation_does_not_alter_comparison_status() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    _assert_setup_comparison_status(at, "EXACT_MATCH")
+    before = at.session_state.filtered_state["last_presentation_report_json"]
+    _build_bundle_from_session(at)
+    at = at.run()
+    after = at.session_state.filtered_state["last_presentation_report_json"]
+    assert after == before
+    _assert_setup_comparison_status(at, "EXACT_MATCH")
+
+
+def test_reproducibility_bundle_widget_change_does_not_rewrite_stored_provenance() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    before_inputs = json.loads(
+        json.dumps(
+            at.session_state.filtered_state["last_reproducibility_bundle_inputs_json"]
+        )
+    )
+    before_bundle = _build_bundle_from_session(at)
+    before_signature = before_bundle.bundle_manifest.bundle_signature
+    before_report = at.session_state.filtered_state["last_presentation_report_json"]
+
+    operating_box = next(
+        item
+        for item in at.selectbox
+        if item.label == "Operating-point selection mode"
+    )
+    at = operating_box.select("LATEST_ROW").run()
+    assert not at.exception
+    after_inputs = at.session_state.filtered_state["last_reproducibility_bundle_inputs_json"]
+    after_report = at.session_state.filtered_state["last_presentation_report_json"]
+    assert after_inputs == before_inputs
+    assert after_report["run_manifest"] == before_report["run_manifest"]
+    after_bundle = _build_bundle_from_session(at)
+    assert after_bundle.bundle_manifest.bundle_signature == before_signature
+    _assert_setup_comparison_status(at, "CONFIGURATION_CHANGED")
+    assert _FingerprintMatchingWorkflow.run_count == 1
+
+
+def test_reproducibility_bundle_source_switch_clears_export_control() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    at = next(item for item in at.button if item.label == "Run analysis").click().run()
+    assert _bundle_download_buttons(at)
+    radio = next(item for item in at.radio if item.label == "Data source")
+    at = radio.set_value("Built-in manufacturing demo").run()
+    assert not at.exception
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    assert (
+        "last_reproducibility_bundle_inputs_json"
+        not in at.session_state.filtered_state
+    )
+    assert _bundle_download_buttons(at) == []
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility bundle verification (Step 14D)
+# ---------------------------------------------------------------------------
+
+_BUNDLE_VERIFY_LABEL = "Upload reproducibility bundle ZIP"
+_BUNDLE_VERIFY_SECTION = "Verify reproducibility bundle"
+
+
+def _bundle_verify_uploader(at: AppTest) -> object:
+    return next(item for item in at.file_uploader if item.label == _BUNDLE_VERIFY_LABEL)
+
+
+def _upload_reproducibility_bundle_zip(at: AppTest, zip_bytes: bytes) -> AppTest:
+    uploader = _bundle_verify_uploader(at)
+    return uploader.set_value(
+        [("reproducibility_bundle.zip", zip_bytes, "application/zip")]
+    ).run()
+
+
+def _valid_bundle_zip_bytes_for_ui() -> bytes:
+    from datetime import UTC, datetime, timedelta
+    from pathlib import Path
+
+    from process_intelligence.core.enums import AnalysisTask, ColumnRole
+    from process_intelligence.evaluation import (
+        MetricAcceptanceDirection,
+        MetricAcceptanceRule,
+        ModelPerformanceAcceptancePolicy,
+    )
+    from process_intelligence.recommendation import (
+        QualityOptimizationDirection,
+        RecommendationObjective,
+    )
+    from process_intelligence.reporting import (
+        build_effective_configuration_payload,
+        build_environment_payload,
+        build_feature_schema_payload,
+        build_reproducibility_bundle,
+        serialize_reproducibility_bundle,
+    )
+    from process_intelligence.workflow import (
+        AnalysisWorkflowPolicy,
+        AnalysisWorkflowRequest,
+        AnalysisWorkflowStage,
+        AnalysisWorkflowStageRecord,
+        AnalysisWorkflowStatus,
+        OperatingPointSelectionMode,
+        build_analysis_run_manifest,
+    )
+
+    request = AnalysisWorkflowRequest(
+        csv_path=Path("data.csv"),
+        target_column="quality",
+        feature_columns=["pressure", "temperature", "flow"],
+        model_performance_policy=ModelPerformanceAcceptancePolicy(
+            rules=[
+                MetricAcceptanceRule(
+                    metric_name="rmse",
+                    direction=MetricAcceptanceDirection.LOWER_IS_BETTER,
+                    threshold=10.0,
+                )
+            ]
+        ),
+        objective=RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
+        quality_direction=QualityOptimizationDirection.MAXIMIZE,
+        requested_task=AnalysisTask.REGRESSION,
+        timestamp_column="timestamp",
+        identifier_columns=["lot_id"],
+        excluded_columns=["notes"],
+        column_role_overrides={"notes": ColumnRole.CONTEXT},
+        operating_point_selection=OperatingPointSelectionMode.TOP_RESIDUAL_ANOMALY,
+        max_simultaneous_changes=2,
+    )
+    policy = AnalysisWorkflowPolicy()
+    started = datetime(2026, 7, 26, 10, 0, tzinfo=UTC)
+    completed = started + timedelta(seconds=8.0)
+    manifest = build_analysis_run_manifest(
+        request=request,
+        policy=policy,
+        stage_records=[
+            AnalysisWorkflowStageRecord(
+                stage=AnalysisWorkflowStage.LOAD,
+                executed=True,
+                succeeded=True,
+                structured_refusal=False,
+                message="LOAD completed.",
+                warnings=[],
+                metadata={"duration_seconds": 0.1},
+            )
+        ],
+        workflow_status=AnalysisWorkflowStatus.COMPLETED,
+        dataset_fingerprint="f" * 64,
+        feature_columns=list(request.feature_columns),
+        analysis_mode=request.analysis_mode,
+        requested_task=request.requested_task,
+        resolved_task=AnalysisTask.REGRESSION,
+        target_column=request.target_column,
+        selected_model="ridge",
+        warning_count=0,
+        started_at_utc=started,
+        completed_at_utc=completed,
+        duration_seconds=8.0,
+    )
+    bundle = build_reproducibility_bundle(
+        run_manifest=manifest,
+        effective_configuration=build_effective_configuration_payload(
+            request,
+            policy,
+            feature_columns=list(manifest.feature_columns),
+        ),
+        feature_schema=build_feature_schema_payload(
+            target_column=manifest.target_column,
+            feature_columns=list(manifest.feature_columns),
+        ),
+        environment=build_environment_payload(
+            application_version=manifest.application_version,
+            python_version="3.11.0",
+            platform_system="TestOS",
+            package_versions={"pydantic": "2.0.0"},
+        ),
+    )
+    return serialize_reproducibility_bundle(bundle)
+
+
+def test_bundle_verify_section_exists_without_completed_run() -> None:
+    at = _make_app().run()
+    assert not at.exception
+    blob = _text_blob(at)
+    assert _BUNDLE_VERIFY_SECTION in blob
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    assert _bundle_verify_uploader(at) is not None
+
+
+def test_bundle_verify_no_result_before_zip_uploaded() -> None:
+    at = _make_app().run()
+    blob = _text_blob(at)
+    assert _BUNDLE_VERIFY_SECTION in blob
+    assert "Overall verification status" not in blob
+    assert "No external bundle uploaded" in blob
+
+
+def test_bundle_verify_valid_bundle_shows_valid() -> None:
+    at = _make_app().run()
+    at = _upload_reproducibility_bundle_zip(at, _valid_bundle_zip_bytes_for_ui())
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "VALID" in blob
+    assert "Overall verification status" in blob
+    assert "External provenance summary" in blob
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+
+
+def test_bundle_verify_invalid_signature_shows_error_status() -> None:
+    import io
+    import zipfile
+
+    zip_bytes = _valid_bundle_zip_bytes_for_ui()
+    members: dict[str, bytes] = {}
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), mode="r") as archive:
+        for name in archive.namelist():
+            members[name] = archive.read(name)
+    readme_path = "reproducibility_bundle/README.txt"
+    members[readme_path] = members[readme_path] + b"\ntampered\n"
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in sorted(members.items()):
+            archive.writestr(name, payload)
+    at = _make_app().run()
+    at = _upload_reproducibility_bundle_zip(at, buffer.getvalue())
+    assert not at.exception
+    blob = _text_blob(at)
+    assert "SIGNATURE_MISMATCH" in blob
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+
+
+def test_bundle_verify_upload_does_not_create_active_workflow_report() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    at = _upload_reproducibility_bundle_zip(at, _valid_bundle_zip_bytes_for_ui())
+    assert not at.exception
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    assert _FingerprintMatchingWorkflow.run_count == 0
+
+
+def test_bundle_verify_upload_does_not_change_dataset_source() -> None:
+    at = _upload_csv(_make_app().run())
+    radio = next(item for item in at.radio if item.label == "Data source")
+    assert radio.value == "Upload CSV"
+    at = _upload_reproducibility_bundle_zip(at, _valid_bundle_zip_bytes_for_ui())
+    radio = next(item for item in at.radio if item.label == "Data source")
+    assert radio.value == "Upload CSV"
+
+
+def test_bundle_verify_upload_does_not_change_live_configuration_widgets() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    target_before = next(
+        item for item in at.selectbox if item.label == "Target column"
+    ).value
+    mode_before = next(
+        item for item in at.selectbox if item.label == "Analysis mode"
+    ).value
+    at = _upload_reproducibility_bundle_zip(at, _valid_bundle_zip_bytes_for_ui())
+    assert not at.exception
+    target_after = next(
+        item for item in at.selectbox if item.label == "Target column"
+    ).value
+    mode_after = next(
+        item for item in at.selectbox if item.label == "Analysis mode"
+    ).value
+    assert target_after == target_before
+    assert mode_after == mode_before
+
+
+def test_bundle_verify_upload_does_not_trigger_workflow_execution() -> None:
+    at = _prepare_runnable_form(_upload_csv(_make_fingerprint_app().run()))
+    assert _FingerprintMatchingWorkflow.run_count == 0
+    at = _upload_reproducibility_bundle_zip(at, _valid_bundle_zip_bytes_for_ui())
+    assert _FingerprintMatchingWorkflow.run_count == 0
+    assert "VALID" in _text_blob(at)
+
+
+def test_bundle_verify_source_switch_does_not_import_external_bundle_as_report() -> None:
+    at = _make_app().run()
+    at = _upload_reproducibility_bundle_zip(at, _valid_bundle_zip_bytes_for_ui())
+    assert "VALID" in _text_blob(at)
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    radio = next(item for item in at.radio if item.label == "Data source")
+    at = radio.set_value("Built-in manufacturing demo").run()
+    assert not at.exception
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
+    # External verification section remains available and is not an active report.
+    assert _BUNDLE_VERIFY_SECTION in _text_blob(at)
+
+
+def test_bundle_verify_removing_uploaded_file_clears_verification_result() -> None:
+    at = _make_app().run()
+    at = _upload_reproducibility_bundle_zip(at, _valid_bundle_zip_bytes_for_ui())
+    assert "VALID" in _text_blob(at)
+    at = _bundle_verify_uploader(at).set_value(None).run()
+    blob = _text_blob(at)
+    assert "Overall verification status" not in blob
+    assert "No external bundle uploaded" in blob
+    assert "last_presentation_report_json" not in at.session_state.filtered_state
 

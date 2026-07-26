@@ -24,8 +24,112 @@ Industrial Process Intelligence Platform을 혼자 실행하기 위한 짧은 �
    - 추천을 쓸 경우: controllable / verified / constraint bounds
    - ANOMALY_ONLY: 선택적 cohort filter, 선택적 anomaly recommendation
 5. **Check Current configuration summary and Run readiness** — False 항목을 해결한 뒤 Run analysis를 누릅니다.
-6. **Inspect the report** — Overview, stage execution, anomaly/diagnosis, recommendation, warnings/disclaimers를 확인합니다.
+6. **Inspect the report** — Overview, **Run provenance**, stage execution, anomaly/diagnosis, recommendation, warnings/disclaimers를 확인합니다.
 7. **Export configuration** — 같은 설정으로 다시 돌릴 때 Download configuration JSON을 사용합니다.
+8. **Export reproducibility bundle** — completed run의 declared-input provenance를 ZIP으로 받으려면 **Run provenance** 안의 **Download reproducibility bundle**을 사용합니다.
+9. **Verify reproducibility bundle** — 이전에 보낸 ZIP을 **Verify reproducibility bundle** 섹션에 업로드하여 서명·레이아웃을 읽기 전용으로 검사합니다 (설정 복원/재실행 없음).
+
+## Run provenance
+
+After an analysis finishes, the report includes a collapsed **Run provenance** expander near the overview. It summarizes the immutable reproducibility manifest stored with that report, and includes a **Current setup comparison** against the currently loaded dataset and effective analysis configuration.
+
+Distinguish these three identifiers:
+
+| Identifier | Meaning |
+| --- | --- |
+| **Dataset fingerprint** | SHA-256 of the raw CSV bytes used for the run |
+| **Configuration fingerprint** | SHA-256 of the effective workflow request/policy (features, target, constraints, cohort, seeds/policies that affect results) |
+| **Run signature** | SHA-256 of dataset fingerprint + configuration fingerprint + application version + manifest schema version |
+
+Signatures help compare whether two runs used the same data, effective configuration, software version, and schema. They do **not** prove model validity, causal correctness, or operational safety.
+
+### Current setup comparison
+
+| Overall status | Meaning |
+| --- | --- |
+| **EXACT_MATCH** | The declared dataset, effective configuration, application version, and manifest schema match this stored run |
+| **CONFIGURATION_CHANGED** | Widgets that affect analysis differ from the run that produced this result — click **Run analysis** again before treating the result as current |
+| **DATASET_CHANGED** | The active dataset content differs from the dataset used for this result |
+| **CURRENT_CONFIGURATION_INCOMPLETE** | The current form cannot be fingerprinted until readiness issues (missing target, invalid rules, incomplete constraints, etc.) are resolved |
+| **UNAVAILABLE** | Comparison cannot run (missing stored manifest or active dataset fingerprint) |
+
+Notes:
+
+- Provenance is taken from the completed report. Changing widgets without clicking **Run analysis** does not rewrite the stored manifest.
+- Behavior-affecting configuration changes require rerunning analysis before the displayed result reflects the current setup.
+- Presentation-only changes (expanders, table display, selected context rows, demo ground-truth evaluation) do **not** require rerunning and do not change the configuration match.
+- Matching signatures identify matching declared inputs and software metadata; they do **not** guarantee model correctness, causality, or bit-for-bit deterministic execution.
+- Incomplete configurations cannot be compared until readiness issues are resolved; the stored result and manifest remain unchanged.
+- Switching data source clears stale reports, so the expander disappears until a new run completes.
+- Demo ground-truth evaluation is presentation-only and does not change fingerprints, the run signature, or the comparison outcome.
+
+### Reproducibility bundle export
+
+After a completed run with a stored run manifest, **Run provenance** includes **Download reproducibility bundle**. The ZIP contains:
+
+| File | Contents |
+| --- | --- |
+| `bundle_manifest.json` | Bundle schema version, bundle signature, included files, run/dataset/configuration digests; `generated_at` is present but **not** part of the signature |
+| `run_manifest.json` | Exact serialized stored immutable run manifest |
+| `effective_configuration.json` | Canonical effective workflow configuration used for that completed run |
+| `feature_schema.json` | Target, final modeling features (pipeline order), roles/dtypes/excluded columns when available — no row values |
+| `environment.json` | Python/platform summary, application version, manifest/bundle schema versions, relevant package versions |
+| `README.txt` | How to interpret provenance vs model replay |
+
+Intentionally excluded:
+
+- Raw dataset rows / CSV bytes (privacy)
+- Trained models and metric/duration values beyond what the immutable run manifest already stores
+- Streamlit widget state, temporary paths, and presentation-only UI metadata
+
+The **bundle signature** is a SHA-256 digest over the canonical contents of the signed files above. Identical provenance inputs produce the same signature and file contents. ZIP container metadata (entry timestamps) may differ and is not part of the signature.
+
+This export proves **declared-input provenance** for offline inspection. It does **not** prove causal correctness or bit-for-bit deterministic model replay, and it does not restore configuration or re-run analysis. Use **Run provenance** / the Step 14B current-setup comparison to see whether the live UI still matches the stored run; use the bundle to take that stored provenance out of the session.
+
+### Verify reproducibility bundle
+
+The page includes a separate **Verify reproducibility bundle** section (not inside **Run provenance**). Upload one exported ZIP to check whether:
+
+| Check | Meaning |
+| --- | --- |
+| Archive layout | Required Step 14C files are present under `reproducibility_bundle/` |
+| Signature | Recomputed digest of signed file bytes matches `bundle_manifest.bundle_signature` |
+| Manifest cross-check | Unsigned `bundle_manifest.json` metadata matches signed provenance (run signature, fingerprints, application version, included files) |
+| Schema compatibility | Bundle schema and run-manifest schema versions are supported (currently version `1`) |
+| Safety | Path traversal, symlinks, encrypted entries, duplicate names, oversized / ZIP-bomb-like archives, unexpected data/executable members are rejected |
+
+Supported schema versions:
+
+- `BUNDLE_SCHEMA_VERSION = 1`
+- `MANIFEST_SCHEMA_VERSION = 1`
+
+Future schema versions are rejected (not silently accepted).
+
+What signature verification **proves**:
+
+- The signed files in the ZIP match the digest recorded in `bundle_manifest.json`
+- For a valid result, inspected provenance fields were derived from those signed files
+
+What it does **not** prove:
+
+- That replaying analysis would reproduce the same metrics or model outputs
+- Causal correctness of diagnosis or recommendations
+- That text fields contain no sensitive data (absence of raw CSV/Parquet members reduces risk but cannot mathematically prove it)
+
+External bundle inspection vs active run provenance:
+
+- **Run provenance** describes the completed run stored in the current session
+- **Verify reproducibility bundle** inspects an uploaded ZIP as external, read-only provenance
+- Uploading a bundle does **not** create an active workflow report, change the dataset source, update live configuration widgets, restore settings, or trigger analysis
+- There is no restore or replay control in this step
+
+Security restrictions for uploaded ZIPs (untrusted input):
+
+- In-memory reading only (no extraction into the project directory)
+- Rejects `../`, absolute paths, Windows drive paths, backslash traversal, symlinks, encrypted entries, duplicates, and non-regular members
+- Enforces compressed / uncompressed size limits, member-count limits, and suspicious compression-ratio checks
+- Accepts only the expected text/JSON provenance files; common raw-data and executable suffixes are rejected
+- JSON and README are decoded as strict UTF-8 (invalid UTF-8 is rejected)
 
 ## Built-in manufacturing demo
 
@@ -42,6 +146,7 @@ Notes:
 - The data is **synthetic**. Results do **not** represent production accuracy.
 - No analysis starts automatically when you select the demo source, change a template, or apply the template.
 - Demo ground-truth columns (`injected_anomaly`, `anomaly_type`) are labeled as evaluation metadata and are excluded from model features by the demo templates.
+- After a successful built-in demo analysis, a **Demo ground-truth evaluation** panel can appear under the anomaly-event report. It is evaluation-only and does not change modeling, diagnosis, recommendation, or run readiness.
 - The **Supervised quality prediction** template configures four synthetic verified controllable setpoints so the public workflow can demonstrate prediction → residual diagnosis → recommendation → what-if verification:
   - `temperature_setpoint`
   - `pressure_setpoint`
@@ -120,6 +225,23 @@ python scripts/validate_demo_workflow.py
 ```
 
 A successful validation only proves the synthetic demo path is useful and non-trivial. It does **not** represent real-world production accuracy.
+
+## Demo ground-truth evaluation
+
+When the active source is **Built-in manufacturing demo** and a non-stale analysis report exists for that demo dataset, the Streamlit report shows a compact **Demo ground-truth evaluation** section after the detected anomaly events.
+
+What it means:
+
+- **Precision among displayed event representatives** — of the anomaly-event rows the workflow currently displays (often only a small top-N set), the share whose original row IDs land on injected anomaly rows.
+- **Enrichment over demo prevalence** — that displayed-event precision divided by the full-demo injected-anomaly prevalence. Values above `1×` mean the displayed events are more concentrated in injected anomalies than a random row would be.
+
+What it is not:
+
+- Not full detector recall (many injected anomalies may never appear in the displayed top events).
+- Not full anomaly-model precision across every scored row.
+- Not production accuracy. Synthetic labels were not used for training or scoring.
+
+Unmatched displayed events are **not** automatically proven false positives. The synthetic labels may omit unusual but real process states. Uploaded CSV files never show this panel.
 
 ## Safety reminders
 

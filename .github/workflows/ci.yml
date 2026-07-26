@@ -41,6 +41,12 @@ jobs:
       - name: pytest
         run: python -m pytest tests -q
 
+      - name: Built-in demo end-to-end acceptance
+        run: |
+          set -euo pipefail
+          timeout 300s python scripts/validate_demo_workflow.py
+          git diff --exit-code
+
       - name: Streamlit startup smoke test
         run: |
           set -euo pipefail

@@ -10,9 +10,12 @@ import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+if TYPE_CHECKING:
+    from process_intelligence.workflow.run_manifest import AnalysisRunManifest
 
 from process_intelligence.core.enums import AnalysisTask, ColumnRole
 from process_intelligence.core.schemas import (
@@ -1558,6 +1561,7 @@ class AnalysisWorkflowReport(BaseModel):
     test_row_count: int
     cohort_filter_summary: CohortFilterSummary
     dataset_fingerprint: str | None = None
+    run_manifest: AnalysisRunManifest | None = None
     started_at: datetime
     completed_at: datetime
     total_seconds: float
@@ -1835,6 +1839,22 @@ class AnalysisWorkflowReport(BaseModel):
     @classmethod
     def _validate_dataset_fingerprint(cls, value: object) -> str | None:
         return normalize_optional_dataset_fingerprint(value)
+
+    @field_validator("run_manifest", mode="before")
+    @classmethod
+    def _validate_run_manifest(cls, value: object) -> AnalysisRunManifest | None:
+        from process_intelligence.workflow.run_manifest import AnalysisRunManifest
+
+        if value is None:
+            return None
+        if isinstance(value, AnalysisRunManifest):
+            return value.model_copy(deep=True)
+        if isinstance(value, dict):
+            return AnalysisRunManifest.model_validate(value)
+        raise ValueError(
+            "run_manifest must be AnalysisRunManifest or None, "
+            f"got {type(value).__name__}"
+        )
 
     @field_validator("anomaly_events", mode="before")
     @classmethod

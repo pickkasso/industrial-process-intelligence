@@ -30,8 +30,13 @@ from process_intelligence.recommendation import (
     RecommendationObjective,
     RecommendationStatus,
 )
-from process_intelligence.reporting import AnalysisWorkflowReportBuilder
+from process_intelligence.reporting import (
+    AnalysisWorkflowReportBuilder,
+    ReproducibilityMatchStatus,
+    compare_setup_to_run_manifest,
+)
 from process_intelligence.workflow import (
+    AnalysisExecutionMode,
     AnalysisWorkflowOutcome,
     AnalysisWorkflowPolicy,
     AnalysisWorkflowReport,
@@ -40,6 +45,7 @@ from process_intelligence.workflow import (
     AnalysisWorkflowStatus,
     IndustrialProcessAnalysisWorkflow,
     OperatingPointSelectionMode,
+    compute_configuration_fingerprint,
 )
 
 CSV_NAME = "semiconductor_reporting.csv"
@@ -589,3 +595,255 @@ def test_builder_does_not_rewrite_backend_status(
                 presentation.recommendation.status
                 is source.final_recommendation.status
             )
+
+
+def test_run_manifest_included_and_stable_for_supervised(
+    quality_outcome: AnalysisWorkflowOutcome,
+    synthetic_csv: Path,
+) -> None:
+    source = quality_outcome.report
+    assert source.run_manifest is not None
+    presentation = AnalysisWorkflowReportBuilder().build(source).report
+    assert presentation.run_manifest is not None
+    assert presentation.run_manifest.run_signature == source.run_manifest.run_signature
+    assert presentation.run_manifest.dataset_fingerprint == source.dataset_fingerprint
+    assert presentation.run_manifest.feature_count == len(
+        presentation.run_manifest.feature_columns
+    )
+    assert presentation.run_manifest.feature_count == len(PROCESS_FEATURES)
+    assert [entry.stage for entry in presentation.run_manifest.stage_entries] == [
+        record.stage for record in source.stage_records
+    ]
+    if (
+        source.final_recommendation is not None
+        and source.final_recommendation.status is RecommendationStatus.REFUSED
+    ):
+        assert presentation.run_manifest.refusal_or_failure_code is not None
+        modeling = [
+            entry
+            for entry in presentation.run_manifest.stage_entries
+            if entry.stage is AnalysisWorkflowStage.SUPERVISED_FINAL_EVALUATION
+        ]
+        assert modeling
+        assert modeling[0].status == "SUCCEEDED"
+
+    repeat = _run(synthetic_csv, RecommendationObjective.IMPROVE_PREDICTED_QUALITY)
+    assert repeat.report.run_manifest is not None
+    assert (
+        repeat.report.run_manifest.run_signature
+        == source.run_manifest.run_signature
+    )
+    assert (
+        repeat.report.run_manifest.configuration_fingerprint
+        == source.run_manifest.configuration_fingerprint
+    )
+
+
+def test_run_manifest_feature_change_alters_signature(
+    synthetic_csv: Path,
+) -> None:
+    first = _run(synthetic_csv, RecommendationObjective.IMPROVE_PREDICTED_QUALITY)
+    reduced_features = list(PROCESS_FEATURES[:-1])
+    second = IndustrialProcessAnalysisWorkflow(
+        policy=AnalysisWorkflowPolicy(
+            require_semiconductor_industry=False,
+            require_regression_task=False,
+        )
+    ).run(
+        build_request(
+            synthetic_csv,
+            RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
+            feature_columns=reduced_features,
+            user_confirmed_controllable_variables=reduced_features,
+            user_verified_variables=reduced_features,
+            request_constraints=[
+                VariableConstraint(
+                    variable=name,
+                    adjustable=True,
+                    minimum=CONSTRAINT_BOUNDS[name][0],
+                    maximum=CONSTRAINT_BOUNDS[name][1],
+                    fixed=False,
+                )
+                for name in reduced_features
+            ],
+            max_simultaneous_changes=min(2, len(reduced_features)),
+        )
+    )
+    assert first.report.run_manifest is not None
+    assert second.report.run_manifest is not None
+    assert (
+        first.report.run_manifest.run_signature
+        != second.report.run_manifest.run_signature
+    )
+    assert second.report.run_manifest.feature_count == len(reduced_features)
+
+
+def test_anomaly_only_run_manifest(
+    synthetic_csv: Path,
+) -> None:
+    request = AnalysisWorkflowRequest(
+        csv_path=synthetic_csv,
+        analysis_mode=AnalysisExecutionMode.ANOMALY_ONLY,
+        feature_columns=list(PROCESS_FEATURES),
+        timestamp_column=TIME_COLUMN,
+        identifier_columns=list(ID_COLUMNS),
+        excluded_columns=list(EXCLUDED_COLUMNS),
+        operating_point_selection=OperatingPointSelectionMode.TOP_UNSUPERVISED_ANOMALY,
+    )
+    outcome = IndustrialProcessAnalysisWorkflow(
+        policy=AnalysisWorkflowPolicy(
+            require_semiconductor_industry=False,
+            require_regression_task=False,
+        )
+    ).run(request)
+    presentation = AnalysisWorkflowReportBuilder().build(outcome.report).report
+    assert presentation.run_manifest is not None
+    assert presentation.run_manifest.target_column is None
+    assert presentation.run_manifest.feature_count == len(PROCESS_FEATURES)
+    assert presentation.run_manifest.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
+    assert presentation.run_manifest.workflow_status in {
+        AnalysisWorkflowStatus.PARTIAL,
+        AnalysisWorkflowStatus.COMPLETED,
+        AnalysisWorkflowStatus.REFUSED,
+    }
+    assert presentation.run_manifest.run_signature
+    assert presentation.run_manifest.configuration_fingerprint
+
+
+def _reporting_workflow_policy() -> AnalysisWorkflowPolicy:
+    return AnalysisWorkflowPolicy(
+        allow_partial_diagnosis_ensemble=True,
+        require_semiconductor_industry=False,
+        require_regression_task=True,
+        require_residual_diagnosis=True,
+    )
+
+
+def test_current_request_fingerprint_matches_manifest_after_run(
+    quality_outcome: AnalysisWorkflowOutcome,
+    synthetic_csv: Path,
+) -> None:
+    source = quality_outcome.report
+    assert source.run_manifest is not None
+    request = build_request(
+        synthetic_csv,
+        RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
+    )
+    policy = _reporting_workflow_policy()
+    before = source.run_manifest.model_dump(mode="json")
+    current_fp = compute_configuration_fingerprint(
+        request,
+        policy,
+        feature_columns=list(PROCESS_FEATURES),
+    )
+    assert current_fp == source.run_manifest.configuration_fingerprint
+    comparison = compare_setup_to_run_manifest(
+        stored_manifest=source.run_manifest,
+        current_dataset_fingerprint=source.dataset_fingerprint,
+        current_request=request,
+        current_policy=policy,
+        current_feature_columns=list(PROCESS_FEATURES),
+        current_application_version=source.run_manifest.application_version,
+    )
+    assert comparison.overall_status is ReproducibilityMatchStatus.EXACT_MATCH
+    assert source.run_manifest.model_dump(mode="json") == before
+
+
+def test_feature_and_constraint_changes_alter_current_fingerprint(
+    synthetic_csv: Path,
+) -> None:
+    request = build_request(
+        synthetic_csv,
+        RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
+    )
+    policy = _reporting_workflow_policy()
+    base = compute_configuration_fingerprint(request, policy)
+    reduced_features = list(PROCESS_FEATURES[:-1])
+    feature_changed = compute_configuration_fingerprint(
+        request.model_copy(update={"feature_columns": reduced_features}),
+        policy,
+        feature_columns=reduced_features,
+    )
+    assert feature_changed != base
+    constraint_changed = compute_configuration_fingerprint(
+        request.model_copy(
+            update={
+                "request_constraints": [
+                    VariableConstraint(
+                        variable=PROCESS_FEATURES[0],
+                        adjustable=True,
+                        minimum=0.0,
+                        maximum=1.0,
+                        fixed=False,
+                    )
+                ]
+            }
+        ),
+        policy,
+    )
+    assert constraint_changed != base
+    presentation_only = compute_configuration_fingerprint(
+        request.model_copy(
+            update={"metadata": {"ui_entry": "streamlit_form", "page": 99}}
+        ),
+        policy,
+    )
+    assert presentation_only == base
+
+
+def test_recommendation_refusal_and_anomaly_partial_allow_comparison(
+    unacceptable_outcome: AnalysisWorkflowOutcome,
+    synthetic_csv: Path,
+) -> None:
+    source = unacceptable_outcome.report
+    assert source.run_manifest is not None
+    request = build_request(
+        synthetic_csv,
+        RecommendationObjective.IMPROVE_PREDICTED_QUALITY,
+        performance_policy=_strict_impossible_policy(),
+    )
+    policy = _reporting_workflow_policy()
+    before = source.run_manifest.model_dump(mode="json")
+    comparison = compare_setup_to_run_manifest(
+        stored_manifest=source.run_manifest,
+        current_dataset_fingerprint=source.dataset_fingerprint,
+        current_request=request,
+        current_policy=policy,
+        current_feature_columns=list(PROCESS_FEATURES),
+        current_application_version=source.run_manifest.application_version,
+    )
+    assert comparison.comparison_available is True
+    assert comparison.overall_status is ReproducibilityMatchStatus.EXACT_MATCH
+    assert source.run_manifest.model_dump(mode="json") == before
+
+    anomaly_request = AnalysisWorkflowRequest(
+        csv_path=synthetic_csv,
+        analysis_mode=AnalysisExecutionMode.ANOMALY_ONLY,
+        feature_columns=list(PROCESS_FEATURES),
+        timestamp_column=TIME_COLUMN,
+        identifier_columns=list(ID_COLUMNS),
+        excluded_columns=list(EXCLUDED_COLUMNS),
+        operating_point_selection=OperatingPointSelectionMode.TOP_UNSUPERVISED_ANOMALY,
+    )
+    anomaly_policy = AnalysisWorkflowPolicy(
+        require_semiconductor_industry=False,
+        require_regression_task=False,
+    )
+    anomaly_outcome = IndustrialProcessAnalysisWorkflow(policy=anomaly_policy).run(
+        anomaly_request
+    )
+    assert anomaly_outcome.report.run_manifest is not None
+    anomaly_before = anomaly_outcome.report.run_manifest.model_dump(mode="json")
+    anomaly_comparison = compare_setup_to_run_manifest(
+        stored_manifest=anomaly_outcome.report.run_manifest,
+        current_dataset_fingerprint=anomaly_outcome.report.dataset_fingerprint,
+        current_request=anomaly_request,
+        current_policy=anomaly_policy,
+        current_feature_columns=list(PROCESS_FEATURES),
+        current_application_version=(
+            anomaly_outcome.report.run_manifest.application_version
+        ),
+    )
+    assert anomaly_comparison.comparison_available is True
+    assert anomaly_comparison.overall_status is ReproducibilityMatchStatus.EXACT_MATCH
+    assert anomaly_outcome.report.run_manifest.model_dump(mode="json") == anomaly_before

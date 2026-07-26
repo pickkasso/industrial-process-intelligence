@@ -8,6 +8,10 @@
 - **SUPERVISED**: target 기반 예측·성능 수용·추천
 - **ANOMALY_ONLY**: target 없이 비지도 이상 탐지·연관 변수 진단
 - 결과는 모델 기반 의사결정 지원이며 운영 명령이 아닙니다
+- Each analysis report includes a reproducibility manifest that fingerprints the dataset content, effective configuration, software version, and manifest schema
+- **Run provenance** compares the displayed result with the currently loaded dataset and effective analysis configuration (informational only; it does not rewrite the stored report or rerun analysis)
+- After a completed run, **Download reproducibility bundle** exports a ZIP of declared-input provenance (run manifest, effective configuration, feature schema, environment, bundle signature). The raw dataset is not included; the export does not replay analysis
+- **Verify reproducibility bundle** accepts an exported ZIP for read-only signature and layout verification. It does not restore configuration, import a dataset, create an active report, or rerun analysis
 
 ## Requirements
 
@@ -47,13 +51,14 @@ python -m pip install -e .
 2. Select supervised or anomaly-only analysis (or apply a demo template).
 3. Review the suggested columns and safety-critical settings.
 4. Run the analysis and inspect the report.
-5. Export reusable configuration when needed.
+5. Export reusable configuration or the reproducibility bundle when needed.
+6. Optionally verify an exported reproducibility bundle ZIP (external, read-only).
 
 자세한 운영 안내는 [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)를 참고하세요.
 
 ## Demo dataset
 
-The Streamlit UI includes a **built-in manufacturing demo** that loads a deterministic synthetic dataset in memory—no CSV file is required. Demo ground-truth columns (`injected_anomaly`, `anomaly_type`) and unused quality/identity columns are excluded from model features by the demo templates. The supervised built-in demo configures four synthetic verified controllable setpoints (`temperature_setpoint`, `pressure_setpoint`, `flow_rate_setpoint`, `cycle_time_setpoint`) with fixed demonstration-only engineering bounds so recommendation and what-if verification can run. Those demo recommendation bounds are illustrative only and must not be reused as real equipment limits. Selecting the demo or changing a template does **not** run analysis; click **Apply demo configuration**, then **Run analysis**.
+The Streamlit UI includes a **built-in manufacturing demo** that loads a deterministic synthetic dataset in memory—no CSV file is required. Demo ground-truth columns (`injected_anomaly`, `anomaly_type`) and unused quality/identity columns are excluded from model features by the demo templates. After analysis on the built-in demo, the UI can compare displayed anomaly-event representatives with those known injected synthetic anomalies for evaluation only; the labels are never used for model training or anomaly scoring. The supervised built-in demo configures four synthetic verified controllable setpoints (`temperature_setpoint`, `pressure_setpoint`, `flow_rate_setpoint`, `cycle_time_setpoint`) with fixed demonstration-only engineering bounds so recommendation and what-if verification can run. Those demo recommendation bounds are illustrative only and must not be reused as real equipment limits. Selecting the demo or changing a template does **not** run analysis; click **Apply demo configuration**, then **Run analysis**.
 
 A CLI generator remains available for local CSV demos of supervised quality prediction, anomaly-only detection, residual anomaly detection, and diagnosis workflows. The built-in synthetic dataset is validated through both supervised and anomaly-only public workflows.
 
@@ -97,7 +102,7 @@ Generated columns `quality_score` and `defect_rate` are quality outputs. Use onl
 
 ## Continuous integration
 
-GitHub Actions runs Ruff, mypy, and pytest automatically on pushes to `main` and on pull requests targeting `main`. CI also verifies that the Streamlit application starts successfully (headless smoke test against the health endpoint). See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+GitHub Actions runs Ruff, mypy, and pytest automatically on pushes to `main` and on pull requests targeting `main`. CI also explicitly verifies the deterministic built-in demo’s supervised and anomaly-only workflows (including demo leakage and safety acceptance) and that the Streamlit application starts successfully (headless smoke test against the health endpoint). See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ## Documentation
 

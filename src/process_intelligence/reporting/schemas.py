@@ -41,6 +41,7 @@ from process_intelligence.workflow.enums import (
     AnalysisWorkflowStatus,
     AnomalyContextOrderBasis,
 )
+from process_intelligence.workflow.run_manifest import AnalysisRunManifest
 
 ScalarMetadataValue = str | int | float | bool | None
 """Allowed scalar types for presentation metadata dictionaries."""
@@ -1930,6 +1931,7 @@ class WorkflowPresentationReport(BaseModel):
     disclaimers: list[str] = Field(default_factory=list)
     metadata: dict[str, ScalarMetadataValue] = Field(default_factory=dict)
     dataset_fingerprint: str | None = None
+    run_manifest: AnalysisRunManifest | None = None
 
     @field_validator("overview", mode="before")
     @classmethod
@@ -2220,6 +2222,20 @@ class WorkflowPresentationReport(BaseModel):
     @classmethod
     def _validate_dataset_fingerprint(cls, value: object) -> str | None:
         return normalize_optional_dataset_fingerprint(value)
+
+    @field_validator("run_manifest", mode="before")
+    @classmethod
+    def _validate_run_manifest(cls, value: object) -> AnalysisRunManifest | None:
+        if value is None:
+            return None
+        if isinstance(value, AnalysisRunManifest):
+            return value.model_copy(deep=True)
+        if isinstance(value, dict):
+            return AnalysisRunManifest.model_validate(value)
+        raise ValueError(
+            "run_manifest must be AnalysisRunManifest or None, "
+            f"got {type(value).__name__}"
+        )
 
     @model_validator(mode="after")
     def _validate_presentation_consistency(self) -> Self:

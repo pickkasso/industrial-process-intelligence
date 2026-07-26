@@ -46,6 +46,26 @@ from process_intelligence.recommendation import (
 )
 from process_intelligence.reporting import AnalysisWorkflowReportBuilder
 from process_intelligence.reporting.comparison import build_anomaly_run_comparison
+from process_intelligence.reporting.reproducibility import (
+    ReproducibilityComparison,
+    ReproducibilityComponentStatus,
+    ReproducibilityMatchStatus,
+    compare_setup_to_run_manifest,
+)
+from process_intelligence.reporting.reproducibility_bundle import (
+    build_effective_configuration_payload,
+    build_environment_payload,
+    build_feature_schema_payload,
+    build_reproducibility_bundle,
+    reproducibility_bundle_download_filename,
+    select_relevant_column_dtypes,
+    serialize_reproducibility_bundle,
+)
+from process_intelligence.reporting.reproducibility_bundle_verification import (
+    ReproducibilityBundleVerificationResult,
+    ReproducibilityBundleVerificationStatus,
+    verify_reproducibility_bundle,
+)
 from process_intelligence.reporting.schemas import (
     AnomalyContextWindowView,
     AnomalyEventView,
@@ -106,6 +126,7 @@ from process_intelligence.ui.demo_configuration import (
     SESSION_DEMO_APPLY_SUCCESS_KEY,
     SESSION_DEMO_APPLY_SUMMARY_KEY,
     SESSION_DEMO_TEMPLATE_KEY,
+    SESSION_REPRODUCIBILITY_BUNDLE_INPUTS_KEY,
     build_demo_configuration_preset,
     clear_demo_recommendation_session_state,
     clear_stale_analysis_session_state,
@@ -118,6 +139,12 @@ from process_intelligence.ui.demo_configuration import (
     load_builtin_demo_dataset,
     validate_demo_feature_guard,
 )
+from process_intelligence.ui.demo_evaluation import (
+    DemoAnomalyEvaluationSummary,
+    evaluate_demo_anomaly_presentation,
+    is_demo_evaluation_panel_eligible,
+    render_demo_ground_truth_evaluation,
+)
 from process_intelligence.ui.request_builder import WorkflowUiRequestBuilder
 from process_intelligence.ui.schemas import (
     StreamlitUiConfig,
@@ -129,12 +156,16 @@ from process_intelligence.ui.workflow_factory import create_default_analysis_wor
 from process_intelligence.workflow import (
     ANOMALY_CONTEXT_RADIUS,
     AnalysisExecutionMode,
+    AnalysisRunManifest,
     AnalysisWorkflowOutcome,
+    AnalysisWorkflowPolicy,
+    AnalysisWorkflowRequest,
     AnalysisWorkflowStage,
     AnalysisWorkflowStatus,
     IndustrialProcessAnalysisWorkflow,
     NumericCohortFilter,
     OperatingPointSelectionMode,
+    compute_dataset_content_fingerprint_from_bytes,
     list_numeric_cohort_filter_candidates,
     observed_numeric_range,
     preview_numeric_cohort_filter_row_count,
@@ -144,6 +175,7 @@ _ORIGINAL_ROW_ID = "_original_row_id"
 _SESSION_REPORT_KEY = "last_presentation_report_json"
 _SESSION_BASELINE_REPORT_KEY = "comparison_baseline_report_json"
 _SESSION_BASELINE_LABEL_KEY = "comparison_baseline_label"
+_SESSION_BUNDLE_INPUTS_KEY = SESSION_REPRODUCIBILITY_BUNDLE_INPUTS_KEY
 _SESSION_COLUMNS_KEY = "ui_column_schema_fingerprint"
 _SESSION_ANALYSIS_MODE_KEY = "ui_analysis_mode"
 _SESSION_TARGET_KEY = "ui_target_column"
@@ -151,6 +183,27 @@ _SESSION_TIMESTAMP_KEY = "ui_timestamp_column"
 _SESSION_IDENTIFIERS_KEY = "ui_identifier_columns"
 _SESSION_EXCLUDED_KEY = "ui_excluded_columns"
 _NOT_AVAILABLE = "Not available"
+_PROVENANCE_PREFIX_LENGTH = 12
+_PROVENANCE_FEATURE_PREVIEW_LIMIT = 12
+_RUN_PROVENANCE_NOTICE = (
+    "The signature identifies matching data, effective configuration, software "
+    "version, and manifest schema. It does not prove model correctness or causality."
+)
+_SETUP_COMPARISON_DISCLAIMER = (
+    "Matching signatures identify matching declared inputs and software "
+    "metadata; they do not prove model correctness, causality, or bit-for-bit "
+    "deterministic execution."
+)
+_BUNDLE_EXPORT_NOTICE = (
+    "The reproducibility bundle exports declared-input provenance only. "
+    "The raw dataset is not included."
+)
+_BUNDLE_VERIFY_NOTICE = (
+    "Uploaded bundles are external, read-only provenance. Verification does not "
+    "restore configuration, import a dataset, create an active report, or rerun "
+    "analysis."
+)
+_BUNDLE_VERIFY_UPLOAD_KEY = "upload_reproducibility_bundle_zip"
 _NOT_APPLICABLE = "Not applicable"
 _ROLE_NONE = "(no override)"
 _TARGET_PLACEHOLDER = "(select target)"
@@ -792,6 +845,413 @@ def _render_baseline_summary(baseline: WorkflowPresentationReport) -> None:
             st.caption(f"Dataset fingerprint prefix: `{fingerprint[:12]}`")
 
 
+def _fingerprint_prefix(value: str | None) -> str:
+    if value is None or value == "":
+        return _NOT_AVAILABLE
+    if len(value) <= _PROVENANCE_PREFIX_LENGTH:
+        return value
+    return value[:_PROVENANCE_PREFIX_LENGTH]
+
+
+def _component_match_label(status: ReproducibilityComponentStatus) -> str:
+    if status is ReproducibilityComponentStatus.MATCH:
+        return "Match"
+    if status is ReproducibilityComponentStatus.CHANGED:
+        return "Changed"
+    if status is ReproducibilityComponentStatus.INCOMPLETE:
+        return "Incomplete"
+    return "Unavailable"
+
+
+def _render_current_setup_comparison(
+    comparison: ReproducibilityComparison | None,
+) -> None:
+    """Render the informational current-setup comparison subsection."""
+    if comparison is None:
+        return
+    st.markdown("Current setup comparison")
+    st.markdown(f"Overall status: `{comparison.overall_status.value}`")
+    st.write(
+        {
+            "Dataset": _component_match_label(comparison.dataset_matches),
+            "Effective configuration": _component_match_label(
+                comparison.configuration_matches
+            ),
+            "Application version": _component_match_label(
+                comparison.application_version_matches
+            ),
+            "Manifest schema": _component_match_label(
+                comparison.manifest_schema_matches
+            ),
+            "Stored run signature (prefix)": _fingerprint_prefix(
+                comparison.stored_run_signature
+            ),
+            "Current candidate signature (prefix)": _fingerprint_prefix(
+                comparison.current_candidate_run_signature
+            ),
+        }
+    )
+    for message in comparison.explanatory_messages:
+        if message == _SETUP_COMPARISON_DISCLAIMER:
+            st.caption(message)
+        elif (
+            comparison.overall_status
+            is ReproducibilityMatchStatus.CURRENT_CONFIGURATION_INCOMPLETE
+            and message in comparison.incompleteness_reasons
+        ):
+            st.caption(f"- {message}")
+        else:
+            st.info(message)
+    if (
+        comparison.overall_status
+        is ReproducibilityMatchStatus.CURRENT_CONFIGURATION_INCOMPLETE
+        and comparison.incompleteness_reasons
+        and not any(
+            reason in comparison.explanatory_messages
+            for reason in comparison.incompleteness_reasons
+        )
+    ):
+        for reason in comparison.incompleteness_reasons:
+            st.caption(f"- {reason}")
+
+
+def _load_cached_reproducibility_bundle_inputs() -> dict[str, Any] | None:
+    """Load stored bundle provenance inputs without mutating session state."""
+    cached = st.session_state.get(_SESSION_BUNDLE_INPUTS_KEY)
+    if cached is None or not isinstance(cached, dict):
+        return None
+    required = ("effective_configuration", "feature_schema", "environment")
+    if any(key not in cached or not isinstance(cached[key], dict) for key in required):
+        return None
+    return cached
+
+
+def _store_reproducibility_bundle_inputs(
+    *,
+    request: AnalysisWorkflowRequest,
+    policy: AnalysisWorkflowPolicy,
+    run_manifest: AnalysisRunManifest,
+    upload_bytes: bytes,
+) -> None:
+    """Snapshot provenance inputs for the completed run (not the live widgets)."""
+    feature_columns = list(run_manifest.feature_columns)
+    effective_configuration = build_effective_configuration_payload(
+        request,
+        policy,
+        feature_columns=feature_columns,
+    )
+    frame = pl.read_csv(BytesIO(upload_bytes), infer_schema_length=None)
+    all_dtypes = {name: str(dtype) for name, dtype in frame.schema.items()}
+    role_overrides = {
+        name: role.value if hasattr(role, "value") else str(role)
+        for name, role in request.column_role_overrides.items()
+    }
+    feature_schema = build_feature_schema_payload(
+        target_column=run_manifest.target_column,
+        feature_columns=feature_columns,
+        column_roles=role_overrides,
+        dtypes=select_relevant_column_dtypes(
+            all_dtypes,
+            feature_columns=feature_columns,
+            target_column=run_manifest.target_column,
+            timestamp_column=run_manifest.timestamp_column,
+            identifier_columns=list(request.identifier_columns),
+            excluded_columns=list(request.excluded_columns),
+        ),
+        excluded_columns=list(request.excluded_columns),
+        identifier_columns=list(request.identifier_columns),
+        timestamp_column=run_manifest.timestamp_column,
+    )
+    environment = build_environment_payload(
+        application_version=run_manifest.application_version,
+        manifest_schema_version=run_manifest.manifest_schema_version,
+    )
+    st.session_state[_SESSION_BUNDLE_INPUTS_KEY] = {
+        "effective_configuration": effective_configuration,
+        "feature_schema": feature_schema,
+        "environment": environment,
+    }
+
+
+def _render_reproducibility_bundle_download(manifest: AnalysisRunManifest) -> None:
+    """Render the download control for the stored-run reproducibility bundle."""
+    cached_inputs = _load_cached_reproducibility_bundle_inputs()
+    if cached_inputs is None:
+        return
+    bundle = build_reproducibility_bundle(
+        run_manifest=manifest,
+        effective_configuration=cached_inputs["effective_configuration"],
+        feature_schema=cached_inputs["feature_schema"],
+        environment=cached_inputs["environment"],
+        application_version=manifest.application_version,
+    )
+    zip_bytes = serialize_reproducibility_bundle(bundle)
+    st.download_button(
+        label="Download reproducibility bundle",
+        data=zip_bytes,
+        file_name=reproducibility_bundle_download_filename(manifest),
+        mime="application/zip",
+        key="download_reproducibility_bundle",
+    )
+    st.caption(_BUNDLE_EXPORT_NOTICE)
+
+
+def _verification_status_is_success(
+    status: ReproducibilityBundleVerificationStatus,
+) -> bool:
+    return status in {
+        ReproducibilityBundleVerificationStatus.VALID,
+        ReproducibilityBundleVerificationStatus.VALID_WITH_WARNINGS,
+    }
+
+
+def _render_bundle_verification_result(
+    result: ReproducibilityBundleVerificationResult,
+) -> None:
+    """Render a read-only verification outcome without mutating session state."""
+    status = result.overall_status
+    st.write({"Overall verification status": status.value})
+    if _verification_status_is_success(status):
+        if status is ReproducibilityBundleVerificationStatus.VALID_WITH_WARNINGS:
+            st.warning(result.summary)
+        else:
+            st.success(result.summary)
+    else:
+        st.error(result.summary)
+
+    st.caption("Expected bundle signature")
+    st.code(
+        _NOT_AVAILABLE
+        if result.expected_bundle_signature is None
+        else result.expected_bundle_signature,
+        language=None,
+    )
+    st.caption("Computed bundle signature")
+    st.code(
+        _NOT_AVAILABLE
+        if result.computed_bundle_signature is None
+        else result.computed_bundle_signature,
+        language=None,
+    )
+
+    schema_rows: list[dict[str, str]] = []
+    if result.bundle_schema_compatibility is not None:
+        compat = result.bundle_schema_compatibility
+        schema_rows.append(
+            {
+                "schema": compat.schema_name,
+                "observed": _display_optional(
+                    None
+                    if compat.observed_version is None
+                    else str(compat.observed_version)
+                ),
+                "supported": str(compat.supported_version),
+                "status": compat.status.value,
+            }
+        )
+    if result.run_manifest_schema_compatibility is not None:
+        compat = result.run_manifest_schema_compatibility
+        schema_rows.append(
+            {
+                "schema": compat.schema_name,
+                "observed": _display_optional(
+                    None
+                    if compat.observed_version is None
+                    else str(compat.observed_version)
+                ),
+                "supported": str(compat.supported_version),
+                "status": compat.status.value,
+            }
+        )
+    if schema_rows:
+        st.write("Schema compatibility")
+        st.dataframe(
+            pd.DataFrame(schema_rows),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    if result.invalid_components:
+        st.write({"Invalid components": list(result.invalid_components)})
+
+    if result.warnings:
+        st.write("Warnings")
+        for warning in result.warnings:
+            st.warning(warning)
+
+    inspection = result.inspection
+    if inspection is not None:
+        st.write("External provenance summary (read-only)")
+        feature_preview = list(
+            inspection.final_modeling_feature_names[:_PROVENANCE_FEATURE_PREVIEW_LIMIT]
+        )
+        omitted = max(
+            0,
+            len(inspection.final_modeling_feature_names) - len(feature_preview),
+        )
+        st.write(
+            {
+                "Bundle schema version": inspection.bundle_schema_version,
+                "Run signature (prefix)": _fingerprint_prefix(inspection.run_signature),
+                "Dataset fingerprint (prefix)": _fingerprint_prefix(
+                    inspection.dataset_fingerprint
+                ),
+                "Configuration fingerprint (prefix)": _fingerprint_prefix(
+                    inspection.configuration_fingerprint
+                ),
+                "Application version": inspection.application_version,
+                "Run manifest schema version": inspection.run_manifest_schema_version,
+                "Analysis task": _display_optional(inspection.analysis_task),
+                "Target": _display_optional(inspection.target_column),
+                "Final modeling feature count": inspection.final_modeling_feature_count,
+                "Platform": _display_optional(inspection.platform_system),
+                "Python version": _display_optional(inspection.python_version),
+                "Raw dataset included": inspection.raw_dataset_included,
+            }
+        )
+        st.caption("Full run signature")
+        st.code(inspection.run_signature, language=None)
+        st.caption("Full dataset fingerprint")
+        st.code(
+            _NOT_AVAILABLE
+            if inspection.dataset_fingerprint is None
+            else inspection.dataset_fingerprint,
+            language=None,
+        )
+        st.caption("Full configuration fingerprint")
+        st.code(inspection.configuration_fingerprint, language=None)
+        st.write({"Feature columns (compact)": feature_preview})
+        if omitted > 0:
+            st.caption(
+                f"{omitted} additional feature"
+                f"{'s' if omitted != 1 else ''} omitted from the compact display."
+            )
+        if inspection.column_roles:
+            st.write({"Column roles": dict(inspection.column_roles)})
+        if inspection.package_versions:
+            st.write({"Package versions": dict(inspection.package_versions)})
+        st.caption(inspection.absence_check_note)
+        with st.expander("Bundle README", expanded=False):
+            st.text(inspection.readme_text)
+
+
+def _render_verify_reproducibility_bundle_section() -> None:
+    """Render external reproducibility-bundle verification (Step 14D).
+
+    Independent of the active Run provenance report. Never mutates the stored
+    report, run manifest, setup comparison, dataset selection, or live widgets.
+    """
+    st.header("Verify reproducibility bundle")
+    st.caption(_BUNDLE_VERIFY_NOTICE)
+    uploaded = st.file_uploader(
+        "Upload reproducibility bundle ZIP",
+        type=["zip"],
+        accept_multiple_files=False,
+        key=_BUNDLE_VERIFY_UPLOAD_KEY,
+        help=(
+            "Verify an exported Step 14C reproducibility bundle. "
+            "Read-only; does not restore settings or rerun analysis."
+        ),
+    )
+    if uploaded is None:
+        st.caption("No external bundle uploaded. Verification result is cleared.")
+        return
+
+    zip_bytes = bytes(uploaded.getvalue())
+    result = verify_reproducibility_bundle(zip_bytes)
+    _render_bundle_verification_result(result)
+
+
+def _render_run_provenance_section(
+    report: WorkflowPresentationReport,
+    *,
+    setup_comparison: ReproducibilityComparison | None = None,
+) -> None:
+    """Render the stored run-manifest provenance expander for the current report."""
+    manifest = report.run_manifest
+    if manifest is None:
+        return
+    if not isinstance(manifest, AnalysisRunManifest):
+        raise TypeError(
+            "report.run_manifest must be AnalysisRunManifest or None, "
+            f"got {type(manifest).__name__}"
+        )
+
+    with st.expander("Run provenance", expanded=False):
+        st.write(
+            {
+                "Run signature (prefix)": _fingerprint_prefix(manifest.run_signature),
+                "Dataset fingerprint (prefix)": _fingerprint_prefix(
+                    manifest.dataset_fingerprint
+                ),
+                "Configuration fingerprint (prefix)": _fingerprint_prefix(
+                    manifest.configuration_fingerprint
+                ),
+                "Application version": manifest.application_version,
+                "Analysis mode": manifest.analysis_mode.value,
+                "Resolved task": _display_optional(
+                    None
+                    if manifest.resolved_task is None
+                    else manifest.resolved_task.value
+                ),
+                "Target": _display_optional(manifest.target_column),
+                "Feature count": manifest.feature_count,
+                "Selected model": _display_optional(manifest.selected_model),
+                "Workflow status": manifest.workflow_status.value,
+                "Started (UTC)": manifest.started_at_utc.isoformat(),
+                "Completed (UTC)": manifest.completed_at_utc.isoformat(),
+                "Duration (seconds)": f"{manifest.duration_seconds:.3f}",
+            }
+        )
+        st.caption("Full run signature")
+        st.code(manifest.run_signature, language=None)
+        st.caption("Full dataset fingerprint")
+        st.code(
+            _NOT_AVAILABLE
+            if manifest.dataset_fingerprint is None
+            else manifest.dataset_fingerprint,
+            language=None,
+        )
+        st.caption("Full configuration fingerprint")
+        st.code(manifest.configuration_fingerprint, language=None)
+
+        preview = list(manifest.feature_columns[:_PROVENANCE_FEATURE_PREVIEW_LIMIT])
+        omitted = max(0, len(manifest.feature_columns) - len(preview))
+        st.write({"Feature columns (compact)": preview})
+        if omitted > 0:
+            st.caption(
+                f"{omitted} additional feature"
+                f"{'s' if omitted != 1 else ''} omitted from the compact display. "
+                "The serialized report retains the full feature list."
+            )
+        elif manifest.feature_count == 0:
+            st.caption("No modeling features were recorded for this run.")
+
+        if manifest.stage_entries:
+            stage_rows = [
+                {
+                    "stage": entry.stage.value,
+                    "status": entry.status,
+                }
+                for entry in manifest.stage_entries
+            ]
+            st.write("Stage summary")
+            st.dataframe(
+                pd.DataFrame(stage_rows),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        if manifest.refusal_or_failure_code is not None:
+            st.caption(
+                "Refusal or failure code: "
+                f"`{manifest.refusal_or_failure_code}`"
+            )
+        _render_current_setup_comparison(setup_comparison)
+        _render_reproducibility_bundle_download(manifest)
+        st.info(_RUN_PROVENANCE_NOTICE)
+
+
 def _render_run_comparison_section(report: WorkflowPresentationReport) -> None:
     st.header("Run comparison")
     baseline = _load_baseline_report_from_session()
@@ -1228,6 +1688,7 @@ def render_app(
     preview_frame: pl.DataFrame | None = None
     upload_bytes: bytes | None = None
     config_report: UiColumnConfigurationReport | None = None
+    demo_frame: pd.DataFrame | None = None
 
     if demo_source_active:
         demo_summary = None
@@ -1250,6 +1711,7 @@ def render_app(
             preview_frame = None
             config_report = None
             demo_summary = None
+            demo_frame = None
         if demo_summary is not None:
             st.info(
                 "Source: synthetic built-in manufacturing demo data "
@@ -1431,7 +1893,24 @@ def render_app(
                 "Upload a valid CSV or select the built-in manufacturing demo "
                 "to configure columns and run the analysis workflow."
             )
-        _render_cached_report_if_any()
+        early_fingerprint = (
+            compute_dataset_content_fingerprint_from_bytes(upload_bytes)
+            if upload_bytes is not None
+            else None
+        )
+        _render_cached_report_if_any(
+            data_source=data_source,
+            demo_frame=demo_frame if demo_source_active else None,
+            current_dataset_fingerprint=early_fingerprint,
+            setup_comparison=_build_setup_reproducibility_comparison(
+                report=_load_cached_presentation_report(),
+                current_dataset_fingerprint=early_fingerprint,
+                upload_bytes=upload_bytes,
+                request_builder=active_request_builder,
+                readiness=None,
+            ),
+        )
+        _render_verify_reproducibility_bundle_section()
         return
 
     _reset_column_widget_state_if_schema_changed(columns)
@@ -2510,14 +2989,104 @@ def render_app(
                 report_builder=active_report_builder,
             )
 
-    _render_cached_report_if_any()
+    current_dataset_fingerprint = (
+        compute_dataset_content_fingerprint_from_bytes(upload_bytes)
+        if upload_bytes is not None
+        else None
+    )
+    timestamp_selection = (
+        _TIMESTAMP_NONE if selected_timestamp is None else selected_timestamp
+    )
+    run_feature_columns = list(feature_columns)
+    final_feature_columns = (
+        list(modeling_feature_columns) if anomaly_only else list(feature_columns)
+    )
+    setup_comparison = _build_setup_reproducibility_comparison(
+        report=_load_cached_presentation_report(),
+        current_dataset_fingerprint=current_dataset_fingerprint,
+        upload_bytes=upload_bytes,
+        request_builder=active_request_builder,
+        readiness=readiness,
+        analysis_mode=analysis_mode,
+        target_column=selected_target,
+        feature_columns=run_feature_columns,
+        final_feature_columns=final_feature_columns,
+        timestamp_selection=timestamp_selection,
+        identifier_columns=list(identifier_columns),
+        excluded_columns=list(excluded_columns),
+        column_role_overrides=dict(column_role_overrides),
+        requested_task=requested_task,
+        objective=(
+            (
+                RecommendationObjective.REDUCE_ANOMALY_SCORE
+                if anomaly_recommendation_enabled
+                else None
+            )
+            if anomaly_only
+            else selected_objective
+        ),
+        quality_direction=quality_direction,
+        quality_target=quality_target,
+        declared_target_minimum=(
+            DEMO_QUALITY_SCORE_DECLARED_MINIMUM
+            if demo_source_active and not anomaly_only
+            else None
+        ),
+        declared_target_maximum=(
+            DEMO_QUALITY_SCORE_DECLARED_MAXIMUM
+            if demo_source_active and not anomaly_only
+            else None
+        ),
+        performance_rule_rows=(
+            [] if anomaly_only else performance_rule_rows
+        ),
+        constraint_rows=(
+            list(constraint_rows)
+            if (anomaly_only and anomaly_recommendation_enabled) or not anomaly_only
+            else []
+        ),
+        confirmed_controllable=(
+            list(confirmed_controllable)
+            if (anomaly_only and anomaly_recommendation_enabled) or not anomaly_only
+            else []
+        ),
+        verified_variables=(
+            list(verified_variables)
+            if (anomaly_only and anomaly_recommendation_enabled) or not anomaly_only
+            else []
+        ),
+        max_simultaneous_changes=max_simultaneous_changes,
+        operating_mode=operating_mode,
+        explicit_operating_row_id=explicit_operating_row_id,
+        cohort_filter=cohort_filter if anomaly_only else None,
+        anomaly_recommendation_enabled=(
+            bool(anomaly_recommendation_enabled) if anomaly_only else False
+        ),
+    )
+    _render_cached_report_if_any(
+        data_source=data_source,
+        demo_frame=demo_frame if demo_source_active else None,
+        current_dataset_fingerprint=current_dataset_fingerprint,
+        setup_comparison=setup_comparison,
+    )
+    _render_verify_reproducibility_bundle_section()
     return
 
-def render_presentation_report(report: WorkflowPresentationReport) -> None:
+def render_presentation_report(
+    report: WorkflowPresentationReport,
+    *,
+    demo_evaluation: DemoAnomalyEvaluationSummary | None = None,
+    setup_comparison: ReproducibilityComparison | None = None,
+) -> None:
     """Render a ``WorkflowPresentationReport`` in section order.
 
     Args:
         report: Presentation DTO produced by ``AnalysisWorkflowReportBuilder``.
+        demo_evaluation: Optional built-in-demo-only ground-truth evaluation
+            summary rendered after the anomaly-event report.
+        setup_comparison: Optional informational comparison of the currently
+            loaded dataset and effective configuration against the stored
+            run manifest. Never mutates the report.
 
     Raises:
         TypeError: If ``report`` is not a ``WorkflowPresentationReport``.
@@ -2526,6 +3095,22 @@ def render_presentation_report(report: WorkflowPresentationReport) -> None:
         raise TypeError(
             "report must be WorkflowPresentationReport, "
             f"got {type(report).__name__}"
+        )
+    if demo_evaluation is not None and not isinstance(
+        demo_evaluation,
+        DemoAnomalyEvaluationSummary,
+    ):
+        raise TypeError(
+            "demo_evaluation must be DemoAnomalyEvaluationSummary or None, "
+            f"got {type(demo_evaluation).__name__}"
+        )
+    if setup_comparison is not None and not isinstance(
+        setup_comparison,
+        ReproducibilityComparison,
+    ):
+        raise TypeError(
+            "setup_comparison must be ReproducibilityComparison or None, "
+            f"got {type(setup_comparison).__name__}"
         )
 
     _render_run_comparison_section(report)
@@ -2560,6 +3145,7 @@ def render_presentation_report(report: WorkflowPresentationReport) -> None:
         f"Terminal stage: {overview.terminal_stage.value} | "
         f"Duration: {overview.total_seconds:.3f}s"
     )
+    _render_run_provenance_section(report, setup_comparison=setup_comparison)
 
     data = report.data_summary
     st.header("Data summary")
@@ -2703,6 +3289,9 @@ def render_presentation_report(report: WorkflowPresentationReport) -> None:
             mime="text/csv",
             key="download_anomaly_events_csv",
         )
+
+    if demo_evaluation is not None:
+        render_demo_ground_truth_evaluation(demo_evaluation)
 
     st.header("Anomaly context explorer")
     st.caption(_ANOMALY_CONTEXT_CAPTION)
@@ -3182,6 +3771,294 @@ def render_presentation_report(report: WorkflowPresentationReport) -> None:
                 st.info(disclaimer)
 
 
+def _normalize_explicit_operating_row_id(
+    *,
+    operating_mode: OperatingPointSelectionMode,
+    explicit_operating_row_id: int | str | None,
+) -> int | str | None:
+    if operating_mode is not OperatingPointSelectionMode.EXPLICIT_ROW_ID:
+        return None
+    if explicit_operating_row_id is None:
+        return None
+    if isinstance(explicit_operating_row_id, int):
+        return explicit_operating_row_id
+    text = str(explicit_operating_row_id).strip()
+    if text == "":
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _build_workflow_ui_submission(
+    *,
+    analysis_mode: AnalysisExecutionMode,
+    target_column: str | None,
+    feature_columns: Sequence[str],
+    timestamp_selection: str,
+    identifier_columns: Sequence[str],
+    excluded_columns: Sequence[str],
+    column_role_overrides: Mapping[str, ColumnRole],
+    requested_task: AnalysisTask | None,
+    objective: RecommendationObjective | None,
+    quality_direction: QualityOptimizationDirection | None,
+    quality_target: float | None,
+    declared_target_minimum: float | None,
+    declared_target_maximum: float | None,
+    performance_rule_rows: Sequence[Mapping[str, Any]],
+    constraint_rows: Sequence[Mapping[str, float | str]],
+    confirmed_controllable: Sequence[str],
+    verified_variables: Sequence[str],
+    max_simultaneous_changes: int,
+    operating_mode: OperatingPointSelectionMode,
+    explicit_operating_row_id: int | str | None,
+    cohort_filter: NumericCohortFilter | None,
+    anomaly_recommendation_enabled: bool,
+) -> WorkflowUiSubmission:
+    """Build a validated UI submission from the current widget-derived inputs."""
+    timestamp_column = (
+        None if timestamp_selection == _TIMESTAMP_NONE else timestamp_selection
+    )
+    performance_rules = [
+        UiMetricRuleInput(
+            metric_name=str(row["metric_name"]),
+            direction=MetricAcceptanceDirection(str(row["direction"])),
+            threshold=float(row["threshold"]),
+            required=bool(row["required"]),
+        )
+        for row in performance_rule_rows
+    ]
+    constraints = [
+        UiVariableConstraintInput(
+            variable=str(row["variable"]),
+            minimum=float(row["minimum"]),
+            maximum=float(row["maximum"]),
+        )
+        for row in constraint_rows
+    ]
+    return WorkflowUiSubmission(
+        analysis_mode=analysis_mode,
+        target_column=target_column,
+        feature_columns=list(feature_columns),
+        timestamp_column=timestamp_column,
+        identifier_columns=list(identifier_columns),
+        excluded_columns=list(excluded_columns),
+        column_role_overrides=dict(column_role_overrides),
+        requested_task=requested_task,
+        objective=objective,
+        quality_direction=quality_direction,
+        quality_target=quality_target,
+        declared_target_minimum=declared_target_minimum,
+        declared_target_maximum=declared_target_maximum,
+        performance_rules=performance_rules,
+        constraints=constraints,
+        user_confirmed_controllable_variables=list(confirmed_controllable),
+        user_verified_variables=list(verified_variables),
+        max_simultaneous_changes=max_simultaneous_changes,
+        operating_point_selection=operating_mode,
+        explicit_operating_row_id=_normalize_explicit_operating_row_id(
+            operating_mode=operating_mode,
+            explicit_operating_row_id=explicit_operating_row_id,
+        ),
+        cohort_filter=(
+            None if cohort_filter is None else cohort_filter.model_copy(deep=True)
+        ),
+        anomaly_recommendation_enabled=bool(anomaly_recommendation_enabled),
+        metadata={"ui_entry": "streamlit_form"},
+    )
+
+
+def _try_build_current_effective_request(
+    *,
+    upload_bytes: bytes,
+    request_builder: WorkflowUiRequestBuilder,
+    readiness: Mapping[str, bool],
+    analysis_mode: AnalysisExecutionMode,
+    target_column: str | None,
+    feature_columns: Sequence[str],
+    final_feature_columns: Sequence[str],
+    timestamp_selection: str,
+    identifier_columns: Sequence[str],
+    excluded_columns: Sequence[str],
+    column_role_overrides: Mapping[str, ColumnRole],
+    requested_task: AnalysisTask | None,
+    objective: RecommendationObjective | None,
+    quality_direction: QualityOptimizationDirection | None,
+    quality_target: float | None,
+    declared_target_minimum: float | None,
+    declared_target_maximum: float | None,
+    performance_rule_rows: Sequence[Mapping[str, Any]],
+    constraint_rows: Sequence[Mapping[str, float | str]],
+    confirmed_controllable: Sequence[str],
+    verified_variables: Sequence[str],
+    max_simultaneous_changes: int,
+    operating_mode: OperatingPointSelectionMode,
+    explicit_operating_row_id: int | str | None,
+    cohort_filter: NumericCohortFilter | None,
+    anomaly_recommendation_enabled: bool,
+) -> tuple[
+    AnalysisWorkflowRequest | None,
+    AnalysisWorkflowPolicy | None,
+    list[str] | None,
+    list[str],
+]:
+    """Build the current effective request/policy without executing analysis.
+
+    Returns:
+        ``(request, policy, final_features, incompleteness_reasons)``. When the
+        current configuration is incomplete or invalid, ``request``/``policy``
+        are ``None`` and reasons list the readiness or validation issues.
+    """
+    incomplete_reasons = [
+        label for label, ready in readiness.items() if not ready
+    ]
+    if incomplete_reasons:
+        return None, None, None, incomplete_reasons
+
+    try:
+        submission = _build_workflow_ui_submission(
+            analysis_mode=analysis_mode,
+            target_column=target_column,
+            feature_columns=feature_columns,
+            timestamp_selection=timestamp_selection,
+            identifier_columns=identifier_columns,
+            excluded_columns=excluded_columns,
+            column_role_overrides=column_role_overrides,
+            requested_task=requested_task,
+            objective=objective,
+            quality_direction=quality_direction,
+            quality_target=quality_target,
+            declared_target_minimum=declared_target_minimum,
+            declared_target_maximum=declared_target_maximum,
+            performance_rule_rows=performance_rule_rows,
+            constraint_rows=constraint_rows,
+            confirmed_controllable=confirmed_controllable,
+            verified_variables=verified_variables,
+            max_simultaneous_changes=max_simultaneous_changes,
+            operating_mode=operating_mode,
+            explicit_operating_row_id=explicit_operating_row_id,
+            cohort_filter=cohort_filter,
+            anomaly_recommendation_enabled=anomaly_recommendation_enabled,
+        )
+    except (ValidationError, ValueError, TypeError) as exc:
+        return None, None, None, [_sanitize_operator_text(str(exc))]
+
+    with tempfile.TemporaryDirectory(prefix="ipi_ui_compare_") as temp_dir:
+        csv_path = Path(temp_dir) / "upload.csv"
+        try:
+            csv_path.write_bytes(upload_bytes)
+            request = request_builder.build(
+                csv_path=csv_path,
+                submission=submission,
+            )
+        except (
+            ValidationError,
+            FileNotFoundError,
+            ValueError,
+            TypeError,
+        ) as exc:
+            return None, None, None, [_sanitize_operator_text(str(exc))]
+        # Deep-copy before the temporary CSV path is cleaned up. Fingerprints
+        # exclude csv_path, but the request object must remain usable.
+        request_copy = request.model_copy(deep=True)
+        return (
+            request_copy,
+            request_builder.workflow_policy,
+            list(final_feature_columns),
+            [],
+        )
+
+
+def _build_setup_reproducibility_comparison(
+    *,
+    report: WorkflowPresentationReport | None,
+    current_dataset_fingerprint: str | None,
+    upload_bytes: bytes | None,
+    request_builder: WorkflowUiRequestBuilder,
+    readiness: Mapping[str, bool] | None,
+    analysis_mode: AnalysisExecutionMode | None = None,
+    target_column: str | None = None,
+    feature_columns: Sequence[str] | None = None,
+    final_feature_columns: Sequence[str] | None = None,
+    timestamp_selection: str = _TIMESTAMP_NONE,
+    identifier_columns: Sequence[str] | None = None,
+    excluded_columns: Sequence[str] | None = None,
+    column_role_overrides: Mapping[str, ColumnRole] | None = None,
+    requested_task: AnalysisTask | None = None,
+    objective: RecommendationObjective | None = None,
+    quality_direction: QualityOptimizationDirection | None = None,
+    quality_target: float | None = None,
+    declared_target_minimum: float | None = None,
+    declared_target_maximum: float | None = None,
+    performance_rule_rows: Sequence[Mapping[str, Any]] | None = None,
+    constraint_rows: Sequence[Mapping[str, float | str]] | None = None,
+    confirmed_controllable: Sequence[str] | None = None,
+    verified_variables: Sequence[str] | None = None,
+    max_simultaneous_changes: int = 1,
+    operating_mode: OperatingPointSelectionMode = (
+        OperatingPointSelectionMode.TOP_RESIDUAL_ANOMALY
+    ),
+    explicit_operating_row_id: int | str | None = None,
+    cohort_filter: NumericCohortFilter | None = None,
+    anomaly_recommendation_enabled: bool = False,
+) -> ReproducibilityComparison | None:
+    """Build an informational comparison for a displayed report, if any."""
+    if report is None or report.run_manifest is None:
+        return None
+
+    if upload_bytes is None or readiness is None or analysis_mode is None:
+        return compare_setup_to_run_manifest(
+            stored_manifest=report.run_manifest,
+            current_dataset_fingerprint=current_dataset_fingerprint,
+            current_configuration_incomplete=True,
+            incompleteness_reasons=["current configuration is not available"],
+        )
+
+    request, policy, final_features, reasons = _try_build_current_effective_request(
+        upload_bytes=upload_bytes,
+        request_builder=request_builder,
+        readiness=readiness,
+        analysis_mode=analysis_mode,
+        target_column=target_column,
+        feature_columns=list(feature_columns or ()),
+        final_feature_columns=list(final_feature_columns or feature_columns or ()),
+        timestamp_selection=timestamp_selection,
+        identifier_columns=list(identifier_columns or ()),
+        excluded_columns=list(excluded_columns or ()),
+        column_role_overrides=dict(column_role_overrides or {}),
+        requested_task=requested_task,
+        objective=objective,
+        quality_direction=quality_direction,
+        quality_target=quality_target,
+        declared_target_minimum=declared_target_minimum,
+        declared_target_maximum=declared_target_maximum,
+        performance_rule_rows=list(performance_rule_rows or ()),
+        constraint_rows=list(constraint_rows or ()),
+        confirmed_controllable=list(confirmed_controllable or ()),
+        verified_variables=list(verified_variables or ()),
+        max_simultaneous_changes=max_simultaneous_changes,
+        operating_mode=operating_mode,
+        explicit_operating_row_id=explicit_operating_row_id,
+        cohort_filter=cohort_filter,
+        anomaly_recommendation_enabled=anomaly_recommendation_enabled,
+    )
+    if request is None or policy is None:
+        return compare_setup_to_run_manifest(
+            stored_manifest=report.run_manifest,
+            current_dataset_fingerprint=current_dataset_fingerprint,
+            current_configuration_incomplete=True,
+            incompleteness_reasons=reasons,
+        )
+    return compare_setup_to_run_manifest(
+        stored_manifest=report.run_manifest,
+        current_dataset_fingerprint=current_dataset_fingerprint,
+        current_request=request,
+        current_policy=policy,
+        current_feature_columns=final_features,
+    )
+
+
 def _run_workflow_from_upload(
     *,
     upload_bytes: bytes,
@@ -3211,48 +4088,12 @@ def _run_workflow_from_upload(
     request_builder: WorkflowUiRequestBuilder,
     report_builder: AnalysisWorkflowReportBuilder,
 ) -> None:
-    timestamp_column = (
-        None if timestamp_selection == _TIMESTAMP_NONE else timestamp_selection
-    )
-    row_id: int | str | None = None
-    if operating_mode is OperatingPointSelectionMode.EXPLICIT_ROW_ID:
-        if explicit_operating_row_id is None:
-            row_id = None
-        elif isinstance(explicit_operating_row_id, int):
-            row_id = explicit_operating_row_id
-        else:
-            text = str(explicit_operating_row_id).strip()
-            if text == "":
-                row_id = None
-            else:
-                try:
-                    row_id = int(text)
-                except ValueError:
-                    row_id = text
-
     try:
-        performance_rules = [
-            UiMetricRuleInput(
-                metric_name=str(row["metric_name"]),
-                direction=MetricAcceptanceDirection(str(row["direction"])),
-                threshold=float(row["threshold"]),
-                required=bool(row["required"]),
-            )
-            for row in performance_rule_rows
-        ]
-        constraints = [
-            UiVariableConstraintInput(
-                variable=str(row["variable"]),
-                minimum=float(row["minimum"]),
-                maximum=float(row["maximum"]),
-            )
-            for row in constraint_rows
-        ]
-        submission = WorkflowUiSubmission(
+        submission = _build_workflow_ui_submission(
             analysis_mode=analysis_mode,
             target_column=target_column,
             feature_columns=feature_columns,
-            timestamp_column=timestamp_column,
+            timestamp_selection=timestamp_selection,
             identifier_columns=identifier_columns,
             excluded_columns=excluded_columns,
             column_role_overrides=column_role_overrides,
@@ -3262,18 +4103,15 @@ def _run_workflow_from_upload(
             quality_target=quality_target,
             declared_target_minimum=declared_target_minimum,
             declared_target_maximum=declared_target_maximum,
-            performance_rules=performance_rules,
-            constraints=constraints,
-            user_confirmed_controllable_variables=confirmed_controllable,
-            user_verified_variables=verified_variables,
+            performance_rule_rows=performance_rule_rows,
+            constraint_rows=constraint_rows,
+            confirmed_controllable=confirmed_controllable,
+            verified_variables=verified_variables,
             max_simultaneous_changes=max_simultaneous_changes,
-            operating_point_selection=operating_mode,
-            explicit_operating_row_id=row_id,
-            cohort_filter=(
-                None if cohort_filter is None else cohort_filter.model_copy(deep=True)
-            ),
-            anomaly_recommendation_enabled=bool(anomaly_recommendation_enabled),
-            metadata={"ui_entry": "streamlit_form"},
+            operating_mode=operating_mode,
+            explicit_operating_row_id=explicit_operating_row_id,
+            cohort_filter=cohort_filter,
+            anomaly_recommendation_enabled=anomaly_recommendation_enabled,
         )
     except (ValidationError, ValueError, TypeError) as exc:
         _display_user_error(exc, area="UI submission / validation")
@@ -3298,6 +4136,15 @@ def _run_workflow_from_upload(
             st.session_state[_SESSION_REPORT_KEY] = presentation.report.model_dump(
                 mode="json"
             )
+            if presentation.report.run_manifest is not None:
+                _store_reproducibility_bundle_inputs(
+                    request=request,
+                    policy=request_builder.workflow_policy,
+                    run_manifest=presentation.report.run_manifest,
+                    upload_bytes=upload_bytes,
+                )
+            else:
+                st.session_state.pop(_SESSION_BUNDLE_INPUTS_KEY, None)
         except (
             ValidationError,
             DataValidationError,
@@ -3643,21 +4490,57 @@ def _performance_rule_missing_fields(
     return missing
 
 
-def _render_cached_report_if_any() -> None:
+def _load_cached_presentation_report() -> WorkflowPresentationReport | None:
+    """Load the cached presentation report without mutating session state."""
+    cached = st.session_state.get(_SESSION_REPORT_KEY)
+    if cached is None or not isinstance(cached, dict):
+        return None
+    try:
+        return WorkflowPresentationReport.model_validate(cached)
+    except ValidationError:
+        return None
+
+
+def _render_cached_report_if_any(
+    *,
+    data_source: object = None,
+    demo_frame: pd.DataFrame | None = None,
+    current_dataset_fingerprint: str | None = None,
+    setup_comparison: ReproducibilityComparison | None = None,
+) -> None:
     cached = st.session_state.get(_SESSION_REPORT_KEY)
     if cached is None:
         return
     if not isinstance(cached, dict):
         st.session_state.pop(_SESSION_REPORT_KEY, None)
+        st.session_state.pop(_SESSION_BUNDLE_INPUTS_KEY, None)
         return
     try:
         report = WorkflowPresentationReport.model_validate(cached)
     except ValidationError:
         st.session_state.pop(_SESSION_REPORT_KEY, None)
+        st.session_state.pop(_SESSION_BUNDLE_INPUTS_KEY, None)
         return
+    demo_evaluation: DemoAnomalyEvaluationSummary | None = None
+    if (
+        demo_frame is not None
+        and is_demo_evaluation_panel_eligible(
+            data_source=data_source,
+            report=report,
+            current_dataset_fingerprint=current_dataset_fingerprint,
+        )
+    ):
+        demo_evaluation = evaluate_demo_anomaly_presentation(
+            report=report,
+            demo_frame=demo_frame,
+        )
     st.divider()
     st.subheader("Last presentation report")
-    render_presentation_report(report)
+    render_presentation_report(
+        report,
+        demo_evaluation=demo_evaluation,
+        setup_comparison=setup_comparison,
+    )
 
 
 def _display_optional(value: object) -> str:

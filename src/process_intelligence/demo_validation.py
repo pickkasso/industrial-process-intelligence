@@ -37,6 +37,10 @@ from process_intelligence.demo_data import (
     summarize_demo_dataset,
     write_demo_workflow_csv,
 )
+from process_intelligence.demo_evaluation import (
+    injected_anomaly_row_ids,
+    overlap_precision_and_enrichment,
+)
 from process_intelligence.evaluation import (
     DatasetSplitter,
     MetricAcceptanceDirection,
@@ -1112,8 +1116,7 @@ def _anomaly_modeling_succeeded(report: AnalysisWorkflowReport) -> bool:
 
 
 def _injected_anomaly_row_ids(frame: pd.DataFrame) -> set[int]:
-    mask = frame["injected_anomaly"].to_numpy(dtype=bool)
-    return {int(index) for index, flag in enumerate(mask) if bool(flag)}
+    return injected_anomaly_row_ids(frame)
 
 
 def _event_row_ids(events: Sequence[object]) -> list[int]:
@@ -1136,13 +1139,11 @@ def _overlap_stats(
     ground_truth_ids: set[int],
     baseline_rate: float,
 ) -> tuple[float | None, float | None]:
-    if not detected_ids:
-        return None, None
-    matched = sum(1 for row_id in detected_ids if row_id in ground_truth_ids)
-    precision = float(matched) / float(len(detected_ids))
-    if baseline_rate <= 0.0 or not math.isfinite(baseline_rate):
-        return precision, None
-    return precision, precision / baseline_rate
+    return overlap_precision_and_enrichment(
+        detected_ids=detected_ids,
+        ground_truth_ids=ground_truth_ids,
+        baseline_rate=baseline_rate,
+    )
 
 
 def _format_metrics(metrics: Mapping[str, float]) -> str:

@@ -1236,6 +1236,72 @@ def test_dataset_fingerprint_passthrough_to_presentation() -> None:
     assert str(Path("C:/tmp/secret.csv")) not in str(dumped)
 
 
+def test_run_manifest_passthrough_and_stage_order() -> None:
+    from process_intelligence.workflow import (
+        AnalysisRunManifest,
+        AnalysisStageManifestEntry,
+        OperatingPointSelectionMode,
+    )
+
+    features = ["pressure", "temperature", "flow"]
+    manifest = AnalysisRunManifest(
+        manifest_schema_version=1,
+        run_signature="a" * 64,
+        configuration_fingerprint="b" * 64,
+        dataset_fingerprint="c" * 64,
+        application_version="0.1.0",
+        started_at_utc=_UTC_START,
+        completed_at_utc=_UTC_END,
+        duration_seconds=12.0,
+        analysis_mode=AnalysisExecutionMode.SUPERVISED,
+        requested_task=AnalysisTask.REGRESSION,
+        resolved_task=AnalysisTask.REGRESSION,
+        target_column="quality",
+        timestamp_column="timestamp",
+        feature_count=len(features),
+        feature_columns=features,
+        operating_point_selection_mode=OperatingPointSelectionMode.TOP_RESIDUAL_ANOMALY,
+        workflow_status=AnalysisWorkflowStatus.REFUSED,
+        selected_model="ridge",
+        stage_entries=[
+            AnalysisStageManifestEntry(
+                stage=AnalysisWorkflowStage.LOAD,
+                status="SUCCEEDED",
+                message="Loaded.",
+            ),
+            AnalysisStageManifestEntry(
+                stage=AnalysisWorkflowStage.RECOMMENDATION,
+                status="REFUSED",
+                code="REFUSED",
+                message="Recommendation refused.",
+            ),
+        ],
+        warning_count=1,
+        refusal_or_failure_code="BELOW_CONFIDENCE_THRESHOLD",
+    )
+    source = _refused_report(
+        final_recommendation=_refused_result(),
+        run_manifest=manifest,
+        selected_supervised_model_key="ridge",
+        selected_task=AnalysisTask.REGRESSION,
+    )
+    report = AnalysisWorkflowReportBuilder().build(source).report
+    assert report.run_manifest is not None
+    assert report.run_manifest.run_signature == "a" * 64
+    assert report.run_manifest.feature_count == 3
+    assert [entry.stage for entry in report.run_manifest.stage_entries] == [
+        AnalysisWorkflowStage.LOAD,
+        AnalysisWorkflowStage.RECOMMENDATION,
+    ]
+    assert report.run_manifest.stage_entries[1].status == "REFUSED"
+    assert report.run_manifest.selected_model == "ridge"
+    assert report.run_manifest.refusal_or_failure_code == (
+        "BELOW_CONFIDENCE_THRESHOLD"
+    )
+    # Older reports without a manifest remain compatible.
+    assert AnalysisWorkflowReportBuilder().build(_completed_report()).report.run_manifest is None
+
+
 def test_anomaly_only_target_and_task_not_applicable() -> None:
     report = AnalysisWorkflowReportBuilder().build(_anomaly_only_report()).report
     assert report.routing_summary.target_column is None

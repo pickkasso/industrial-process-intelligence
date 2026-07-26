@@ -53,6 +53,11 @@ class WorkflowUiRequestBuilder:
                 f"got {type(workflow_policy).__name__}"
             )
 
+    @property
+    def workflow_policy(self) -> AnalysisWorkflowPolicy:
+        """Return a deep copy of the effective workflow policy used for requests."""
+        return self._workflow_policy.model_copy(deep=True)
+
     def build(
         self,
         *,

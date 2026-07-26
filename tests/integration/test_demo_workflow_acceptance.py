@@ -28,6 +28,11 @@ from process_intelligence.demo_validation import (
     validate_demo_supervised,
     validate_demo_workflows,
 )
+from process_intelligence.reporting import AnalysisWorkflowReportBuilder
+from process_intelligence.ui.demo_evaluation import (
+    DemoAnomalyEvaluationStatus,
+    evaluate_demo_anomaly_presentation,
+)
 from process_intelligence.workflow import AnalysisExecutionMode
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -320,3 +325,82 @@ def test_default_demo_supervised_recommendation_safety_and_plausibility() -> Non
     assert verification.proposed_objective_value is not None
     assert math.isfinite(verification.baseline_objective_value)
     assert math.isfinite(verification.proposed_objective_value)
+
+
+def test_default_demo_anomaly_only_ground_truth_evaluation_available() -> None:
+    """Displayed-event evaluation is AVAILABLE and enriched for the default demo."""
+    import tempfile
+
+    from process_intelligence.demo_data import write_demo_workflow_csv
+    from process_intelligence.demo_validation import _run_anomaly_only_workflow
+
+    frame = generate_demo_dataset(_default_config())
+    with tempfile.TemporaryDirectory(prefix="demo_eval_anom_") as temp_dir:
+        csv_path = write_demo_workflow_csv(frame, Path(temp_dir) / "demo.csv")
+        outcome = _run_anomaly_only_workflow(
+            csv_path=csv_path,
+            feature_columns=default_demo_feature_columns(),
+        )
+    original_dump = outcome.report.model_dump(mode="json")
+    presentation = AnalysisWorkflowReportBuilder().build(outcome.report).report
+    evaluation = evaluate_demo_anomaly_presentation(
+        report=presentation,
+        demo_frame=frame,
+    )
+    assert evaluation.evaluation_status is DemoAnomalyEvaluationStatus.AVAILABLE
+    assert evaluation.matched_event_count >= 1
+    assert evaluation.enrichment_factor is not None
+    assert evaluation.enrichment_factor >= MIN_ANOMALY_ENRICHMENT_FACTOR
+    assert outcome.report.model_dump(mode="json") == original_dump
+
+
+def test_default_demo_supervised_residual_evaluation_and_safety_unchanged() -> None:
+    """Residual demo evaluation stays available without altering safety outcomes."""
+    import tempfile
+
+    from process_intelligence.demo_data import write_demo_workflow_csv
+    from process_intelligence.demo_validation import _run_supervised_workflow
+    from process_intelligence.recommendation import RecommendationStatus
+
+    frame = generate_demo_dataset(_default_config())
+    with tempfile.TemporaryDirectory(prefix="demo_eval_sup_") as temp_dir:
+        csv_path = write_demo_workflow_csv(frame, Path(temp_dir) / "demo.csv")
+        outcome = _run_supervised_workflow(
+            csv_path=csv_path,
+            feature_columns=default_demo_feature_columns(),
+        )
+    report = outcome.report
+    original_dump = report.model_dump(mode="json")
+    recommendation = report.final_recommendation
+    assert recommendation is not None
+    recommendation_status = recommendation.status
+    plausibility = recommendation.target_prediction_plausibility
+
+    presentation = AnalysisWorkflowReportBuilder().build(report).report
+    residual_events = [
+        event
+        for event in presentation.anomaly_events
+        if event.selection_source == "residual_anomaly_detector"
+    ]
+    evaluation = evaluate_demo_anomaly_presentation(
+        report=presentation,
+        demo_frame=frame,
+    )
+    if residual_events:
+        assert evaluation.evaluation_status is DemoAnomalyEvaluationStatus.AVAILABLE
+        assert evaluation.matched_event_count >= 1
+        assert evaluation.enrichment_factor is not None
+        assert evaluation.enrichment_factor >= MIN_ANOMALY_ENRICHMENT_FACTOR
+    else:
+        assert evaluation.evaluation_status in {
+            DemoAnomalyEvaluationStatus.NO_DISPLAYED_EVENTS,
+            DemoAnomalyEvaluationStatus.UNAVAILABLE,
+        }
+
+    assert report.model_dump(mode="json") == original_dump
+    assert recommendation.status is recommendation_status
+    assert recommendation.target_prediction_plausibility == plausibility
+    # Low-confidence refusal remains an accepted safety outcome on the default demo.
+    if recommendation.status is RecommendationStatus.REFUSED:
+        assert recommendation.proposed_prediction is None
+        assert not recommendation.changes

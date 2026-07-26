@@ -142,6 +142,7 @@ from process_intelligence.workflow.enums import (
     OperatingPointSelectionMode,
     TaskSelectionSource,
 )
+from process_intelligence.workflow.run_manifest import build_analysis_run_manifest
 from process_intelligence.workflow.schemas import (
     AnalysisWorkflowOutcome,
     AnalysisWorkflowPolicy,
@@ -232,6 +233,7 @@ class _RunState:
     context_warnings: list[str] = field(default_factory=list)
     raw_csv_loaded: bool = False
     dataset_fingerprint: str | None = None
+    feature_columns: list[str] = field(default_factory=list)
     supervised_model_available: bool = False
     anomaly_model_available: bool = False
     residual_calibration_performed: bool = False
@@ -480,6 +482,7 @@ class IndustrialProcessAnalysisWorkflow:
         completed_at = datetime.now(tz=UTC)
         total_seconds = max(0.0, time.perf_counter() - perf_started)
         report = self._build_report(
+            request=request,
             policy=policy,
             state=state,
             started_at=started_at,
@@ -502,6 +505,7 @@ class IndustrialProcessAnalysisWorkflow:
         feature_columns = list(request.feature_columns)
         state.analysis_mode = request.analysis_mode
         state.target_column = request.target_column
+        state.feature_columns = list(feature_columns)
         state.feature_count = len(feature_columns)
         anomaly_only = request.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY
         if anomaly_only:
@@ -783,6 +787,7 @@ class IndustrialProcessAnalysisWorkflow:
                     feature_columns = [
                         name for name in feature_columns if name != filter_column
                     ]
+                    state.feature_columns = list(feature_columns)
                     state.feature_count = len(feature_columns)
                 if not feature_columns:
                     self._refuse(
@@ -2553,6 +2558,7 @@ class IndustrialProcessAnalysisWorkflow:
     def _build_report(
         self,
         *,
+        request: AnalysisWorkflowRequest,
         policy: AnalysisWorkflowPolicy,
         state: _RunState,
         started_at: datetime,
@@ -2568,6 +2574,46 @@ class IndustrialProcessAnalysisWorkflow:
             extra_warnings=state.context_warnings,
         )
         report_metadata = _build_report_metadata(state)
+        feature_columns = (
+            list(state.feature_columns)
+            if state.feature_columns
+            else list(request.feature_columns)
+        )
+        if state.analysis_mode is AnalysisExecutionMode.ANOMALY_ONLY:
+            selected_model = state.selected_anomaly_model_key
+        else:
+            selected_model = (
+                state.selected_supervised_model_key
+                or state.selected_anomaly_model_key
+            )
+        recommendation_reason_codes: list[str] = []
+        recommendation_status = None
+        if state.final_recommendation is not None:
+            recommendation_status = state.final_recommendation.status
+            recommendation_reason_codes = [
+                code.value
+                for code in state.final_recommendation.safety_decision.global_reason_codes
+            ]
+        run_manifest = build_analysis_run_manifest(
+            request=request,
+            policy=policy,
+            stage_records=records,
+            workflow_status=state.status,
+            dataset_fingerprint=state.dataset_fingerprint,
+            feature_columns=feature_columns,
+            analysis_mode=state.analysis_mode,
+            requested_task=request.requested_task,
+            resolved_task=state.selected_task,
+            target_column=state.target_column,
+            selected_model=selected_model,
+            warning_count=len(warnings),
+            started_at_utc=started_at,
+            completed_at_utc=completed_at,
+            duration_seconds=total_seconds,
+            target_refusal_code=state.target_refusal_code,
+            recommendation_status=recommendation_status,
+            recommendation_reason_codes=recommendation_reason_codes,
+        )
 
         return AnalysisWorkflowReport(
             status=state.status,
@@ -2615,6 +2661,7 @@ class IndustrialProcessAnalysisWorkflow:
                 )
             ),
             dataset_fingerprint=state.dataset_fingerprint,
+            run_manifest=run_manifest,
             started_at=started_at,
             completed_at=completed_at,
             total_seconds=total_seconds,

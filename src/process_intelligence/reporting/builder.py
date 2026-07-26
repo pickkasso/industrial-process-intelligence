@@ -1196,6 +1196,11 @@ class AnalysisWorkflowReportBuilder:
             disclaimers=disclaimers,
             metadata=metadata,
             dataset_fingerprint=workflow_report.dataset_fingerprint,
+            run_manifest=(
+                None
+                if workflow_report.run_manifest is None
+                else workflow_report.run_manifest.model_copy(deep=True)
+            ),
         )
         return WorkflowPresentationOutcome(report=presentation)
 
